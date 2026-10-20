@@ -1,16 +1,12 @@
 # fastgrid
 
-Rust workspace: cross-platform DB client (MySQL/PostgreSQL first) on GPUI Kit, plus MCP server.
-Read docs/architecture.md before changing crate boundaries.
+规范以 [`AGENTS.md`](AGENTS.md) 为准（项目规范、crate 边界、代码/测试约定、Git 提交信息格式、安全红线）。
+本文件只做转发，不要在这里新增规则，避免两处漂移。
 
-## Rules
-- Dependencies point downward; only `fg-app` may depend on gpui. `fg-mcp`/`fg-cli` must run headless.
-- No `unwrap`/`expect` on production paths; return `fg_core::Error`.
-- Secrets only in the OS keychain; never log credentials or query parameters containing them.
-- MCP is read-only by default; any change weakening that needs an update to docs/mcp-security.md.
-- Edition 2024, `unsafe_code = forbid`.
+Quick start:
 
-## Commands
-- `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace`
-- `cargo run -p fg-app`
+```bash
+cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo run -p fg-app
+```

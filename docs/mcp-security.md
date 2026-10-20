@@ -13,11 +13,14 @@ External agents can run SQL, so safety is designed in from day one, not bolted o
    MySQL `START TRANSACTION READ ONLY`) and statement classification in `fg-sql`.
 2. **Writes are opt-in per connection** and require explicit confirmation in the GUI for each
    statement. Headless mode denies writes.
-3. **Limits**: max rows and statement timeout enforced server-side; truncated results are flagged to the agent.
-4. **Production connections** (`is_production`) are hidden from MCP unless explicitly exposed.
-5. **Audit log**: every call (agent, connection, statement, outcome, duration) is stored locally and
-   viewable in the GUI.
-6. **Secrets** never appear in tool results, resources, or logs.
+3. **No raw SQL fragments from agents in browse tools.** Filters are structured and bound as parameters;
+   `BrowseOptions::allow_raw_where` is false for agents (`fg-service`).
+4. **Limits**: max rows and statement timeout enforced server-side; truncated results are flagged to the agent.
+5. **Production-like connections** (`Environment::Production`, and any environment this build does not
+   recognise) are hidden from MCP unless explicitly exposed (`McpAccess::exposed`).
+6. **Audit log**: every call (agent, connection, statement, outcome, duration) is stored locally
+   (encrypted like all other data, append-only) and viewable in the GUI. Entries outlive their connection.
+7. **Secrets** never appear in tool results, resources, or logs.
 
 ## Planned surface
 

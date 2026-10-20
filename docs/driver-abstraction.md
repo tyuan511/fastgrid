@@ -49,8 +49,8 @@ fg-service pooling, SSH tunnel / TLS, policy (read-only, limits), metadata cache
 8. **Transport is above the driver.** SSH tunnels and TLS termination are `fg-service` concerns;
    drivers see a plain host/port (or file path). `ConnectionConfig.options` carries engine-specific
    knobs (`readonly`, `create`, ...); unknown keys are ignored.
-9. **Secrets are arguments, not config.** The password is passed to `connect` from the keychain and
-   is never stored in `ConnectionConfig`.
+9. **Secrets are arguments, not config.** The password is passed to `connect` (read by `fg-service` from the
+   encrypted store) and is never part of `ConnectionConfig`.
 10. **Read-only is layered.** `Session::set_read_only` is the engine-level guard; engines that
     can't offer it return `Unsupported` and `fg-service` relies on `fg-sql` statement
     classification as well (see `mcp-security.md`).
@@ -71,7 +71,7 @@ fg-service pooling, SSH tunnel / TLS, policy (read-only, limits), metadata cache
 
 - Async engines (PG/MySQL) need an async variant of the send helpers; the SQLite driver uses
   `blocking_send` from the blocking pool.
-- Large/lazy cells (blobs, long text) are fully materialized for now; a `Value::Lazy` reference
-  is the likely extension.
+- Large cells: `ExecOptions::max_cell_bytes` turns oversized text/bytes/JSON into `Value::Truncated`
+  (preview + full size) in the shared `Batcher`. Loading the full value on demand is `fg-service`'s job (M3 inspector).
 - Not yet modelled: routines, triggers, sequences, users/privileges, EXPLAIN plans, notices/warnings.
 - SSL/SSH settings will become typed fields on `ConnectionConfig` when `fg-service` implements them.

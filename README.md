@@ -21,7 +21,8 @@ Phase 1 databases: SQLite first, then MySQL (and MariaDB) and PostgreSQL. All en
 |---|---|
 | `fg-core` | Domain types (connection, value, error). No IO. |
 | `fg-driver` | `Driver` / `Session` traits + SQLite (MySQL / PostgreSQL next) |
-| `fg-store` | Local SQLite store, keychain access |
+| `fg-crypto` | Envelope encryption, password-protected files (no IO) |
+| `fg-store` | Encrypted local store (connections, history, ...), migrations, backup/sync primitives |
 | `fg-sql` | Statement splitting and classification, completion |
 | `fg-service` | Pools, query tasks, metadata cache, policy; shared by GUI and MCP |
 | `fg-mcp` | MCP server (stdio + local HTTP) |
