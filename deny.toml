@@ -1,2 +1,20 @@
 [licenses]
 allow = ["Apache-2.0", "MIT", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib", "0BSD", "MPL-2.0", "CC0-1.0", "OpenSSL"]
+
+# RUSTSEC's `unmaintained` notices fire for crates that only reach us transitively: GPUI Kit
+# (text shaping, SVG rasterising, its vendored reqwest, its Linux accessibility stack) and the
+# D-Bus crates behind `keyring`/atspi on Linux. None is a vulnerability, and none can be
+# upgraded away from our side, so each is ignored individually — turning `unmaintained` into a
+# warning instead would also mute advisories for crates we do control.
+# Drop an entry once the offending crate leaves the tree.
+[advisories]
+ignore = [
+  { id = "RUSTSEC-2024-0384", reason = "instant: gpui-base/gpui-component dependency, the suggested web-time replacement is wasm-only" },
+  { id = "RUSTSEC-2024-0436", reason = "paste: proc-macro helper of gpui-component, metal and exr/pulp; archived but functional" },
+  { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile: inside gpui-kit's vendored reqwest; we hand it no PEM - TLS is rustls and keys live in the OS keychain" },
+  { id = "RUSTSEC-2026-0206", reason = "rustybuzz: text shaping through usvg in gpui-fast/gpui-pre" },
+  { id = "RUSTSEC-2026-0192", reason = "ttf-parser: font parsing through fontdb/usvg and gpui-fast in GPUI Kit" },
+  { id = "RUSTSEC-2026-0371", reason = "zbus_names: Linux D-Bus stack behind atspi/accesskit and keyring, no maintained successor yet" },
+  { id = "RUSTSEC-2026-0370", reason = "zvariant: same Linux D-Bus stack as zbus_names" },
+  { id = "RUSTSEC-2026-0372", reason = "zvariant_derive: same Linux D-Bus stack as zbus_names" },
+]

@@ -227,4 +227,7 @@ BREAKING CHANGE: persisted workspace files from older builds need a store migrat
 - M0 已完成；M1 的无界面部分（`fg-sql`、`fg-service`、加密存储）和界面主体（启动页、工作区、只读网格、过滤抽屉、Quick Open、快捷键）已完成并有无头测试；详见 `docs/roadmap.md` 的勾选状态。
 - **界面的视觉效果从未被人眼验证过**，只验证了行为；改视觉相关的东西请让用户本地看一眼。
 - 未完成：启动页的编辑 / 分组 / 搜索、侧栏拖拽调宽、外键跳转、`⌘K` 切换、主题切换界面；M2 起的 SQL 编辑器；同步是 M9。
-- 三端 CI 的实际运行结果尚未确认；`cargo deny check` 在本机没装，新增依赖只做了许可证的人工核对。
+- 三端 CI：macOS / Ubuntu 已过；Windows 只在 `fg-store` 的落盘测试上失败过（文件占用 + 迁移校验和），deny 只在
+  GPUI Kit 传递依赖的 `unmaintained` 通告上失败过，两者都已在 `deny.toml` / 测试里修掉，待 CI 复跑确认。
+- `cargo deny`（本机 0.20.2）可跑；新增依赖若带来 `unmaintained` 通告，在 `deny.toml` 里**逐条**忽略并写清来源，
+  不要把 `unmaintained` 整体降级成 warning。
