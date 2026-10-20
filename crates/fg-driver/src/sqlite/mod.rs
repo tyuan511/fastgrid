@@ -102,21 +102,23 @@ pub struct SqliteSession {
 
 /// Delivers a cancel to a session's SQLite connection.
 ///
-/// `sqlite3_interrupt()` is only seen by a statement that is *already* stepping: an interrupt set
-/// before the first `sqlite3_step()` is cleared when that step begins, so it is lost (measured on
-/// rusqlite 0.40 / bundled SQLite: 25 of 25 pre-step interrupts were ignored, 10 of 10 delivered
-/// mid-step aborted the query). A UI "stop" pressed the moment a query starts therefore lands in
-/// that window now and then, and the query keeps burning a core with nobody able to cancel it.
+/// `sqlite3_interrupt()` is only reliable while an API call is in progress. An interrupt set while
+/// the connection is idle does not survive into the next statement: measured on rusqlite 0.40 with
+/// the bundled SQLite, a single interrupt delivered before a query started was ignored 25 times out
+/// of 25 (the query ran on), while one delivered mid-step aborted 10 out of 10. A UI "stop" pressed
+/// the moment a query starts lands in that window now and then, and the query then keeps burning a
+/// core with nobody able to cancel it.
 ///
 /// Two mechanisms cover the whole span:
 /// * `Cancel::cancelled` is our own flag, never cleared by SQLite, and consulted at every
 ///   checkpoint in `run::run` - it catches a cancel that arrives before a statement starts.
-/// * While a statement is in flight, the cancel is re-delivered every few milliseconds, so an
-///   interrupt that arrived too early is handed to SQLite at a moment when it can observe it.
+/// * While a statement is in flight, the interrupt is re-delivered every few milliseconds, so
+///   whichever call SQLite is actually inside when the cancel arrives, it observes one.
 ///
-/// Both flag writes are `SeqCst`, and the guard is published before the first checkpoint is read,
-/// so a cancel racing with a starting statement always either sees the statement in flight (and
-/// retries) or has its flag visible to that checkpoint.
+/// Both flag writes are `SeqCst`, and the guard is published after the connection is held and
+/// released before it is handed back, so a cancel racing with a starting statement always either
+/// sees it in flight (and retries) or has its flag visible to that statement's first checkpoint -
+/// and a retry can never outlive its statement into the next one.
 #[derive(Clone)]
 struct Cancel {
     interrupt: Arc<InterruptHandle>,
@@ -263,10 +265,11 @@ impl Session for SqliteSession {
         let sql = sql.to_owned();
         let params = params.to_vec();
         tokio::task::spawn_blocking(move || {
-            // Publish before touching SQLite: from here on a cancel has to re-deliver its
-            // interrupt, because the one it sends first can still land before the step starts.
-            let _statement = cancel.statement();
             let guard = lock(&conn);
+            // Published after the connection is held and dropped before it is handed back: a retry
+            // that is still poking would otherwise interrupt whichever statement takes the
+            // connection next. Declaring it after `guard` is what gives it the earlier drop.
+            let _statement = cancel.statement();
             if let Err(run::RunError::Db(e)) =
                 run::run(&guard, &sql, &params, options, &tx, cancel.flag())
             {
@@ -305,27 +308,43 @@ mod tests {
     /// hanging the suite.
     const BUSY: &str = "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 40000000) SELECT sum(i) FROM n";
 
+    fn interrupted(e: &rusqlite::Error) -> bool {
+        matches!(
+            e,
+            rusqlite::Error::SqliteFailure(f, _)
+                if f.code == rusqlite::ffi::ErrorCode::OperationInterrupted
+        )
+    }
+
+    /// Run the busy query and report whether SQLite refused it.
+    fn run_busy(conn: &Connection) -> bool {
+        let mut stmt = match conn.prepare(BUSY) {
+            Ok(stmt) => stmt,
+            Err(e) => return interrupted(&e),
+        };
+        let mut rows = stmt.raw_query();
+        match rows.next() {
+            Ok(_) => false,
+            Err(e) => interrupted(&e),
+        }
+    }
+
     #[test]
     fn a_cancel_that_lands_before_the_first_step_still_stops_the_statement() {
         let conn = Connection::open_in_memory().unwrap();
         let cancel = Cancel::new(Arc::new(conn.get_interrupt_handle()));
 
-        // The statement is published but has not reached SQLite yet: this is the window where
-        // sqlite3_interrupt() is forgotten (verified: 25/25 pre-step interrupts ignored, 10/10
-        // delivered mid-step abort). The cancel must therefore be re-delivered, not just sent.
+        // The statement is published but has not reached SQLite yet: this is the window where one
+        // interrupt on its own is not enough (see `Cancel`). The cancel must therefore be sent
+        // again, not just once.
         let statement = cancel.statement();
         cancel.handle().cancel();
         std::thread::sleep(Duration::from_millis(2));
-
-        let interrupted = {
-            let mut stmt = conn.prepare(BUSY).unwrap();
-            let mut rows = stmt.raw_query();
-            rows.next().is_err()
-        };
+        let stopped = run_busy(&conn);
         drop(statement);
 
         assert!(
-            interrupted,
+            stopped,
             "the retried interrupt must abort the statement, not let it run to completion"
         );
     }
@@ -337,13 +356,21 @@ mod tests {
         let statement = cancel.statement();
         cancel.handle().cancel();
         drop(statement);
-        // The guard is gone, so the retry thread must exit rather than interrupt this connection
-        // forever (a later statement of the session would be killed by a stale cancel).
+        // The guard is gone, so the retry thread must stop rather than keep interrupting this
+        // connection: a late cancel may not poison the session's next work. One straggler poke can
+        // still land while a call is in flight, hence the bounded retry.
         std::thread::sleep(Duration::from_millis(50));
-        assert_eq!(
-            conn.query_row::<i64, _, _>("SELECT 1", [], |r| r.get(0))
-                .unwrap(),
-            1
-        );
+        let mut usable = false;
+        for _ in 0..20 {
+            if conn
+                .query_row::<i64, _, _>("SELECT 1", [], |r| r.get(0))
+                .is_ok()
+            {
+                usable = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(usable, "the retry loop outlived its statement");
     }
 }
