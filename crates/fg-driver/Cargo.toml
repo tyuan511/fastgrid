@@ -16,5 +16,5 @@ sqlite = ["dep:rusqlite", "dep:fallible-iterator"]
 fg-core.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
-rusqlite = { version = "0.40", features = ["bundled", "column_decltype"], optional = true }
+rusqlite = { workspace = true, optional = true }
 fallible-iterator = { version = "0.3", optional = true }

@@ -83,11 +83,13 @@ impl Dialect for MySqlDialect {
     }
 }
 
-pub fn dialect_for(kind: DbKind) -> &'static dyn Dialect {
+/// `None` for engines this build does not know (`DbKind::Unknown`).
+pub fn dialect_for(kind: DbKind) -> Option<&'static dyn Dialect> {
     match kind {
-        DbKind::Sqlite => &SqliteDialect,
-        DbKind::Postgres => &PostgresDialect,
-        DbKind::MySql => &MySqlDialect,
+        DbKind::Sqlite => Some(&SqliteDialect),
+        DbKind::Postgres => Some(&PostgresDialect),
+        DbKind::MySql => Some(&MySqlDialect),
+        _ => None,
     }
 }
 
@@ -117,5 +119,14 @@ mod tests {
     fn limit_clause_omits_zero_offset() {
         assert_eq!(SqliteDialect.limit_clause(10, 0), "LIMIT 10");
         assert_eq!(SqliteDialect.limit_clause(10, 20), "LIMIT 10 OFFSET 20");
+    }
+
+    #[test]
+    fn unknown_engines_have_no_dialect() {
+        assert!(dialect_for(DbKind::Unknown).is_none());
+        assert_eq!(
+            dialect_for(DbKind::Postgres).map(|d| d.kind()),
+            Some(DbKind::Postgres)
+        );
     }
 }

@@ -1606,7 +1606,9 @@ name = "fg-core"
 version = "0.0.1"
 dependencies = [
  "serde",
+ "serde_json",
  "thiserror 2.0.21",
+ "uuid",
 ]
 
 [[package]]

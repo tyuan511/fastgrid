@@ -1,0 +1,157 @@
+//! Records persisted by `fg-store` (besides connections): history, snippets, drafts, audit log,
+//! MCP clients. Same evolution rules as `compat`.
+
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    ConnectionId, DangerReason, DocumentId, McpClientId, SnippetId, StatementClass, UnixMillis,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Outcome {
+    Ok,
+    Error,
+    Cancelled,
+    /// Blocked before reaching the database.
+    NotRun,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum QuerySource {
+    Editor,
+    Grid,
+    Mcp,
+    Import,
+    System,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QueryHistoryEntry {
+    /// Assigned by the store.
+    #[serde(default)]
+    pub id: Option<i64>,
+    pub connection_id: ConnectionId,
+    #[serde(default)]
+    pub namespace: Option<String>,
+    pub sql: String,
+    pub executed_at: UnixMillis,
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+    pub outcome: Outcome,
+    #[serde(default)]
+    pub row_count: Option<u64>,
+    #[serde(default)]
+    pub error: Option<String>,
+    pub source: QuerySource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Snippet {
+    pub id: SnippetId,
+    /// `None` = available on every connection.
+    #[serde(default)]
+    pub connection_id: Option<ConnectionId>,
+    pub title: String,
+    pub sql: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub sort_order: i64,
+    pub created_at: UnixMillis,
+    pub updated_at: UnixMillis,
+}
+
+/// Content of a query tab. Persisted continuously so a crash loses nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryDocument {
+    pub id: DocumentId,
+    pub connection_id: ConnectionId,
+    pub title: String,
+    pub content: String,
+    /// File the user saved this document to, if any.
+    #[serde(default)]
+    pub saved_path: Option<String>,
+    /// Edited since last save to `saved_path`.
+    #[serde(default)]
+    pub dirty: bool,
+    #[serde(default)]
+    pub cursor_offset: Option<u64>,
+    pub created_at: UnixMillis,
+    pub updated_at: UnixMillis,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Actor {
+    User,
+    Mcp { client: String },
+    System,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Decision {
+    /// Policy allowed it without asking.
+    Allowed,
+    /// Policy refused it.
+    Denied,
+    /// A human approved it.
+    Confirmed,
+    /// A human rejected it (or the request timed out).
+    Rejected,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Append-only record of statements run on a user's behalf by anyone other than the user typing
+/// them directly - above all external agents. Never edited; pruned only by explicit user action.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuditEntry {
+    #[serde(default)]
+    pub id: Option<i64>,
+    pub at: UnixMillis,
+    pub actor: Actor,
+    /// Kept even after the connection is deleted.
+    #[serde(default)]
+    pub connection_id: Option<ConnectionId>,
+    /// Snapshot of the name at the time.
+    pub connection_name: String,
+    pub statement: String,
+    pub class: StatementClass,
+    #[serde(default)]
+    pub danger: Option<DangerReason>,
+    pub decision: Decision,
+    #[serde(default)]
+    pub reason: Option<String>,
+    pub outcome: Outcome,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+    #[serde(default)]
+    pub row_count: Option<u64>,
+}
+
+/// An external agent allowed to call the local MCP HTTP endpoint. Only a hash of the token is stored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpClient {
+    pub id: McpClientId,
+    pub name: String,
+    pub token_hash: String,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    pub created_at: UnixMillis,
+    #[serde(default)]
+    pub last_used_at: Option<UnixMillis>,
+    #[serde(default)]
+    pub revoked_at: Option<UnixMillis>,
+}

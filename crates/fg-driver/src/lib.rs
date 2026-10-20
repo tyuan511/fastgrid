@@ -16,8 +16,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use fg_core::{
-    Capabilities, ConnectionConfig, DbKind, Dialect, Error, ObjectInfo, ObjectPath, Result,
-    TableDetail, Value,
+    Capabilities, ConnectionConfig, DbKind, Dialect, Error, ObjectInfo, ObjectPath, Relation,
+    Result, TableDetail, Value,
 };
 
 pub use stream::{Batcher, CancelHandle, Event, ExecOptions, ExecutionStream, Push, ResultSet};
@@ -57,6 +57,23 @@ pub trait Session: Send + Sync {
     async fn list_objects(&self, namespace: Option<&str>) -> Result<Vec<ObjectInfo>>;
 
     async fn describe(&self, path: &ObjectPath) -> Result<TableDetail>;
+
+    /// Every foreign key in a namespace, in one call (reverse references, ER diagrams, MCP).
+    /// The default asks `describe` per table; drivers should override it with a bulk query.
+    async fn list_relations(&self, namespace: Option<&str>) -> Result<Vec<Relation>> {
+        let mut out = Vec::new();
+        for object in self.list_objects(namespace).await? {
+            if object.kind != fg_core::ObjectKind::Table {
+                continue;
+            }
+            let detail = self.describe(&object.path).await?;
+            out.extend(detail.foreign_keys.into_iter().map(|key| Relation {
+                from: object.path.clone(),
+                key,
+            }));
+        }
+        Ok(out)
+    }
 
     /// `CREATE` statement for an object, when `Capabilities::show_ddl`.
     async fn ddl(&self, _path: &ObjectPath) -> Result<Option<String>> {

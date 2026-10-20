@@ -15,7 +15,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use fg_core::{
     Capabilities, ConnectionConfig, ConnectionParams, DbKind, Dialect, Error, ObjectInfo,
-    ObjectPath, Result, TableDetail, Value, dialect_for,
+    ObjectPath, Relation, Result, SqliteDialect, TableDetail, Value,
 };
 use rusqlite::{Connection, InterruptHandle, OpenFlags};
 
@@ -37,14 +37,17 @@ impl Driver for SqliteDriver {
             transactions: true,
             transactional_ddl: true,
             cancel: true,
+            statement_timeout: false,
             read_only_session: true,
             returning: true,
             show_ddl: true,
+            row_estimates: false,
+            column_origin: true,
         }
     }
 
     fn dialect(&self) -> &'static dyn Dialect {
-        dialect_for(DbKind::Sqlite)
+        &SqliteDialect
     }
 
     async fn connect(
@@ -151,6 +154,11 @@ impl Session for SqliteSession {
         self.blocking(move |c| meta::describe(c, &path)).await
     }
 
+    async fn list_relations(&self, namespace: Option<&str>) -> Result<Vec<Relation>> {
+        let ns = namespace.unwrap_or("main").to_owned();
+        self.blocking(move |c| meta::list_relations(c, &ns)).await
+    }
+
     async fn ddl(&self, path: &ObjectPath) -> Result<Option<String>> {
         let path = path.clone();
         self.blocking(move |c| meta::ddl(c, &path)).await
@@ -201,5 +209,5 @@ impl Session for SqliteSession {
 }
 
 pub(crate) fn quote(ident: &str) -> String {
-    dialect_for(DbKind::Sqlite).quote_ident(ident)
+    SqliteDialect.quote_ident(ident)
 }

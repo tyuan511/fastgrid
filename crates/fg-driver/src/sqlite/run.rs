@@ -1,7 +1,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use fallible_iterator::FallibleIterator;
-use fg_core::{ColumnMeta, Error, QueryError, Value};
+use fg_core::{ColumnMeta, ColumnOrigin, Error, QueryError, Value};
 use rusqlite::{Batch, Connection, ErrorCode};
 use tokio::sync::mpsc::Sender;
 
@@ -17,6 +18,12 @@ pub enum RunError {
 impl From<rusqlite::Error> for RunError {
     fn from(e: rusqlite::Error) -> Self {
         RunError::Db(map_err(e))
+    }
+}
+
+impl From<Error> for RunError {
+    fn from(e: Error) -> Self {
+        RunError::Db(e)
     }
 }
 
@@ -53,6 +60,10 @@ fn check_cancelled(cancelled: &AtomicBool) -> Result<(), RunError> {
     }
 }
 
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
 pub fn run(
     conn: &Connection,
     sql: &str,
@@ -70,21 +81,36 @@ pub fn run(
                 "parameters are only supported for single statements",
             ))));
         }
-        index += 1;
+        let started = Instant::now();
         for (i, p) in params.iter().enumerate() {
-            stmt.raw_bind_parameter(i + 1, to_sql(p))?;
+            stmt.raw_bind_parameter(i + 1, to_sql(p)?)?;
         }
 
-        let columns: Vec<ColumnMeta> = stmt
+        let decls: Vec<Option<String>> = stmt
             .columns()
             .iter()
-            .map(|c| ColumnMeta {
-                name: c.name().to_owned(),
-                data_type: data_type(c.decl_type()),
+            .map(|c| c.decl_type().map(str::to_owned))
+            .collect();
+        let columns: Vec<ColumnMeta> = stmt
+            .columns_with_metadata()
+            .iter()
+            .zip(&decls)
+            .map(|(c, decl)| {
+                let mut meta = ColumnMeta::new(c.name(), data_type(decl.as_deref()));
+                meta.origin = match (c.table_name(), c.origin_name()) {
+                    (Some(table), Some(column)) => Some(ColumnOrigin {
+                        namespace: c.database_name().map(str::to_owned),
+                        table: table.to_owned(),
+                        column: column.to_owned(),
+                    }),
+                    _ => None,
+                };
+                meta
             })
             .collect();
         let col_count = columns.len();
-        send(tx, Event::ResultStart { columns })?;
+        send(tx, Event::ResultStart { index, columns })?;
+        index += 1;
 
         if col_count == 0 {
             let changed = stmt.raw_execute()?;
@@ -92,7 +118,10 @@ pub fn run(
                 tx,
                 Event::ResultEnd {
                     affected_rows: Some(changed as u64),
+                    last_insert_id: None,
                     truncated: false,
+                    elapsed_ms: elapsed_ms(started),
+                    warnings: Vec::new(),
                 },
             )?;
             continue;
@@ -126,7 +155,10 @@ pub fn run(
             tx,
             Event::ResultEnd {
                 affected_rows: None,
+                last_insert_id: None,
                 truncated,
+                elapsed_ms: elapsed_ms(started),
+                warnings: Vec::new(),
             },
         )?;
     }

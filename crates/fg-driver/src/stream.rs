@@ -7,16 +7,25 @@ use tokio::sync::mpsc;
 /// `ResultStart`, zero or more `Rows`, then `ResultEnd`. Statements that return no rows
 /// (INSERT, DDL, ...) have empty `columns`.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum Event {
     ResultStart {
+        /// 0-based index of the statement within the `execute` call.
+        index: usize,
         columns: Vec<ColumnMeta>,
     },
     Rows(Vec<Vec<Value>>),
     ResultEnd {
         affected_rows: Option<u64>,
+        /// Generated key of the last inserted row, where the protocol reports it (MySQL).
+        last_insert_id: Option<u64>,
         /// The row limit in `ExecOptions::max_rows` cut the result short.
         truncated: bool,
+        elapsed_ms: u64,
+        warnings: Vec<String>,
     },
+    /// Server message not tied to a result (PostgreSQL `NOTICE`, ...).
+    Notice(String),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -25,6 +34,11 @@ pub struct ExecOptions {
     pub batch_size: usize,
     /// Stop a result set after this many rows and flag it truncated.
     pub max_rows: Option<usize>,
+    /// Replace text/bytes/JSON cells larger than this by `Value::Truncated`.
+    pub max_cell_bytes: Option<usize>,
+    /// Abort a statement after this long. Only enforced when
+    /// `Capabilities::statement_timeout`; otherwise ignored.
+    pub statement_timeout_secs: Option<u32>,
 }
 
 impl Default for ExecOptions {
@@ -32,6 +46,8 @@ impl Default for ExecOptions {
         Self {
             batch_size: 500,
             max_rows: None,
+            max_cell_bytes: None,
+            statement_timeout_secs: None,
         }
     }
 }
@@ -77,11 +93,14 @@ impl ExecutionStream {
         let mut sets: Vec<ResultSet> = Vec::new();
         while let Some(event) = self.next().await {
             match event? {
-                Event::ResultStart { columns } => sets.push(ResultSet {
+                Event::ResultStart { columns, .. } => sets.push(ResultSet {
                     columns,
                     rows: Vec::new(),
                     affected_rows: None,
+                    last_insert_id: None,
                     truncated: false,
+                    elapsed_ms: 0,
+                    warnings: Vec::new(),
                 }),
                 Event::Rows(mut rows) => match sets.last_mut() {
                     Some(set) => set.rows.append(&mut rows),
@@ -89,13 +108,20 @@ impl ExecutionStream {
                 },
                 Event::ResultEnd {
                     affected_rows,
+                    last_insert_id,
                     truncated,
+                    elapsed_ms,
+                    warnings,
                 } => {
                     if let Some(set) = sets.last_mut() {
                         set.affected_rows = affected_rows;
+                        set.last_insert_id = last_insert_id;
                         set.truncated = truncated;
+                        set.elapsed_ms = elapsed_ms;
+                        set.warnings = warnings;
                     }
                 }
+                Event::Notice(_) => {}
             }
         }
         Ok(sets)
@@ -107,7 +133,10 @@ pub struct ResultSet {
     pub columns: Vec<ColumnMeta>,
     pub rows: Vec<Vec<Value>>,
     pub affected_rows: Option<u64>,
+    pub last_insert_id: Option<u64>,
     pub truncated: bool,
+    pub elapsed_ms: u64,
+    pub warnings: Vec<String>,
 }
 
 /// What the driver should do after pushing a row.
@@ -124,6 +153,7 @@ pub enum Push {
 pub struct Batcher {
     batch_size: usize,
     max_rows: Option<usize>,
+    max_cell_bytes: Option<usize>,
     buf: Vec<Vec<Value>>,
     count: usize,
     truncated: bool,
@@ -134,6 +164,7 @@ impl Batcher {
         Self {
             batch_size: options.batch_size.max(1),
             max_rows: options.max_rows,
+            max_cell_bytes: options.max_cell_bytes,
             buf: Vec::new(),
             count: 0,
             truncated: false,
@@ -147,6 +178,13 @@ impl Batcher {
             return Push::Stop(std::mem::take(&mut self.buf));
         }
         self.count += 1;
+        let row = match self.max_cell_bytes {
+            Some(max) => row
+                .into_iter()
+                .map(|v| v.truncated_if_larger(max))
+                .collect(),
+            None => row,
+        };
         self.buf.push(row);
         if self.buf.len() >= self.batch_size {
             Push::Flush(std::mem::take(&mut self.buf))
@@ -173,7 +211,7 @@ mod tests {
     fn flushes_every_batch_and_returns_the_rest() {
         let mut b = Batcher::new(ExecOptions {
             batch_size: 2,
-            max_rows: None,
+            ..ExecOptions::default()
         });
         assert_eq!(b.push(row(1)), Push::Continue);
         assert_eq!(b.push(row(2)), Push::Flush(vec![row(1), row(2)]));
@@ -182,10 +220,23 @@ mod tests {
     }
 
     #[test]
+    fn oversized_cells_are_truncated() {
+        let mut b = Batcher::new(ExecOptions {
+            max_cell_bytes: Some(3),
+            ..ExecOptions::default()
+        });
+        b.push(vec![Value::Text("hello".into()), Value::Int(1)]);
+        let (rows, _) = b.finish();
+        assert!(matches!(rows[0][0], Value::Truncated(_)));
+        assert_eq!(rows[0][1], Value::Int(1));
+    }
+
+    #[test]
     fn truncates_only_when_an_extra_row_exists() {
         let opts = ExecOptions {
             batch_size: 10,
             max_rows: Some(2),
+            ..ExecOptions::default()
         };
         let mut exact = Batcher::new(opts);
         exact.push(row(1));

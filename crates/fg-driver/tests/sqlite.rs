@@ -1,23 +1,19 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::collections::BTreeMap;
 use std::time::Duration;
 
 use fg_core::{
-    ConnectionConfig, ConnectionId, ConnectionParams, DbKind, Error, ObjectKind, ObjectPath,
+    ConnectionConfig, ConnectionParams, DbKind, Error, ObjectKind, ObjectPath, ReferentialAction,
     TypeCategory, Value,
 };
 use fg_driver::{Event, ExecOptions, Session, driver_for};
 
 fn config(path: &str) -> ConnectionConfig {
-    ConnectionConfig {
-        id: ConnectionId("t".into()),
-        name: "test".into(),
-        kind: DbKind::Sqlite,
-        params: ConnectionParams::File { path: path.into() },
-        options: BTreeMap::new(),
-        is_production: false,
-    }
+    ConnectionConfig::new(
+        "test",
+        DbKind::Sqlite,
+        ConnectionParams::File { path: path.into() },
+    )
 }
 
 async fn memory() -> Box<dyn Session> {
@@ -118,7 +114,7 @@ async fn rows_stream_in_batches() {
             &[],
             ExecOptions {
                 batch_size: 4,
-                max_rows: None,
+                ..ExecOptions::default()
             },
         )
         .await
@@ -139,6 +135,7 @@ async fn max_rows_truncates_and_flags_it() {
     let opts = |max| ExecOptions {
         batch_size: 3,
         max_rows: Some(max),
+        ..ExecOptions::default()
     };
     let cut = s
         .execute(q, &[], opts(5))
@@ -228,7 +225,7 @@ async fn metadata_roundtrip() {
     assert_eq!(fk.columns, vec!["author_id"]);
     assert_eq!(fk.referenced.name, "authors");
     assert_eq!(fk.referenced_columns, vec!["id"]);
-    assert_eq!(fk.on_delete.as_deref(), Some("CASCADE"));
+    assert_eq!(fk.on_delete, Some(ReferentialAction::Cascade));
 
     let ddl = s
         .ddl(&ObjectPath::new(None, "authors"))
@@ -238,6 +235,78 @@ async fn metadata_roundtrip() {
     assert!(ddl.starts_with("CREATE TABLE authors"));
 
     assert!(s.describe(&ObjectPath::new(None, "nope")).await.is_err());
+}
+
+#[tokio::test]
+async fn relations_are_listed_in_one_call() {
+    let s = seeded().await;
+    let rels = s.list_relations(None).await.unwrap();
+    assert_eq!(rels.len(), 1);
+    assert_eq!(rels[0].from.name, "books");
+    assert_eq!(rels[0].key.referenced.name, "authors");
+}
+
+#[tokio::test]
+async fn result_columns_know_their_origin() {
+    let s = seeded().await;
+    let sets = run(
+        &*s,
+        "SELECT b.title AS t, a.name, upper(b.title) AS shout FROM books b JOIN authors a ON a.id = b.author_id",
+    )
+    .await;
+    let cols = &sets[0].columns;
+    let o = |i: usize| {
+        cols[i]
+            .origin
+            .as_ref()
+            .map(|o| (o.table.as_str(), o.column.as_str()))
+    };
+    assert_eq!(o(0), Some(("books", "title")), "aliases keep their origin");
+    assert_eq!(o(1), Some(("authors", "name")));
+    assert_eq!(o(2), None, "expressions have no origin");
+}
+
+#[tokio::test]
+async fn oversized_cells_arrive_truncated() {
+    let s = memory().await;
+    let sets = s
+        .execute(
+            "SELECT 'abcdefghij' AS big, 'ab' AS small",
+            &[],
+            ExecOptions {
+                max_cell_bytes: Some(4),
+                ..ExecOptions::default()
+            },
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    match &sets[0].rows[0][0] {
+        Value::Truncated(t) => {
+            assert_eq!(t.total_len, 10);
+            assert_eq!(t.preview, b"abcd");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(sets[0].rows[0][1], Value::Text("ab".into()));
+}
+
+#[tokio::test]
+async fn statements_report_index_and_timing() {
+    let s = memory().await;
+    let mut stream = s
+        .execute("SELECT 1; SELECT 2", &[], ExecOptions::default())
+        .await
+        .unwrap();
+    let mut starts = Vec::new();
+    while let Some(ev) = stream.next().await {
+        if let Event::ResultStart { index, .. } = ev.unwrap() {
+            starts.push(index);
+        }
+    }
+    assert_eq!(starts, vec![0, 1]);
 }
 
 #[tokio::test]

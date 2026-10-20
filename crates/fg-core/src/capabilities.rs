@@ -15,10 +15,16 @@ pub struct Capabilities {
     pub transactional_ddl: bool,
     /// Running statements can be cancelled from another task.
     pub cancel: bool,
+    /// `ExecOptions::statement_timeout_secs` is enforced by the driver.
+    pub statement_timeout: bool,
     /// The session can be switched to read-only (`Session::set_read_only`).
     pub read_only_session: bool,
     /// `INSERT/UPDATE/DELETE ... RETURNING`.
     pub returning: bool,
     /// `Session::ddl` can return a CREATE statement.
     pub show_ddl: bool,
+    /// `ObjectInfo::row_estimate` is populated.
+    pub row_estimates: bool,
+    /// Result columns carry `ColumnMeta::origin` (needed for editable query results).
+    pub column_origin: bool,
 }
