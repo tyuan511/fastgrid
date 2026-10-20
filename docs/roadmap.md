@@ -1,28 +1,293 @@
 # Roadmap
 
-Estimates assume one full-time developer.
+## 范围
 
-| Milestone | Scope | Time |
+**一期（v0.x → v1.0）支持三个引擎：SQLite、PostgreSQL、MySQL（含 MariaDB）。** 其他引擎不在一期范围内。
+
+定位：对标 TablePlus 的原生速度与交互手感（调研见 [tableplus-interaction-research.md](tableplus-interaction-research.md)），
+加上开源免费，以及面向外部 agent 的 MCP。
+
+估算以一名全职开发者为准，只是排期参考，不是承诺。每个里程碑结束时都应是**可运行、可演示**的状态。
+
+| 里程碑 | 主题 | 估时 | 累计 |
+|---|---|---|---|
+| M0 | 骨架与技术验证 | ✅ 已完成 | — |
+| M1 | 数据层补全 + 应用外壳（SQLite 端到端浏览） | 5w | 5w |
+| M2 | SQL 编辑器 + 一级安全模式 | 3w | 8w |
+| M2.5 | MCP 只读 MVP | 1w | 9w |
+| M3 | 暂存变更与数据编辑 | 4w | 13w |
+| M4 | PostgreSQL | 3w | 16w |
+| M5 | MySQL / MariaDB | 2.5w | 18.5w |
+| M6 | 表结构管理 + 导入导出 | 3w | 21.5w |
+| M7 | MCP 完整版 | 3w | 24.5w |
+| M8 | 打磨与发布 | 3w | 27.5w |
+
+总计约 27 周（6 个多月）。排序的原因：先用最简单的引擎（SQLite，无网络、无认证）把 UI 与交互打磨到位，
+再接入网络型引擎，这样 M4/M5 只是在已验证的抽象上新增驱动，而不是同时调试驱动和界面。
+
+---
+
+## M0 骨架与技术验证 ✅
+
+- [x] Cargo workspace、8 个 crate、Apache-2.0、`cargo-deny` 配置
+- [x] 三端 CI 配置（fmt / clippy / test / deny）。**状态：配置已写好，三端实际运行结果尚未确认**
+- [x] 网格性能验证：gpui-kit `DataTable`，100 万行 × 200 列，macOS 上平均 59.9fps、
+      无超过 100ms 的帧、60 秒内存增长不足 1MB（数据现场生成，见 `crates/fg-app/examples/grid_spike.rs`）。
+      Windows / Linux 未测
+- [x] 数据层抽象设计（[driver-abstraction.md](driver-abstraction.md)）
+- [x] SQLite 驱动：多语句、参数绑定、流式批处理、行数上限、取消、只读会话、元数据（12 个集成测试）
+
+---
+
+## M1 数据层补全 + 应用外壳（5w）
+
+目标：能在 GUI 里打开 SQLite 文件，浏览所有表，网格滚动流畅，具备 TablePlus 式的整体布局。**本里程碑只读，不含编辑。**
+
+### M1.0 数据层补全（1w）
+
+调研报告的需求暴露出抽象里的缺口，在做网格之前补上，避免之后改接口：
+
+- [ ] `ColumnMeta.origin`：结果列的来源（namespace / table / column），用于「可编辑的查询结果」。
+      SQLite 用列元数据；PG 用表 OID + 列号；MySQL 用 org_table / org_name
+- [ ] `Session::list_relations(namespace)`：批量返回全库外键，供反向引用、ER 图、MCP 使用（避免逐表 N 次往返）
+- [ ] `ObjectInfo.row_estimate`：对象树中的行数估算（SQLite 无廉价估算，返回 `None`）
+- [ ] `fg-sql`：结构化过滤条件（列、操作符、值）→ 经 `Dialect` 编译为带参数的 SQL；浏览查询构造器（分页、排序、过滤）
+- [ ] `fg-sql`：语句拆分（分号感知，处理字符串、注释、`$$`）与基础语句分类（只读 / 写 / DDL / 未知）
+- [ ] 以上全部有单元或集成测试；更新 `driver-abstraction.md`
+
+**验收**：`cargo test --workspace` 通过；`list_relations` 在含外键的 SQLite 库上返回正确结果。
+
+### M1.1 `fg-store` 与 `fg-service` 最小版（1w）
+
+- [ ] `fg-store`：本地 SQLite 存储（连接、分组、设置、最近打开）；迁移机制；密码走系统钥匙串（`keyring`）
+- [ ] `fg-service`：会话管理（按连接/标签持有 `Session`）、任务生命周期（执行、取消、完成事件）、
+      元数据缓存（TTL + 手动刷新）、tokio runtime 与 GPUI 之间的通道桥接
+- [ ] 取消语义：同一会话上新任务启动时，不得误取消新任务（M0 遗留的已知问题）
+- [ ] 测试：服务层对 SQLite 的端到端测试（无 GUI）
+
+### M1.2 应用外壳（1.5w）
+
+对应调研报告 §3、§4.1–4.3：
+
+- [ ] 主窗口布局：顶栏、标签栏、左侧栏（可拖拽调整宽度，双击复位/折叠）、主工作区、底部状态栏
+- [ ] 连接启动页：分组、环境色标、搜索、新建/编辑/复制/删除；SQLite 文件选择器
+- [ ] 顶栏环境胶囊：显示连接名与环境色；`⌘K` 数据库/命名空间切换浮层
+- [ ] 左侧对象树：按类型分组（表 / 视图）、行数估算、顶部过滤框、键盘导航（↑↓←→ Enter）
+- [ ] 多标签：打开、关闭、切换、恢复上次会话
+- [ ] `⌘P` Quick Open（模糊匹配，高亮命中字符）
+- [ ] 明暗主题，使用 token 定义（见调研报告 §10），不写死颜色
+
+### M1.3 只读数据网格（1.5w）
+
+对应调研报告 §4.4、§4.5、§5.1：
+
+- [ ] 基于 `DataTable` 的表浏览：分页（100/300/1000）、预取下一页、后台 `COUNT(*)`
+- [ ] 表头：列名 + 类型徽章 + 外键标识 + 排序（含多列排序优先级）、列宽拖拽、双击自适应、列重排
+- [ ] 单元格渲染：数值/日期/UUID 等宽字体；`NULL` 以斜体/药丸与字符串 "NULL" 区分；布尔、大字段摘要（`[JSON 4 keys]`、`[BLOB 45 KB]`）
+- [ ] 选区：单元格 / 行 / 范围；`⌘C` 复制为 TSV
+- [ ] 过滤抽屉（`⌘F`）：多条规则、启停、Raw SQL 模式
+- [ ] 底部状态栏：过滤徽章、列可见性、分页大小、行数与耗时
+- [ ] 外键单元格：点击跳转到目标表并自动带过滤条件（正向）
+- [ ] 验证 gpui-kit 能力缺口并记录结论：范围选区、行号槽状态条、冻结列、自定义单元格覆盖层
+
+**M1 验收标准**
+
+- 打开一个 100 万行的 SQLite 表：首屏出数据 < 200ms；滚动 60fps；内存随结果集线性增长且有上限
+- 切换标签、折叠侧栏、拖动分割线无明显卡顿
+- 全程仅键盘可完成：打开连接 → `⌘P` 打开表 → 过滤 → 翻页
+- macOS / Windows / Linux 三端均能构建并启动（CI 绿）
+
+---
+
+## M2 SQL 编辑器 + 一级安全模式（3w）
+
+对应调研报告 §7、§8。
+
+- [ ] 编辑器：基于 gpui-kit 的 Editor，SQL 语法高亮（Tree-sitter）、行号、多光标
+- [ ] 执行：`⌘↵` 运行当前语句（分号感知并高亮）、`⌘⇧↵` 运行全部、选中优先；`Esc` / `⌘.` 取消
+- [ ] 结果区：多结果集标签、消息/日志（耗时、影响行数）、错误位置下划线（用 `QueryError.position`）
+- [ ] 补全：关键字 / 表 / 列（依赖元数据缓存），列优先于表优先于关键字
+- [ ] 格式化 SQL；注释切换
+- [ ] 查询历史（`⌘Y`）与收藏片段，持久化到 `fg-store`；未保存内容崩溃恢复
+- [ ] EXPLAIN：文本形式展示（SQLite 的 `EXPLAIN QUERY PLAN`）
+- [ ] 安全模式 L0 / L1 / 只读：连接级设置；L1 拦截 `DROP` / `TRUNCATE` / 无 `WHERE` 的 `UPDATE`/`DELETE`，弹确认框并展示语句
+- [ ] 环境色标驱动默认安全级别（生产 → L1）
+
+**验收**
+
+- 在 10 万行结果上执行查询，UI 在流式接收时保持响应，可中途取消
+- 语句拆分与分类通过针对字符串、注释、嵌套引号的测试集
+- L1 对「无 WHERE 的 DELETE」必定拦截（有测试）；只读模式下任何写语句都被拒绝
+
+---
+
+## M2.5 MCP 只读 MVP（1w）
+
+目的：尽早让 `fg-service` 被第二个调用方（外部 agent）验证，暴露抽象问题。
+
+- [ ] `fastgrid-cli mcp --stdio`（`rmcp`）：无头运行，与 GUI 共享 `fg-store` 里的连接配置
+- [ ] 工具：`list_connections`、`list_namespaces`、`describe_table`、`run_query`（强制只读 + `max_rows` + 超时）
+- [ ] 标为生产的连接默认不暴露
+- [ ] 与 Claude Desktop / Claude Code 联调并记录配置示例
+
+**验收**：外部 agent 能完成「列出表 → 查看结构 → 查询」；尝试写入会被拒绝（引擎层与语句分类两层都有测试）。
+
+---
+
+## M3 暂存变更与数据编辑（4w）
+
+对应调研报告 §1.2、§4.4.4、§4.6、§5.2、§12.2。这是体验上最接近 TablePlus 的核心。
+
+- [ ] Changeset 覆盖层：基线快照不可变；`modified_cells` / `inserted_rows` / `deleted_row_ids`；
+      行标识用主键，无主键的表只读并说明原因
+- [ ] 渲染合成：修改（黄）/ 新增（绿）/ 删除（红 + 删除线）；行号槽左侧 3px 状态条；`O(1)` 查表，不影响滚动性能
+- [ ] 行内编辑：双击 / `Enter` / 直接键入；`Tab` / `⇧Tab` / `Enter` / `Esc` 流转；枚举与外键字段的下拉
+- [ ] 行操作：插入、克隆（自增主键清空）、删除标记 / 恢复；`Set NULL` / `Set Empty` / `Set Default`；单点还原
+- [ ] 撤销 / 重做栈（纯内存）
+- [ ] DML 编译：`fg-sql` 基于 `Dialect` 生成 `INSERT` / `UPDATE` / `DELETE`（带参数）；用 `RETURNING` 或回读获取默认值和自增主键
+- [ ] 顶栏暂存胶囊（计数）、预览 SQL 弹窗（`⌘⇧P`）、提交（`⌘S`，单事务）、放弃全部（二次确认）
+- [ ] 提交失败：整体回滚并定位到出错的那一行
+- [ ] 行详情检查器（`Space`）：Text / JSON 模式，JSON 校验与格式化；与网格单元格双向同步
+- [ ] 可编辑的查询结果：基于 `ColumnMeta.origin` 与主键检测；无法安全定位则只读
+- [ ] 安全模式与提交联动：L1 在批量提交前确认
+
+**验收**
+
+- 混合 1000 个修改 / 新增 / 删除后提交：单事务、语句正确；任一失败则全部回滚（测试覆盖）
+- 在 100 万行表上存在暂存变更时滚动仍为 60fps
+- 撤销 / 重做 / 放弃不产生任何数据库往返
+- 对每类 DML 有基于属性的测试：生成的 SQL 执行后，表内容与预期变更集一致
+
+---
+
+## M4 PostgreSQL（3w）
+
+在已验证的抽象与界面上新增驱动。
+
+- [ ] `fg-driver/src/postgres/`：`tokio-postgres` + rustls；连接池由 `fg-service` 统一管理
+- [ ] 异步流式发送辅助函数（补齐 M0 遗留的「已知缺口」），复用 `Batcher`
+- [ ] 取消：cancel token；只读：`SET TRANSACTION READ ONLY` / `default_transaction_read_only`
+- [ ] 元数据：`pg_catalog`（schema、表、视图、物化视图、列、主键、索引、外键、注释、行数估算 `reltuples`）；`pg_get_*` 生成 DDL
+- [ ] 类型解码矩阵：整数 / 浮点 / `numeric`（保持精度）/ `text` / `bytea` / `bool` / `date` / `time` / `timestamp(tz)` / `interval` /
+      `uuid` / `json(b)` / 数组 / 枚举 / 范围 / `inet` / `bit` / 几何 / 未知类型（走 `Value::Other`）
+- [ ] `fg-service`：SSH 隧道（`russh`，密码 / 私钥 / agent）与 TLS（Disable ~ Verify-Full、客户端证书）—— 驱动无感知
+- [ ] 连接配置界面（网络型）：host / port / user / password / database、环境色标、SSL、SSH、连接 URL 粘贴自动解析、测试连接（显示延迟与精确错误）
+- [ ] 数据库切换（`⌘K`）：PG 通过重连实现
+- [ ] 方言细节：`$n` 占位符、`RETURNING`、事务性 DDL、`EXPLAIN`
+- [ ] 共享的行为测试（与 SQLite 同一组场景）通过 testcontainers 在 PG 12–17 上运行
+
+**验收**
+
+- 行为测试在 PG 12 / 14 / 16 / 17 全部通过
+- 类型矩阵每种类型都有「读 → 显示 → 编辑 → 提交」的往返测试
+- 通过 SSH 隧道 + `verify-full` TLS 能连接并浏览；取消一个 `pg_sleep(60)` 在 1 秒内生效
+- 网格性能指标与 SQLite 相当（同等行数下滚动 60fps）
+
+---
+
+## M5 MySQL / MariaDB（2.5w）
+
+- [ ] `fg-driver/src/mysql/`：`mysql_async` + rustls
+- [ ] 取消：旁路连接执行 `KILL QUERY`；只读：`START TRANSACTION READ ONLY`
+- [ ] 元数据：`information_schema`；`SHOW CREATE TABLE`；数据库即命名空间（`list_databases` == `list_namespaces`，`USE` 切换无需重连）
+- [ ] 类型解码：有符号 / 无符号整数、`decimal`、`tinyint(1)` 布尔约定、`enum` / `set`、`json`、`bit`、
+      日期时间（含 `0000-00-00` 零值日期）、`blob` 系列、字符集与排序规则
+- [ ] 多语句与多结果集（`CLIENT_MULTI_STATEMENTS`）
+- [ ] 方言细节：反引号、`?` 占位符、`LIMIT` 写法、无 `RETURNING`（MariaDB 有）→ 回读策略；DDL 隐式提交的提示
+- [ ] 复用 M4 的 SSH / TLS / 连接界面
+- [ ] 行为测试在 MySQL 5.7 / 8.0 / 8.4 与 MariaDB 10.6 / 11 上通过
+
+**验收**
+
+- 与 M4 相同的行为测试集与类型往返测试全部通过
+- 无符号 `bigint` 最大值、零值日期、`utf8mb4` 表情字符的往返无损
+- 在一次提交中执行 DDL 时，UI 明确提示「MySQL 的 DDL 无法回滚」
+
+---
+
+## M6 表结构管理 + 导入导出（3w）
+
+对应调研报告 §6、§9。
+
+- [ ] 数据 / 结构双模切换（`⌘⌃[` / `⌘⌃]`）
+- [ ] 结构查看：列、索引、外键、DDL 原文
+- [ ] 结构编辑（进入同一套暂存机制）：增删改列、索引、外键；按方言生成 `ALTER TABLE` 并预览。
+      SQLite 的限制（需要重建表）要明确处理并向用户说明
+- [ ] 创建 / 删除 / 重命名表
+- [ ] 导出向导（`⌘⇧E`）：CSV / JSON / SQL；表或查询结果；仅结构 / 仅数据；gzip；**流式，内存占用与行数无关**
+- [ ] CSV 导入：预览前 10 行、列映射矩阵、错误策略（中止 / 跳过并记录）、批量事务
+- [ ] 反向引用：在主键单元格上列出全库引用它的子表，并一键带条件打开（基于 `list_relations`）
+
+**验收**
+
+- 导出 1000 万行表到 CSV：内存峰值 < 200MB（有基准测试）
+- 三个引擎上的列增删改往返测试通过，生成的 DDL 有快照测试
+- 导入 100 万行 CSV 成功，错误行被记录
+
+---
+
+## M7 MCP 完整版（3w）
+
+详见 [mcp-security.md](mcp-security.md)。
+
+- [ ] 本地 Streamable HTTP：仅监听 127.0.0.1，随机 bearer token，GUI 中可轮换
+- [ ] 复用 GUI 已建立的会话与连接（可选）
+- [ ] 工具补全：`explain`、`sample_rows`、`list_relations`、`find_references`（反向引用）、受控的 `execute_write`
+- [ ] 资源：按连接导出 schema 快照
+- [ ] 写入门控：连接级开关 + 每条语句需 GUI 确认；无头模式默认拒绝；超时自动拒绝
+- [ ] 统一策略引擎：GUI 的安全模式与 MCP 的限制合并到 `fg-service` 一处实现（只读、行数 / 超时上限、生产连接可见性）
+- [ ] 审计日志：落本地，GUI 内可查看 / 过滤 / 导出（agent、连接、语句、结果、耗时）
+- [ ] 提示注入防护：工具返回内容明确标注为「数据」；超长结果截断并提示
+
+**验收**
+
+- 安全测试集：试图绕过只读（多语句、注释、CTE 写入、`SELECT ... INTO`、存储过程）全部被拒绝
+- 写入未经 GUI 确认时一定失败；审计日志与实际执行一一对应
+- 用 Claude Desktop / Cursor / Claude Code 分别完成一次端到端演示
+
+---
+
+## M8 打磨与发布（3w）
+
+- [ ] 快捷键体系定稿（见 [shortcuts.md](shortcuts.md)）与命令面板；Escape 逐级退出
+- [ ] 崩溃恢复、日志与诊断包导出、遥测（默认关闭）
+- [ ] 无障碍与键盘可达性检查；中英文界面
+- [ ] 三端打包：macOS（签名 + 公证，dmg）、Windows（msi，签名）、Linux（AppImage + deb）；自动更新
+- [ ] 性能回归进入 CI（解码基准、滚动 / 内存固定数据集）
+- [ ] 文档站：快速开始、各引擎连接指南、MCP 配置、贡献指南、驱动开发指南
+- [ ] Beta 发布 → 收集反馈 → v1.0
+
+**发布门槛**
+
+- 三端 CI 全绿；三个引擎的行为测试全绿
+- 无已知的数据丢失 / 误写类缺陷
+- 第一次启动到浏览第一张表 < 1 分钟（有真人试用记录）
+
+---
+
+## 贯穿所有里程碑的要求
+
+| 方面 | 要求 |
+|---|---|
+| 性能预算 | 首屏 < 200ms；滚动 60fps；UI 线程不做 IO；结果集流式，内存有上限 |
+| 稳定性 | 生产路径不使用 `unwrap` / `expect`；所有错误可展示且不崩溃；长任务可取消 |
+| 测试 | 每个驱动跑同一组行为测试；解码做属性测试；关键 UI 流程用 `gpui_kit::test` |
+| 安全 | 密码仅存钥匙串；日志不含凭据；MCP 默认只读 |
+| 跨平台 | 每个里程碑结束前在三端各构建一次，不攒到最后 |
+| 文档 | 抽象变更必须同步 `driver-abstraction.md`；安全相关变更同步 `mcp-security.md` |
+
+## 一期明确不做
+
+其他数据库引擎、云同步与账号、团队协作、插件系统、应用内 AI 对话（NL2SQL，计划二期）、
+分屏与标签拖出为新窗口、图片 / 日期选择等检查器模式、分区与触发器管理、用户与权限管理、ER 图、数据对比。
+
+## 主要风险
+
+| 风险 | 影响 | 应对 |
 |---|---|---|
-| **M0** Skeleton | Workspace, 3-OS CI, grid performance spike (1M rows x 200 cols) | 1w |
-| **M1a** Data layer + SQLite | Driver abstraction (see driver-abstraction.md), SQLite driver, connection manager, schema tree, data grid (sort/filter/page), multi-tab | 2w |
-| **M1b** PostgreSQL & MySQL | Both drivers against the same contracts, SSL/SSH tunnel, shared behavioural tests via testcontainers | 3w |
-| **M2** SQL editor | Highlighting, multi-statement execution, completion, multiple result sets, EXPLAIN, history/favorites | 3w |
-| **M2.5** MCP read-only MVP | `fastgrid-cli mcp --stdio` with list/describe/read-only query | 1w |
-| **M3** Edit & structure | Inline edit with pending-changes area and SQL preview, structure editing with DDL preview, import/export (streamed) | 3w |
-| **M4** MCP complete | Local HTTP endpoint with token, write tools with GUI confirmation, audit log, resources | 3w |
-| **M5** Polish & release | Shortcuts, command palette, crash recovery, signed packages for 3 OSes, auto-update, docs site | 3w |
-
-## M0 acceptance
-
-- `cargo run -p fg-app` opens a window on macOS, Windows, Linux.
-- Mock-data grid: 1M rows x 200 cols scrolls at 60fps with bounded memory.
-- CI green on all three OSes (fmt, clippy, test, cargo-deny).
-
-## Out of scope for phase 1
-
-Other databases, cloud sync, team features, plugin system, in-app AI chat (NL2SQL; planned phase 2).
-
-## Later
-
-ER diagram, data diff, users/privileges, process list, more drivers (SQLite, ClickHouse, ...).
+| gpui-kit 的 Table 缺少范围选区 / 覆盖层 / 状态条等能力 | M1.3、M3 返工 | M1.3 开头先逐项验证；必要时向上游贡献或在本仓库封装 |
+| 类型兼容的长尾问题（尤其 MySQL 零值日期、PG 范围 / 几何） | 数据显示错误甚至误写 | 类型往返测试矩阵；未知类型一律走 `Value::Other` 且只读 |
+| 暂存提交的行标识（无主键、复合主键、主键被修改） | 误改数据 | 无主键只读；提交前校验影响行数 == 1，否则回滚 |
+| 三端差异（字体渲染、钥匙串、打包签名） | M8 集中爆雷 | 每个里程碑三端构建；M1 起就接钥匙串 |
+| MCP 写入是最大风险面 | 数据被 agent 误改 | 门控 + 双层只读 + 审计 + 专项安全测试，不允许绕过 |
+| 排期乐观 | 延期 | 每个里程碑末尾复盘并重估；「不做」清单严格执行 |
