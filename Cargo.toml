@@ -7,13 +7,14 @@ version = "0.0.1"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/tyuan511/fastgrid"
-rust-version = "1.85"
+rust-version = "1.92"
 
 [workspace.dependencies]
 # internal
 fg-core = { path = "crates/fg-core" }
 fg-driver = { path = "crates/fg-driver" }
 fg-store = { path = "crates/fg-store" }
+fg-crypto = { path = "crates/fg-crypto" }
 fg-sql = { path = "crates/fg-sql" }
 fg-service = { path = "crates/fg-service" }
 fg-mcp = { path = "crates/fg-mcp" }
@@ -26,6 +27,7 @@ serde_json = "1"
 async-trait = "0.1"
 tracing = "0.1"
 uuid = { version = "1", features = ["v7"] }
+keyring = "4.2"
 rusqlite = { version = "0.40", features = ["bundled", "column_decltype", "column_metadata"] }
 
 [workspace.lints.rust]
