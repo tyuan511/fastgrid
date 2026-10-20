@@ -12,6 +12,8 @@ workspace = true
 fg-core.workspace = true
 fg-driver.workspace = true
 fg-store.workspace = true
+fg-crypto.workspace = true
+keyring.workspace = true
 fg-sql.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "macros"] }
 tracing.workspace = true
