@@ -1,0 +1,599 @@
+//! The data grid tab driven through a real headless window.
+#![recursion_limit = "256"]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use fg_app::views::{TableTab, TableTabEvent};
+// No `use gpui_kit::*`: it would import `gpui_kit::test`, which then shadows the built-in
+// `#[test]` that `#[gpui_kit::test]` expands to.
+use fg_core::{ColumnMeta, DataType, ObjectPath, SortKey, TypeCategory, Value};
+use gpui_kit::test::TestWindowExt as _;
+use gpui_kit::{
+    AnyWindowHandle, AppContext as _, Bounds, Entity, Point, TestAppContext, WindowBounds,
+    WindowOptions, px, size,
+};
+
+struct Fixture {
+    window: AnyWindowHandle,
+    view: Entity<TableTab>,
+    events: Rc<RefCell<Vec<TableTabEvent>>>,
+}
+
+fn open(cx: &mut TestAppContext) -> Fixture {
+    cx.update(gpui_kit::init);
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let log = Rc::clone(&events);
+    let (window, view) = cx.update(|cx| {
+        let bounds = Bounds {
+            origin: Point::default(),
+            size: size(px(900.), px(600.)),
+        };
+        gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                ..Default::default()
+            },
+            cx,
+            |window, cx| {
+                cx.new(|cx| TableTab::new(ObjectPath::new(Some("main"), "items"), window, cx))
+            },
+        )
+        .unwrap()
+    });
+    cx.update(|cx| {
+        cx.subscribe(&view, move |_, e: &TableTabEvent, _| {
+            log.borrow_mut().push(e.clone())
+        })
+        .detach();
+    });
+    Fixture {
+        window,
+        view,
+        events,
+    }
+}
+
+fn columns() -> Vec<ColumnMeta> {
+    vec![
+        ColumnMeta::new("id", DataType::new("INTEGER", TypeCategory::Integer)),
+        ColumnMeta::new("name", DataType::new("VARCHAR(100)", TypeCategory::Text)),
+    ]
+}
+
+fn rows(n: i64) -> Vec<Vec<Value>> {
+    (1..=n)
+        .map(|i| {
+            vec![
+                Value::Int(i),
+                if i % 2 == 0 {
+                    Value::Null
+                } else {
+                    Value::Text(format!("item {i}"))
+                },
+            ]
+        })
+        .collect()
+}
+
+/// Run a full load cycle as the controller would.
+fn load(cx: &mut TestAppContext, f: &Fixture, n: i64, total: Option<u64>) {
+    cx.update_window(f.window, |_, window, cx| {
+        f.view.update(cx, |v, cx| {
+            let g = v.begin_load(cx);
+            v.set_columns(g, columns(), cx);
+            v.append_rows(g, rows(n), cx);
+            v.finish(g, 7, cx);
+            if let Some(t) = total {
+                v.set_total(g, t, cx);
+            }
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+}
+
+fn status(cx: &mut TestAppContext, f: &Fixture) -> String {
+    cx.update_window(f.window, |_, window, _| {
+        window.find("grid-status").label().unwrap().to_owned()
+    })
+    .unwrap()
+}
+
+fn disabled(cx: &mut TestAppContext, f: &Fixture, id: &'static str) -> bool {
+    cx.update_window(f.window, |_, window, _| {
+        window.find(id).disabled() == Some(true)
+    })
+    .unwrap()
+}
+
+#[gpui_kit::test]
+fn the_status_bar_reports_rows_total_and_time(cx: &mut TestAppContext) {
+    let f = open(cx);
+    assert_eq!(status(cx, &f), "No rows");
+    load(cx, &f, 3, None);
+    assert_eq!(status(cx, &f), "Showing 1–3 · 7 ms");
+    load(cx, &f, 3, Some(1_234));
+    assert_eq!(status(cx, &f), "Showing 1–3 of 1,234 · 7 ms");
+}
+
+#[gpui_kit::test]
+fn paging_buttons_follow_what_is_known(cx: &mut TestAppContext) {
+    let f = open(cx);
+    // 300 of 1000: more pages ahead, none behind.
+    load(cx, &f, 300, Some(1000));
+    assert!(disabled(cx, &f, "page-prev"));
+    assert!(!disabled(cx, &f, "page-next"));
+    assert!(disabled(cx, &f, "page-first"));
+    assert!(!disabled(cx, &f, "page-last"));
+
+    // A short result is the whole table.
+    load(cx, &f, 12, Some(12));
+    assert!(disabled(cx, &f, "page-next"));
+    assert!(disabled(cx, &f, "page-last"));
+}
+
+#[gpui_kit::test]
+fn next_page_moves_the_offset_and_asks_for_a_reload(cx: &mut TestAppContext) {
+    let f = open(cx);
+    load(cx, &f, 300, Some(1000));
+    cx.update_window(f.window, |_, window, cx| window.click("page-next", cx))
+        .unwrap();
+    assert_eq!(*f.events.borrow(), vec![TableTabEvent::Reload]);
+    cx.update_window(f.window, |_, _, cx| {
+        assert_eq!(f.view.read(cx).query().to_table_query().offset, 300);
+    })
+    .unwrap();
+
+    // Back and forth.
+    cx.update_window(f.window, |_, window, cx| window.click("page-prev", cx))
+        .unwrap();
+    assert_eq!(f.events.borrow().len(), 2);
+    cx.update_window(f.window, |_, _, cx| {
+        assert_eq!(f.view.read(cx).query().to_table_query().offset, 0);
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn disabled_paging_buttons_do_nothing(cx: &mut TestAppContext) {
+    let f = open(cx);
+    load(cx, &f, 12, Some(12));
+    cx.update_window(f.window, |_, window, cx| {
+        window.click("page-next", cx);
+        window.click("page-prev", cx);
+    })
+    .unwrap();
+    assert!(f.events.borrow().is_empty());
+}
+
+#[gpui_kit::test]
+fn changing_the_page_size_reloads_and_keeps_the_first_visible_row(cx: &mut TestAppContext) {
+    let f = open(cx);
+    load(cx, &f, 300, Some(5000));
+    cx.update_window(f.window, |_, window, cx| window.click("page-size-1000", cx))
+        .unwrap();
+    assert_eq!(*f.events.borrow(), vec![TableTabEvent::Reload]);
+    cx.update_window(f.window, |_, _, cx| {
+        let q = f.view.read(cx).query().to_table_query();
+        assert_eq!((q.limit, q.offset), (1000, 0));
+    })
+    .unwrap();
+
+    // Choosing the size already in use is not a change.
+    cx.update_window(f.window, |_, window, cx| window.click("page-size-1000", cx))
+        .unwrap();
+    assert_eq!(f.events.borrow().len(), 1);
+}
+
+#[gpui_kit::test]
+fn sorting_resets_to_the_first_page_and_reloads(cx: &mut TestAppContext) {
+    let f = open(cx);
+    load(cx, &f, 300, Some(1000));
+    cx.update_window(f.window, |_, window, cx| window.click("page-next", cx))
+        .unwrap();
+    cx.update_window(f.window, |_, window, cx| {
+        f.view.update(cx, |v, cx| v.toggle_sort("name", cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(f.events.borrow().len(), 2);
+    cx.update_window(f.window, |_, _, cx| {
+        let q = f.view.read(cx).query().to_table_query();
+        assert_eq!(q.offset, 0);
+        assert_eq!(
+            q.sort,
+            vec![SortKey {
+                column: "name".into(),
+                descending: false,
+                nulls: None
+            }]
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn results_from_an_outdated_load_are_ignored(cx: &mut TestAppContext) {
+    let f = open(cx);
+    cx.update_window(f.window, |_, window, cx| {
+        f.view.update(cx, |v, cx| {
+            let old = v.begin_load(cx);
+            let new = v.begin_load(cx); // the user changed the query before the first answered
+            v.set_columns(new, columns(), cx);
+            v.append_rows(new, rows(2), cx);
+            // The slow, outdated query finally answers: it must not touch anything.
+            v.set_columns(old, vec![], cx);
+            v.append_rows(old, rows(50), cx);
+            v.set_total(old, 9999, cx);
+            v.finish(old, 1, cx);
+            assert_eq!(v.loaded_rows(), 2);
+            assert!(
+                v.is_loading(),
+                "only the current generation can finish the load"
+            );
+            v.finish(new, 3, cx);
+            assert!(!v.is_loading());
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(status(cx, &f), "Showing 1–2 · 3 ms");
+}
+
+#[gpui_kit::test]
+fn a_failed_load_shows_the_error_and_clears_the_spinner(cx: &mut TestAppContext) {
+    let f = open(cx);
+    cx.update_window(f.window, |_, window, cx| {
+        f.view.update(cx, |v, cx| {
+            let g = v.begin_load(cx);
+            v.fail(g, "no such table: items".into(), cx);
+            assert!(!v.is_loading());
+        });
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("grid-error").label(),
+            Some("no such table: items")
+        );
+        // A new load clears the error.
+        f.view.update(cx, |v, cx| {
+            v.begin_load(cx);
+        });
+        window.render_frame(cx);
+        assert!(window.try_find("grid-error").is_none());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn while_loading_the_status_does_not_describe_stale_rows(cx: &mut TestAppContext) {
+    let f = open(cx);
+    load(cx, &f, 300, Some(1000));
+    cx.update_window(f.window, |_, window, cx| window.click("page-next", cx))
+        .unwrap();
+    // The query now points at page 2 but its rows have not arrived: the old rows are still shown.
+    cx.update_window(f.window, |_, window, cx| {
+        f.view.update(cx, |v, cx| {
+            v.begin_load(cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(status(cx, &f), "Loading…");
+}
+
+// ---- filter drawer -----------------------------------------------------------------------------
+
+use fg_app::model::{DraftRow, FilterDraft};
+use fg_core::{Filter, FilterOp};
+
+fn open_drawer(cx: &mut TestAppContext, f: &Fixture) {
+    load(cx, f, 5, Some(5));
+    cx.update_window(f.window, |_, window, cx| {
+        assert!(
+            window.try_find("filter-drawer").is_none(),
+            "closed until asked for"
+        );
+        window.click("filters-toggle", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("filter-drawer").is_some());
+    })
+    .unwrap();
+}
+
+fn applied_filters(cx: &mut TestAppContext, f: &Fixture) -> Vec<Filter> {
+    cx.update_window(f.window, |_, _, cx| {
+        f.view.read(cx).query().to_table_query().filters
+    })
+    .unwrap()
+}
+
+#[gpui_kit::test]
+fn the_drawer_opens_from_the_status_bar_and_toggles_closed(cx: &mut TestAppContext) {
+    let f = open(cx);
+    open_drawer(cx, &f);
+    cx.update_window(f.window, |_, window, cx| {
+        window.click("filters-toggle", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("filter-drawer").is_none());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn adding_a_rule_typing_a_value_and_applying_filters_the_grid(cx: &mut TestAppContext) {
+    let f = open(cx);
+    open_drawer(cx, &f);
+    cx.update_window(f.window, |_, window, cx| {
+        window.click("filter-add", cx);
+        window.render_frame(cx);
+        // A new rule starts on the first column with "=".
+        window.click("filter-0-value", cx);
+        window.input("42", cx);
+        window.click("filter-apply", cx);
+    })
+    .unwrap();
+
+    assert_eq!(*f.events.borrow(), vec![TableTabEvent::Reload]);
+    let filters = applied_filters(cx, &f);
+    assert_eq!(filters.len(), 1);
+    assert_eq!(
+        (filters[0].column.as_str(), filters[0].op),
+        ("id", FilterOp::Eq)
+    );
+    assert_eq!(
+        filters[0].values,
+        vec![Value::Int(42)],
+        "typed with the column's type"
+    );
+
+    // The status bar shows how many rules are active.
+    cx.update_window(f.window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("filters-toggle").is_some());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn applying_returns_to_the_first_page(cx: &mut TestAppContext) {
+    let f = open(cx);
+    load(cx, &f, 300, Some(1000));
+    cx.update_window(f.window, |_, window, cx| window.click("page-next", cx))
+        .unwrap();
+    cx.update_window(f.window, |_, window, cx| {
+        window.click("filters-toggle", cx);
+        window.render_frame(cx);
+        let drawer = f.view.read(cx).filter_drawer().clone();
+        drawer.update(cx, |d, cx| {
+            d.load(
+                FilterDraft {
+                    rows: vec![DraftRow {
+                        value: "7".into(),
+                        ..DraftRow::new("id")
+                    }],
+                    ..Default::default()
+                },
+                cx,
+            )
+        });
+        window.render_frame(cx);
+        window.click("filter-apply", cx);
+    })
+    .unwrap();
+    cx.update_window(f.window, |_, _, cx| {
+        assert_eq!(f.view.read(cx).query().to_table_query().offset, 0);
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn a_value_that_does_not_fit_the_column_is_reported_not_applied(cx: &mut TestAppContext) {
+    let f = open(cx);
+    open_drawer(cx, &f);
+    cx.update_window(f.window, |_, window, cx| {
+        window.click("filter-add", cx);
+        window.render_frame(cx);
+        window.click("filter-0-value", cx);
+        window.input("abc", cx);
+        window.click("filter-apply", cx);
+        window.render_frame(cx);
+        assert!(
+            window
+                .find("filter-0-error")
+                .label()
+                .unwrap()
+                .contains("abc")
+        );
+    })
+    .unwrap();
+    assert!(f.events.borrow().is_empty(), "nothing is reloaded");
+    assert!(applied_filters(cx, &f).is_empty());
+}
+
+#[gpui_kit::test]
+fn raw_sql_mode_applies_a_where_expression(cx: &mut TestAppContext) {
+    let f = open(cx);
+    open_drawer(cx, &f);
+    cx.update_window(f.window, |_, window, cx| {
+        window.click("filter-raw", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("filter-raw-input").is_some());
+        window.click("filter-raw-input", cx);
+        window.input("id > 3 AND name LIKE 'item%'", cx);
+        window.click("filter-apply", cx);
+    })
+    .unwrap();
+    assert_eq!(*f.events.borrow(), vec![TableTabEvent::Reload]);
+    cx.update_window(f.window, |_, _, cx| {
+        let q = f.view.read(cx).query().to_table_query();
+        assert_eq!(q.raw_where.as_deref(), Some("id > 3 AND name LIKE 'item%'"));
+        assert!(q.filters.is_empty());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn clear_removes_every_rule_and_reloads(cx: &mut TestAppContext) {
+    let f = open(cx);
+    open_drawer(cx, &f);
+    cx.update_window(f.window, |_, window, cx| {
+        let drawer = f.view.read(cx).filter_drawer().clone();
+        drawer.update(cx, |d, cx| {
+            d.load(
+                FilterDraft {
+                    rows: vec![DraftRow {
+                        value: "1".into(),
+                        ..DraftRow::new("id")
+                    }],
+                    ..Default::default()
+                },
+                cx,
+            )
+        });
+        window.render_frame(cx);
+        window.click("filter-apply", cx);
+    })
+    .unwrap();
+    assert_eq!(applied_filters(cx, &f).len(), 1);
+
+    cx.update_window(f.window, |_, window, cx| window.click("filter-clear", cx))
+        .unwrap();
+    assert!(applied_filters(cx, &f).is_empty());
+    assert_eq!(f.events.borrow().len(), 2);
+    cx.update_window(f.window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("filter-0-value").is_none(),
+            "the rule row is gone"
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn a_rule_can_be_removed_and_the_drawer_remembers_saved_filters(cx: &mut TestAppContext) {
+    let f = open(cx);
+    load(cx, &f, 5, Some(5));
+    // Restore a saved view: the drawer is rebuilt from it, rows included.
+    cx.update_window(f.window, |_, window, cx| {
+        f.view.update(cx, |t, cx| {
+            let mut q = fg_app::model::GridQuery::new(ObjectPath::new(Some("main"), "items"), 300);
+            q.set_filters(
+                vec![Filter {
+                    column: "id".into(),
+                    op: FilterOp::Gt,
+                    values: vec![Value::Int(2)],
+                    enabled: true,
+                }],
+                None,
+            );
+            t.restore_query(q, cx);
+            t.toggle_filters(cx);
+        });
+        window.render_frame(cx);
+        assert!(window.try_find("filter-0-value").is_some());
+        window.click("filter-0-remove", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("filter-0-value").is_none());
+    })
+    .unwrap();
+}
+
+// ---- copying -------------------------------------------------------------------------------------
+
+use gpui_kit::ClipboardItem;
+
+fn clipboard(cx: &mut TestAppContext) -> Option<String> {
+    cx.read_from_clipboard().and_then(|c| c.text())
+}
+
+#[gpui_kit::test]
+fn copying_a_cell_row_or_column_puts_text_on_the_clipboard(cx: &mut TestAppContext) {
+    let f = open(cx);
+    load(cx, &f, 4, Some(4)); // ids 1..4; names: item 1, NULL, item 3, NULL
+    let copy = |cx: &mut TestAppContext, f: &Fixture| {
+        cx.update_window(f.window, |_, _, cx| {
+            f.view.update(cx, |t, cx| t.copy_selection(cx))
+        })
+        .unwrap();
+        clipboard(cx)
+    };
+
+    // Nothing selected: nothing happens (and the clipboard is left alone).
+    cx.write_to_clipboard(ClipboardItem::new_string("before".into()));
+    assert_eq!(copy(cx, &f).as_deref(), Some("before"));
+
+    // A cell.
+    cx.update_window(f.window, |_, _, cx| {
+        f.view.update(cx, |t, cx| t.select_cell(0, 1, cx))
+    })
+    .unwrap();
+    assert_eq!(copy(cx, &f).as_deref(), Some("item 1"));
+
+    // A NULL is copied as the word NULL, not as an empty cell.
+    cx.update_window(f.window, |_, _, cx| {
+        f.view.update(cx, |t, cx| t.select_cell(1, 1, cx))
+    })
+    .unwrap();
+    assert_eq!(copy(cx, &f).as_deref(), Some("NULL"));
+
+    // A number.
+    cx.update_window(f.window, |_, _, cx| {
+        f.view.update(cx, |t, cx| t.select_cell(2, 0, cx))
+    })
+    .unwrap();
+    assert_eq!(copy(cx, &f).as_deref(), Some("3"));
+}
+
+#[gpui_kit::test]
+fn selection_text_for_rows_and_columns_is_spreadsheet_friendly(cx: &mut TestAppContext) {
+    let f = open(cx);
+    cx.update_window(f.window, |_, window, cx| {
+        f.view.update(cx, |v, cx| {
+            let g = v.begin_load(cx);
+            v.set_columns(g, columns(), cx);
+            v.append_rows(
+                g,
+                vec![
+                    vec![Value::Int(1), Value::Text("has\ttab".into())],
+                    vec![Value::Int(2), Value::Text("plain".into())],
+                ],
+                cx,
+            );
+            v.finish(g, 1, cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let text = |cx: &mut TestAppContext, f: &Fixture| {
+        cx.update_window(f.window, |_, _, cx| f.view.read(cx).selection_text(cx))
+            .unwrap()
+    };
+
+    // A cell containing a tab is returned as is; a row quotes it so a paste keeps it in one cell.
+    cx.update_window(f.window, |_, _, cx| {
+        f.view.update(cx, |t, cx| t.select_cell(0, 1, cx))
+    })
+    .unwrap();
+    assert_eq!(text(cx, &f).as_deref(), Some("has\ttab"));
+
+    cx.update_window(f.window, |_, _, cx| {
+        f.view.update(cx, |t, cx| t.select_row(0, cx))
+    })
+    .unwrap();
+    assert_eq!(text(cx, &f).as_deref(), Some("1\t\"has\ttab\""));
+    cx.update_window(f.window, |_, _, cx| {
+        f.view.update(cx, |t, cx| t.select_row(1, cx))
+    })
+    .unwrap();
+    assert_eq!(text(cx, &f).as_deref(), Some("2\tplain"));
+
+    // A column: one value per line, for this page.
+    cx.update_window(f.window, |_, _, cx| {
+        f.view.update(cx, |t, cx| t.select_column(0, cx))
+    })
+    .unwrap();
+    assert_eq!(text(cx, &f).as_deref(), Some("1\n2"));
+}

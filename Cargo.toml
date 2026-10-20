@@ -28,6 +28,7 @@ async-trait = "0.1"
 tracing = "0.1"
 uuid = { version = "1", features = ["v7"] }
 keyring = "4.2"
+dirs = "7"
 rusqlite = { version = "0.40", features = ["bundled", "column_decltype", "column_metadata"] }
 
 [workspace.lints.rust]

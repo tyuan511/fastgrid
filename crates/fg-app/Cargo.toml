@@ -8,10 +8,23 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
-[dependencies]
-fg-service.workspace = true
-gpui-kit = "0.8"
+[lib]
+name = "fg_app"
+path = "src/lib.rs"
 
 [[bin]]
 name = "fastgrid"
 path = "src/main.rs"
+
+[dependencies]
+fg-core.workspace = true
+fg-driver.workspace = true
+fg-service.workspace = true
+fg-store.workspace = true
+dirs.workspace = true
+gpui-kit = { version = "0.8", features = ["gpui-fast"] }
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+gpui-kit = { version = "0.8", features = ["gpui-fast", "test-support"] }
