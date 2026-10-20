@@ -108,6 +108,12 @@ UI 线程只做渲染和小的状态更新；数据库 IO 在 `fg-service` 的 t
 - 新驱动必须跑完与 SQLite 同一组场景：多语句、参数绑定、流式分批、`max_rows` 截断、结构化错误、元数据、只读会话、取消。网络引擎用 testcontainers（MySQL 5.7/8.x、MariaDB、PostgreSQL 12–17）。
 - 数值/时间/JSON/数组/枚举等解码写属性测试；解码热点用 criterion 基准；网格滚动有固定数据集的性能检查（参考 `crates/fg-app/examples/grid_spike.rs`）。
 - **不许改测试来迁就实现**。测试失败时先怀疑实现；确认是测试写错了，要在提交信息里说明为什么。
+- **三端都要能跑**（CI 的 `check` 在 macOS / Ubuntu / Windows 各跑一遍）。两条最容易踩的坑：
+  1. Windows 删不掉**仍被打开**的文件：测试里清理临时目录前必须先 `drop` 掉 `Store` / `Connection`，
+     并且对删除结果做重试而不是 `unwrap()`（参考 `fg-store` 的 `testutil::cleanup`）；SQLite 的 WAL/SHM 句柄
+     是在最后一个连接关闭后才释放的。
+  2. 不要依赖 checkout 的换行符：`.gitattributes` 已把文本文件钉成 LF，任何按文件字节算的东西
+     （迁移校验和、夹具摘要）都要显式忽略 `\r`，否则 Windows 上算出另一个值。
 
 ---
 

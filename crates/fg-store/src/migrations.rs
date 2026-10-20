@@ -84,11 +84,14 @@ pub(crate) fn storage(e: rusqlite::Error) -> Error {
 mod tests {
     use super::*;
 
-    /// FNV-1a, enough to detect edits.
+    /// FNV-1a, enough to detect edits. Carriage returns are skipped: a checkout on Windows can
+    /// hand `include_str!` CRLF bytes for the very same migration, and that is not an edit.
     fn checksum(s: &str) -> u64 {
-        s.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
-            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
-        })
+        s.bytes()
+            .filter(|b| *b != b'\r')
+            .fold(0xcbf2_9ce4_8422_2325, |h, b| {
+                (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+            })
     }
 
     /// (version, checksum) of every released migration. Append when adding one; never change.

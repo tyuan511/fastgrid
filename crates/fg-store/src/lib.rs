@@ -270,6 +270,25 @@ pub(crate) mod testutil {
         let _ = std::fs::remove_dir_all(&dir);
         dir.join("store.db")
     }
+
+    /// Delete a test's temporary directory once its assertions are done.
+    ///
+    /// Windows refuses to remove a file while a handle to it is open, and SQLite releases its
+    /// `-wal`/`-shm` handles only shortly after the last connection closes, so one attempt fails
+    /// with a sharing violation even when the test dropped every store. Retry for a moment, then
+    /// give up quietly: a leftover directory in the temp folder says nothing about the behaviour
+    /// under test, and failing here would hide a store that actually worked.
+    pub fn cleanup(store_path: &Path) {
+        let Some(dir) = store_path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+            return;
+        };
+        for _ in 0..40 {
+            if std::fs::remove_dir_all(dir).is_ok() || !dir.exists() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -315,7 +334,8 @@ mod tests {
             (again.store_id(), again.device_id()),
             (store_id.as_str(), device_id.as_str())
         );
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        drop(again);
+        cleanup(&path);
     }
 
     #[test]
@@ -337,7 +357,7 @@ mod tests {
         // Never regenerated a key over the existing store.
         assert!(keys.load(&store_id).unwrap().is_some());
         let _ = before;
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        cleanup(&path);
     }
 
     #[test]
@@ -357,7 +377,8 @@ mod tests {
             migrations::current_version(&c).unwrap(),
             latest_version() + 1
         );
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        drop(c);
+        cleanup(&path);
     }
 
     fn v1() -> Migration {
@@ -415,7 +436,9 @@ mod tests {
             })
             .unwrap();
         assert_eq!(old, "conn-a");
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        drop(bak);
+        drop(s);
+        cleanup(&path);
     }
 
     #[test]
@@ -442,7 +465,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(leaked, 0, "the failed migration must roll back completely");
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        drop(c);
+        cleanup(&path);
     }
 
     #[test]

@@ -30,10 +30,22 @@ fn contains(haystack: &[u8], needle: &str) -> bool {
         .any(|w| w == needle.as_bytes())
 }
 
+/// Windows refuses to delete a file some handle still refers to, and SQLite lets go of its
+/// `-wal`/`-shm` handles only just after the last connection closes. Retry for a moment, then
+/// give up: leaving a temp directory behind says nothing about whether plaintext reached disk.
+fn remove_temp_dir(dir: &Path) {
+    for _ in 0..40 {
+        if std::fs::remove_dir_all(dir).is_ok() || !dir.exists() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
 #[test]
 fn no_plaintext_reaches_any_file_on_disk() {
     let dir = std::env::temp_dir().join(format!("fg-enc-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    remove_temp_dir(&dir);
     let path = dir.join("store.db");
     let keys = MemoryKeyProvider::new();
 
@@ -119,7 +131,8 @@ fn no_plaintext_reaches_any_file_on_disk() {
     let store = Store::open(&path, &keys).unwrap();
     assert_eq!(store.load_connections().unwrap().len(), 1);
     assert_eq!(store.query_audit(&AuditFilter::default()).unwrap().len(), 1);
-    std::fs::remove_dir_all(&dir).unwrap();
+    drop(store);
+    remove_temp_dir(&dir);
 }
 
 #[test]

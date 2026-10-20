@@ -1,0 +1,17 @@
+# Source files must be byte-identical on every checkout. fg-store pins each released
+# migration by hashing the checked-out .sql text, and a Windows checkout with
+# core.autocrlf=true would turn every LF into CRLF and change that hash.
+* text=auto eol=lf
+
+# Never touch bytes inside binary assets.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.icns binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
