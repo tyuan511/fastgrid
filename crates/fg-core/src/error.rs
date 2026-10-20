@@ -45,6 +45,10 @@ pub enum Error {
     Connection(String),
     #[error("query error: {0}")]
     Query(QueryError),
+    /// The caller asked for something malformed (a bad filter, an unsafe raw `WHERE`), as opposed
+    /// to a database error.
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
     #[error("query cancelled")]
     Cancelled,
     #[error("operation denied by policy: {0}")]
@@ -54,6 +58,10 @@ pub enum Error {
     Unsupported(String),
     #[error("storage error: {0}")]
     Storage(String),
+    /// The local encryption key is missing or does not match the store. The data is intact but
+    /// unreadable until the key is restored (sync pull or encrypted-backup import).
+    #[error("encryption key unavailable: {0}")]
+    KeyUnavailable(String),
     #[error("{0}")]
     Other(String),
 }

@@ -2,9 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    ConnectionId, Environment, GroupId, SafeMode, TagColor, UnixMillis, compat::lenient_vec,
-};
+use crate::{ConnectionId, Environment, GroupId, SafeMode, TagColor, UnixMillis};
 
 /// Supported database engines. Adding a variant is the first step of adding a driver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -261,22 +259,6 @@ impl ConnectionGroup {
     }
 }
 
-/// Portable, versioned file for exporting/importing connections. No secrets inside.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ConnectionExport {
-    /// Bump only on breaking changes to this envelope.
-    pub format_version: u32,
-    pub exported_at: UnixMillis,
-    #[serde(default, deserialize_with = "lenient_vec")]
-    pub groups: Vec<ConnectionGroup>,
-    #[serde(default, deserialize_with = "lenient_vec")]
-    pub connections: Vec<ConnectionConfig>,
-}
-
-impl ConnectionExport {
-    pub const FORMAT_VERSION: u32 = 1;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,14 +306,5 @@ mod tests {
         assert_eq!(c.effective_safe_mode(), SafeMode::Alert);
         c.mcp.exposed = Some(true);
         assert!(c.mcp_exposed(), "explicit setting wins");
-    }
-
-    #[test]
-    fn export_skips_unreadable_connections() {
-        let json = r#"{"format_version":1,"exported_at":0,"connections":[
-            {"id":"a","name":"ok","kind":"sqlite","params":{"type":"file","path":"x"}},
-            {"id":"b","name":"bad","kind":"sqlite","params":{"type":"carrier_pigeon"}}]}"#;
-        let e: ConnectionExport = serde_json::from_str(json).unwrap();
-        assert_eq!(e.connections.len(), 1);
     }
 }

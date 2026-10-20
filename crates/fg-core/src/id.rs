@@ -54,6 +54,8 @@ define_id!(SnippetId);
 define_id!(DocumentId);
 define_id!(TabId);
 define_id!(McpClientId);
+define_id!(HistoryId);
+define_id!(AuditId);
 
 /// Unix time in milliseconds, UTC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]

@@ -26,13 +26,16 @@ mod workspace;
 
 pub use capabilities::Capabilities;
 pub use connection::{
-    ConnectionConfig, ConnectionExport, ConnectionGroup, ConnectionParams, DbKind, McpAccess,
-    SshAuth, SshConfig, Timeouts, TlsConfig, TlsMode,
+    ConnectionConfig, ConnectionGroup, ConnectionParams, DbKind, McpAccess, SshAuth, SshConfig,
+    Timeouts, TlsConfig, TlsMode,
 };
 pub use dialect::{Dialect, MySqlDialect, PostgresDialect, SqliteDialect, dialect_for};
 pub use edit::{CellValue, Changeset, RowChange, RowKey};
 pub use error::{Error, QueryError, Result};
-pub use id::{ConnectionId, DocumentId, GroupId, McpClientId, SnippetId, TabId, UnixMillis};
+pub use id::{
+    AuditId, ConnectionId, DocumentId, GroupId, HistoryId, McpClientId, SnippetId, TabId,
+    UnixMillis,
+};
 pub use meta::{
     CheckConstraint, ColumnInfo, ForeignKeyInfo, GeneratedColumn, IndexColumn, IndexInfo,
     ObjectInfo, ObjectKind, ObjectPath, ReferentialAction, Relation, TableDetail, TriggerInfo,
@@ -43,7 +46,7 @@ pub use records::{
     Actor, AuditEntry, Decision, McpClient, Outcome, QueryDocument, QueryHistoryEntry, QuerySource,
     Snippet,
 };
-pub use secret::SecretKind;
+pub use secret::{SecretKind, SecretRecord};
 pub use types::{ColumnMeta, ColumnOrigin, DataType, TypeCategory, TypeParams};
 pub use value::{LargeKind, Truncated, Value};
 pub use workspace::{

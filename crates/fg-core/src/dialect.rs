@@ -27,6 +27,16 @@ pub trait Dialect: Send + Sync {
     }
 
     fn default_port(&self) -> Option<u16>;
+
+    /// Convert an expression to text, so `LIKE` works on any column type.
+    fn text_cast(&self, expr: &str) -> String {
+        format!("CAST({expr} AS TEXT)")
+    }
+
+    /// `ORDER BY x NULLS FIRST/LAST`. MySQL lacks it and needs an `x IS NULL` sort key instead.
+    fn supports_nulls_ordering(&self) -> bool {
+        true
+    }
 }
 
 fn quote_with(ident: &str, q: char) -> String {
@@ -80,6 +90,12 @@ impl Dialect for MySqlDialect {
     }
     fn default_port(&self) -> Option<u16> {
         Some(3306)
+    }
+    fn supports_nulls_ordering(&self) -> bool {
+        false
+    }
+    fn text_cast(&self, expr: &str) -> String {
+        format!("CAST({expr} AS CHAR)")
     }
 }
 
