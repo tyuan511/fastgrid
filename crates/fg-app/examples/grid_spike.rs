@@ -68,6 +68,11 @@ struct Bench {
     window_start: Instant,
     frames: u32,
     worst: Duration,
+    started: Instant,
+    duration: Option<Duration>,
+    total_frames: u64,
+    slow_frames: u64,
+    worst_all: Duration,
 }
 
 fn rss_mb() -> f64 {
@@ -82,13 +87,30 @@ fn rss_mb() -> f64 {
 }
 
 impl Render for Root {
-    fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(b) = self.bench.as_mut() {
             let now = Instant::now();
             let dt = now - b.last;
             b.last = now;
             b.frames += 1;
             b.worst = b.worst.max(dt);
+            b.worst_all = b.worst_all.max(dt);
+            b.total_frames += 1;
+            if dt > Duration::from_millis(100) {
+                b.slow_frames += 1;
+            }
+            if let Some(limit) = b.duration
+                && now - b.started >= limit
+            {
+                println!(
+                    "SUMMARY avg fps {:.1}  worst frame {:.1} ms  frames >100ms: {}  frames: {}",
+                    b.total_frames as f64 / (now - b.started).as_secs_f64(),
+                    b.worst_all.as_secs_f64() * 1000.0,
+                    b.slow_frames,
+                    b.total_frames
+                );
+                cx.quit();
+            }
             if now - b.window_start >= Duration::from_secs(1) {
                 println!(
                     "fps {:>5.1}  worst frame {:>6.1} ms  rss {:>7.1} MB",
@@ -111,12 +133,23 @@ impl Render for Root {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let bench = args.iter().any(|a| a == "--bench");
-    let nums: Vec<usize> = args.iter().filter_map(|a| a.parse().ok()).collect();
+    let duration = args
+        .iter()
+        .position(|a| a == "--duration")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs);
+    let nums: Vec<usize> = args
+        .iter()
+        .filter_map(|a| a.parse().ok())
+        .filter(|n| Some(Duration::from_secs(*n as u64)) != duration || *n > 1000)
+        .collect();
     let rows = nums.first().copied().unwrap_or(1_000_000);
     let cols = nums.get(1).copied().unwrap_or(200);
 
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
+        cx.activate(true);
         let opened = gpui_kit::open_window(WindowOptions::default(), cx, move |window, cx| {
             let table = cx.new(|cx| TableState::new(Grid::new(rows, cols), window, cx));
             if bench {
@@ -143,6 +176,11 @@ fn main() {
                     window_start: Instant::now(),
                     frames: 0,
                     worst: Duration::ZERO,
+                    started: Instant::now(),
+                    duration,
+                    total_frames: 0,
+                    slow_frames: 0,
+                    worst_all: Duration::ZERO,
                 }),
             })
         });
