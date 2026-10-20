@@ -278,6 +278,8 @@ pub fn hugeicon(icon: Hugeicon) -> Icon {
     icon.icon()
 }
 
+pub const FASTGRID_LOGO_PNG: &[u8] = include_bytes!("../../../../assets/logo-256.png");
+
 /// The composite asset source for FastGrid.
 ///
 /// Serves Hugeicons first, and delegates all other icon paths to .
@@ -286,6 +288,9 @@ pub struct FastgridAssets;
 
 impl AssetSource for FastgridAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        if path == "fastgrid/logo.png" || path == "logo.png" {
+            return Ok(Some(Cow::Borrowed(FASTGRID_LOGO_PNG)));
+        }
         let p = path.strip_prefix("hugeicons/").unwrap_or(path);
         let name = p.strip_suffix(".svg").unwrap_or(p);
         if let Some(icon) = Hugeicon::from_name(name) {
@@ -300,6 +305,7 @@ impl AssetSource for FastgridAssets {
             .map(|i| SharedString::from(format!("hugeicons/{}.svg", i.name())))
             .filter(|p| path.is_empty() || p.starts_with(path))
             .collect();
+        list.push(SharedString::from("fastgrid/logo.png"));
         if let Ok(extra) = gpui_kit::assets::Assets.list(path) {
             list.extend(extra);
         }

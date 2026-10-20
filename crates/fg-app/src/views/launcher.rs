@@ -442,20 +442,8 @@ impl Launcher {
     }
 }
 
-fn fastgrid_origami_logo() -> impl IntoElement {
-    svg()
-        .size(px(64.))
-        .data(
-            br##"<svg width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
-  <polygon points="32,6 48,16 32,26 16,16" fill="#F59E0B" />
-  <polygon points="48,16 56,32 40,36 32,26" fill="#D97706" />
-  <polygon points="16,16 32,26 24,36 8,32" fill="#FBBF24" />
-  <polygon points="32,26 40,36 32,48 24,36" fill="#F97316" />
-  <polygon points="40,36 56,32 52,48 44,52 32,48" fill="#EA580C" />
-  <polygon points="24,36 32,48 20,52 12,48 8,32" fill="#F59E0B" />
-  <polygon points="32,48 44,52 32,60 20,52" fill="#C2410C" />
-</svg>"##,
-        )
+fn fastgrid_logo() -> impl IntoElement {
+    img("fastgrid/logo.png").size(px(64.))
 }
 
 const ENGINES: &[(DbKind, &str, &str, f32, f32, f32)] = &[
@@ -614,7 +602,7 @@ impl Render for Launcher {
                             .gap_3()
                             .items_center()
                             .pt_2()
-                            .child(fastgrid_origami_logo())
+                            .child(fastgrid_logo())
                             .child(
                                 v_flex()
                                     .items_center()
