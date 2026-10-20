@@ -23,6 +23,7 @@ Rust workspace，一个跨平台的数据库客户端（对标 TablePlus 交互�
 | `docs/mcp-security.md` | 碰 MCP 的工具、权限、只读策略、审计 |
 | `docs/roadmap.md` | 认领任务、完成后勾选、写验收标准 |
 | `docs/shortcuts.md` | 加快捷键（同一焦点上下文内不得重复） |
+| `docs/ui-testing.md` | 写或改 `fg-app` 的视图与 UI 测试（GPUI 测试有几个必踩的坑） |
 
 ---
 
@@ -217,6 +218,7 @@ BREAKING CHANGE: persisted workspace files from older builds need a store migrat
 
 ## 9. 快照（会过期，2026-10-20）
 
-- M0 已完成；M1.0 的数据结构部分与 M1.1 的 `fg-crypto` / `fg-store` 已完成（加密、迁移、导出导入、同步原语），详见 `docs/roadmap.md` 的勾选状态。
-- 未完成：`fg-sql`（过滤编译、语句拆分与分类）、`fg-service`（含钥匙串的 `DeviceKeyProvider` 实现）、GUI 外壳；同步是 M9。
-- 三端 CI 的实际运行结果尚未确认；`cargo deny check` 在本机没装，新增密码学依赖只做了许可证的人工核对。
+- M0 已完成；M1 的无界面部分（`fg-sql`、`fg-service`、加密存储）和界面主体（启动页、工作区、只读网格、过滤抽屉、Quick Open、快捷键）已完成并有无头测试；详见 `docs/roadmap.md` 的勾选状态。
+- **界面的视觉效果从未被人眼验证过**，只验证了行为；改视觉相关的东西请让用户本地看一眼。
+- 未完成：启动页的编辑 / 分组 / 搜索、侧栏拖拽调宽、外键跳转、`⌘K` 切换、主题切换界面；M2 起的 SQL 编辑器；同步是 M9。
+- 三端 CI 的实际运行结果尚未确认；`cargo deny check` 在本机没装，新增依赖只做了许可证的人工核对。

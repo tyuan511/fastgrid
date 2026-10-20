@@ -6,6 +6,8 @@
 
 约定：⌘=Cmd，⌃=Control，⌥=Option，⇧=Shift。Win/Linux 列只写与「⌘→Ctrl」不同的项。
 
+> **实现状态**：已实现 `⌘P`、`⌘W`、`⌘B`、`⌘R`（刷新对象树）、`⌘F`（过滤抽屉）、`⌘C`（复制选区）、`⌘[` / `⌘]` / `Ctrl+Tab`。其余为规划。绑定集中在 `crates/fg-app/src/views/actions.rs`。
+
 ## 全局（任何焦点）
 
 | 操作 | macOS | Win / Linux |
