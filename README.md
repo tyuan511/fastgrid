@@ -13,14 +13,14 @@ with a built-in MCP server so external AI agents can query your databases safely
 - **MCP for external agents**: `fastgrid-cli mcp --stdio`, read-only by default, audited.
 - macOS, Windows, Linux. Apache-2.0, free.
 
-Phase 1 databases: MySQL (and MariaDB), PostgreSQL.
+Phase 1 databases: SQLite first, then MySQL (and MariaDB) and PostgreSQL. All engines plug in through one driver abstraction ([docs/driver-abstraction.md](docs/driver-abstraction.md)).
 
 ## Layout
 
 | Crate | Role |
 |---|---|
 | `fg-core` | Domain types (connection, value, error). No IO. |
-| `fg-driver` | `Driver` trait + MySQL / PostgreSQL backends |
+| `fg-driver` | `Driver` / `Session` traits + SQLite (MySQL / PostgreSQL next) |
 | `fg-store` | Local SQLite store, keychain access |
 | `fg-sql` | Statement splitting and classification, completion |
 | `fg-service` | Pools, query tasks, metadata cache, policy; shared by GUI and MCP |
@@ -28,7 +28,7 @@ Phase 1 databases: MySQL (and MariaDB), PostgreSQL.
 | `fg-cli` | Headless binary `fastgrid-cli` |
 | `fg-app` | GPUI desktop app `fastgrid` |
 
-More: [architecture](docs/architecture.md) · [roadmap](docs/roadmap.md) · [MCP security](docs/mcp-security.md)
+More: [architecture](docs/architecture.md) · [driver abstraction](docs/driver-abstraction.md) · [roadmap](docs/roadmap.md) · [MCP security](docs/mcp-security.md)
 
 ## Develop
 

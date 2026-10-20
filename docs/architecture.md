@@ -15,12 +15,15 @@ fg-driver fg-store fg-sql
 Rule: dependencies point downward only. `fg-core` has no IO. `fg-app` is the only crate that
 depends on GPUI. `fg-mcp` and `fg-cli` must work without a display.
 
+The multi-database contracts (Driver / Session / Dialect / Capabilities) are described in
+[driver-abstraction.md](driver-abstraction.md).
+
 ## Key decisions
 
 1. **Runtimes**: GPUI keeps its own executor. Database IO runs on a dedicated tokio runtime owned by
    `fg-service`; results return to the UI over channels. The UI thread only renders and applies
    small state updates.
-2. **Drivers**: native `tokio-postgres` and `mysql_async` rather than sqlx. We need streaming rows
+2. **Drivers**: SQLite first (`rusqlite`, bundled), then native `tokio-postgres` and `mysql_async` rather than sqlx. We need streaming rows
    and exact control over dynamic type decoding, not compile-time checked queries.
 3. **Result sets**: typed `Value` cells, streamed in batches so the first rows render quickly.
    Large blobs / long text are loaded lazily.

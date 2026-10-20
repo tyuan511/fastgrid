@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-/// A typed cell value. Large payloads are expected to be loaded lazily by the driver.
+/// A typed cell value, the common currency between drivers, the grid and MCP.
+///
+/// Exotic engine types that have no dedicated variant travel as [`Value::Other`] so that
+/// nothing is silently lost or mis-decoded.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Value {
     Null,
@@ -15,4 +18,15 @@ pub enum Value {
     Json(String),
     /// Temporal types as ISO-8601 text until a dedicated representation is chosen.
     Temporal(String),
+    /// Anything else, as the engine's textual form plus its native type name.
+    Other {
+        type_name: String,
+        text: String,
+    },
+}
+
+impl Value {
+    pub fn is_null(&self) -> bool {
+        matches!(self, Value::Null)
+    }
 }
