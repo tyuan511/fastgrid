@@ -171,7 +171,7 @@ Refs: M1.0
 | `chore` | 格式化、清理、锁文件等杂项 |
 | `revert` | 回滚 |
 
-**scope**：受影响 crate 的目录名 `fg-core` / `fg-driver` / `fg-store` / `fg-sql` / `fg-service` / `fg-mcp` / `fg-cli` / `fg-app`；跨多个用 `workspace`，另有 `deps`（依赖变动）、`ci`、`docs`。示例 `15c89c6` 那种不带 scope 的旧写法保留在历史里，新提交一律带。
+**scope**：受影响 crate 的目录名 `fg-core` / `fg-driver` / `fg-store` / `fg-sql` / `fg-service` / `fg-mcp` / `fg-cli` / `fg-app`；跨多个用 `workspace`，另有 `deps`（依赖变动）、`ci`、`docs`。历史提交一律带 scope（2026-10-20 已把早期不带 scope 的 8 个提交重写成规范写法并 `--force-with-lease` 推送，无遗留例外）；新提交同样必须带。
 
 **subject**：祈使现在时（`add`，不是 `added`/`adds`）；小写开头；**结尾不加句号**；整行 ≤72 字符（建议 ≤60）；说清「做了什么」，别写 `fix bug`。
 
