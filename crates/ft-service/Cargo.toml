@@ -1,0 +1,17 @@
+[package]
+name = "ft-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ft-core.workspace = true
+ft-driver.workspace = true
+ft-store.workspace = true
+ft-sql.workspace = true
+tokio.workspace = true
+tracing.workspace = true

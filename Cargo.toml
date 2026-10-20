@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/OWNER/fast-table"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# internal
+ft-core = { path = "crates/ft-core" }
+ft-driver = { path = "crates/ft-driver" }
+ft-store = { path = "crates/ft-store" }
+ft-sql = { path = "crates/ft-sql" }
+ft-service = { path = "crates/ft-service" }
+ft-mcp = { path = "crates/ft-mcp" }
+
+# external (versions pinned as each crate starts using them)
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+tracing = "0.1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+dbg_macro = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

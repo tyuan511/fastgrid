@@ -1,0 +1,18 @@
+[package]
+name = "ft-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ft-service.workspace = true
+ft-mcp.workspace = true
+tokio.workspace = true
+
+[[bin]]
+name = "fast-table-cli"
+path = "src/main.rs"

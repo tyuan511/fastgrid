@@ -1,0 +1,12 @@
+[package]
+name = "ft-sql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ft-core.workspace = true
