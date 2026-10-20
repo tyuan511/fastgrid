@@ -691,3 +691,73 @@ async fn workspace_and_table_view_state_persist_per_connection() {
     let again = env.service();
     assert!(again.load_workspace(&a.id).await.unwrap().is_some());
 }
+
+/// Roadmap M1 acceptance: first screen of a 1M-row table in under 200 ms.
+/// Run by hand: `cargo test -p fg-service --release --test e2e -- --ignored --nocapture perf_`
+#[tokio::test]
+#[ignore = "performance measurement, run by hand in release mode"]
+async fn perf_first_page_of_a_million_rows() {
+    use std::time::Instant;
+
+    let env = Env::new("perf");
+    let svc = env.service();
+    let saved = svc
+        .save_connection(env.sqlite("big"), PasswordUpdate::Keep)
+        .await
+        .unwrap();
+    let conn = svc.open(&saved.id).await.unwrap();
+    let seeding = Instant::now();
+    run(
+        &conn,
+        "CREATE TABLE big (id INTEGER PRIMARY KEY, name TEXT, score INTEGER, note TEXT);
+         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1000000)
+         INSERT INTO big SELECT i, 'name ' || i, i % 1000, 'some note text for row ' || i FROM n;",
+    )
+    .await;
+    eprintln!("seeded 1,000,000 rows in {:?}", seeding.elapsed());
+    // Warm the metadata cache the way opening the sidebar would.
+    conn.describe(&ObjectPath::new(Some("main"), "big"))
+        .await
+        .unwrap();
+
+    let query = TableQuery::new(ObjectPath::new(Some("main"), "big"), 300);
+    let mut samples = Vec::new();
+    for _ in 0..5 {
+        let started = Instant::now();
+        let mut stream = conn.browse(&query, BrowseOptions::default()).await.unwrap();
+        let mut first_rows = None;
+        while let Some(ev) = stream.next().await {
+            if let Event::Rows(_) = ev.unwrap() {
+                first_rows.get_or_insert(started.elapsed());
+            }
+        }
+        samples.push((first_rows.unwrap(), started.elapsed()));
+    }
+    for (first, total) in &samples {
+        eprintln!("first rows after {first:?}, page complete after {total:?}");
+    }
+    let count_started = Instant::now();
+    let total = conn.count(&query, BrowseOptions::default()).await.unwrap();
+    eprintln!("COUNT(*) = {total} in {:?}", count_started.elapsed());
+
+    // A page far into the table, sorted by an unindexed column: the slow, honest case.
+    let mut deep = query.clone();
+    deep.offset = 900_000;
+    let started = Instant::now();
+    conn.browse(&deep, BrowseOptions::default())
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    eprintln!(
+        "page at offset 900,000 (primary-key order) in {:?}",
+        started.elapsed()
+    );
+
+    let worst_first = samples.iter().map(|(f, _)| *f).max().unwrap();
+    assert!(
+        worst_first < Duration::from_millis(200),
+        "first rows took {worst_first:?}"
+    );
+}
