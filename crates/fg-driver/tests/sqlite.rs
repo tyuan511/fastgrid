@@ -408,3 +408,26 @@ async fn other_engines_are_not_available_yet() {
         Err(Error::Unsupported(_))
     ));
 }
+
+#[tokio::test]
+async fn analysed_tables_report_a_row_estimate() {
+    let s = seeded().await;
+    let estimate = |objects: &[fg_core::ObjectInfo], name: &str| {
+        objects
+            .iter()
+            .find(|o| o.path.name == name)
+            .unwrap()
+            .row_estimate
+    };
+    let before = s.list_objects(None).await.unwrap();
+    assert_eq!(
+        estimate(&before, "authors"),
+        None,
+        "never analysed: no cheap count"
+    );
+
+    run(&*s, "CREATE INDEX authors_name ON authors(name); ANALYZE").await;
+    let after = s.list_objects(None).await.unwrap();
+    assert_eq!(estimate(&after, "authors"), Some(2));
+    assert_eq!(estimate(&after, "book_titles"), None, "views have none");
+}

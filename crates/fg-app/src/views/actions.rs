@@ -10,6 +10,8 @@ use gpui_kit::{App, KeyBinding};
 pub const WORKSPACE_CONTEXT: &str = "Workspace";
 /// A table tab (data grid).
 pub const GRID_CONTEXT: &str = "TableTab";
+/// The connection list.
+pub const LAUNCHER_CONTEXT: &str = "Launcher";
 
 gpui_kit::actions!(
     fastgrid,
@@ -22,6 +24,10 @@ gpui_kit::actions!(
         ToggleFilters,
         RefreshSchema,
         CopySelection,
+        LauncherNext,
+        LauncherPrev,
+        LauncherOpen,
+        NewConnection,
     ]
 );
 
@@ -38,5 +44,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-shift-tab", PrevTab, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("secondary-f", ToggleFilters, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("secondary-c", CopySelection, Some(GRID_CONTEXT)),
+        KeyBinding::new("down", LauncherNext, Some(LAUNCHER_CONTEXT)),
+        KeyBinding::new("up", LauncherPrev, Some(LAUNCHER_CONTEXT)),
+        KeyBinding::new("enter", LauncherOpen, Some(LAUNCHER_CONTEXT)),
+        KeyBinding::new("secondary-n", NewConnection, Some(LAUNCHER_CONTEXT)),
     ]);
 }

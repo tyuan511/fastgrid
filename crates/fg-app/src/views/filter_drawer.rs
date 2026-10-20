@@ -9,10 +9,12 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::searchable_list::SearchableVec;
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, IconName, IndexPath, Sizable as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, IndexPath, Sizable as _, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+
+use super::icons::{Hugeicon, hugeicon};
 
 use crate::model::{
     Applied, DraftRow, FilterDraft, OPERATORS, RowError, op_from_label, value_slots,
@@ -352,7 +354,7 @@ impl Render for FilterDrawer {
                                             Button::new(SharedString::from(format!(
                                                 "filter-{i}-remove"
                                             )))
-                                            .icon(IconName::Close)
+                                            .icon(hugeicon(Hugeicon::Close))
                                             .ghost()
                                             .xsmall()
                                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -394,7 +396,7 @@ impl Render for FilterDrawer {
                     .child(
                         Button::new("filter-add")
                             .label("Add rule")
-                            .icon(IconName::Plus)
+                            .icon(hugeicon(Hugeicon::Plus))
                             .xsmall()
                             .disabled(self.raw_mode || self.columns.is_empty())
                             .on_click(cx.listener(|this, _, window, cx| this.add_row(window, cx))),

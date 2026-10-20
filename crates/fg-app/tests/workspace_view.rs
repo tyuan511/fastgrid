@@ -414,3 +414,77 @@ fn the_filter_shortcut_toggles_the_active_tabs_drawer(cx: &mut TestAppContext) {
     press(cx, &f, "secondary-f");
     assert!(!open(cx));
 }
+
+#[gpui_kit::test]
+fn the_theme_button_asks_the_controller_to_cycle(cx: &mut TestAppContext) {
+    let f = open(cx);
+    let asked = Rc::new(Cell::new(0));
+    let count = Rc::clone(&asked);
+    cx.update(|cx| {
+        cx.subscribe(&f.view, move |_, e: &WorkspaceEvent, _| {
+            if matches!(e, WorkspaceEvent::CycleTheme) {
+                count.set(count.get() + 1);
+            }
+        })
+        .detach();
+    });
+    cx.update_window(f.window, |_, window, cx| window.click("cycle-theme", cx))
+        .unwrap();
+    assert_eq!(asked.get(), 1);
+}
+
+#[gpui_kit::test]
+fn the_sidebar_width_is_kept_within_bounds_and_saved(cx: &mut TestAppContext) {
+    let f = open(cx);
+    let set = |cx: &mut TestAppContext, w: f32| {
+        cx.update_window(f.window, |_, window, cx| {
+            f.view
+                .update(cx, |v, cx| v.set_sidebar_width(w, window, cx));
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.read_entity(&f.view, |v, _| v.sidebar_width())
+    };
+    assert_eq!(
+        cx.read_entity(&f.view, |v, _| v.sidebar_width()),
+        220.0,
+        "the default"
+    );
+    assert_eq!(set(cx, 300.0), 300.0);
+    assert_eq!(set(cx, 50.0), 140.0, "not narrower than the minimum");
+    assert_eq!(set(cx, 9000.0), 450.0, "not wider than the maximum");
+
+    set(cx, 333.0);
+    let saved = cx.read_entity(&f.view, |v, _| v.session());
+    assert_eq!(saved.sidebar_width, Some(333.0));
+
+    let second = open(cx);
+    cx.update_window(second.window, |_, window, cx| {
+        second
+            .view
+            .update(cx, |v, cx| v.restore(&saved, window, cx));
+    })
+    .unwrap();
+    assert_eq!(
+        cx.read_entity(&second.view, |v, _| v.sidebar_width()),
+        333.0
+    );
+}
+
+#[gpui_kit::test]
+fn dragging_a_tab_onto_another_reorders_the_strip(cx: &mut TestAppContext) {
+    let f = open(cx);
+    open_table(cx, &f, "users");
+    open_table(cx, &f, "orders");
+    assert_eq!(titles(cx, &f), ["users", "orders"]);
+    let ids: Vec<_> = cx.read_entity(&f.view, |v, _| {
+        v.tabs().tabs().iter().map(|t| t.id.clone()).collect()
+    });
+
+    cx.update_window(f.window, |_, window, cx| {
+        window.drag_to(format!("tab-{}", ids[1]), format!("tab-{}", ids[0]), cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(titles(cx, &f), ["orders", "users"]);
+}

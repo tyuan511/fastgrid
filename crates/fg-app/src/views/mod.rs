@@ -3,15 +3,17 @@
 mod actions;
 mod filter_drawer;
 mod grid;
+pub mod icons;
 mod launcher;
 mod style;
 mod workspace;
 
 pub use actions::{
-    CloseTab, CopySelection, NextTab, PrevTab, QuickOpen, RefreshSchema, ToggleFilters,
-    ToggleSidebar, bind_keys,
+    CloseTab, CopySelection, LauncherNext, LauncherOpen, LauncherPrev, NewConnection, NextTab,
+    PrevTab, QuickOpen, RefreshSchema, ToggleFilters, ToggleSidebar, bind_keys,
 };
 pub use filter_drawer::{FilterDrawer, FilterDrawerEvent};
 pub use grid::{GridDelegate, TableTab, TableTabEvent};
+pub use icons::{FastgridAssets, Hugeicon, hugeicon};
 pub use launcher::{Launcher, LauncherEvent, Row, rows_from};
 pub use workspace::{WorkspaceEvent, WorkspaceView, open_workspace_window, restore_query};

@@ -508,3 +508,117 @@ fn an_unsafe_raw_where_is_rejected_by_the_service_and_shown(cx: &mut TestAppCont
     })
     .unwrap();
 }
+
+#[gpui_kit::test]
+fn following_a_foreign_key_opens_the_referenced_row(cx: &mut TestAppContext) {
+    let env = Env::new("fk");
+    let (service, app) = start(cx, &env);
+
+    // Two more tables, linked by a foreign key.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let svc = service.clone();
+    rt.block_on(async move {
+        let id = match svc.connections().await.unwrap().remove(0) {
+            fg_store::StoredConnection::Ok(c) => c.id,
+            other => panic!("{other:?}"),
+        };
+        let conn = svc.open(&id).await.unwrap();
+        conn.execute(
+            "CREATE TABLE authors (id INTEGER PRIMARY KEY, author_name TEXT);
+             CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, author_id INTEGER REFERENCES authors(id));
+             INSERT INTO authors VALUES (1, 'Ann'), (2, 'Bob'), (3, 'Cy');
+             INSERT INTO books VALUES (10, 'Rust', 2), (11, 'SQL', 3), (12, 'None', NULL);",
+            &[],
+            ExecOptions::default(),
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+        conn.refresh(&fg_service::Refresh::Everything);
+    });
+    // Reload the sidebar's schema so it lists the new tables.
+    cx.update_window(app.window, |_, window, cx| {
+        window.press("secondary-r", cx);
+    })
+    .unwrap();
+    let books = ObjectPath::new(Some("main"), "books");
+    settle(cx, "the new tables to be listed", |cx| {
+        cx.read_entity(&app.view, |v, _| v.object_exists(&books))
+    });
+
+    cx.update_window(app.window, |_, window, cx| {
+        app.view
+            .update(cx, |v, cx| v.open_table(&books, window, cx));
+    })
+    .unwrap();
+    let books_tab = cx.read_entity(&app.view, |v, _| {
+        let id = v.tabs().active_id().unwrap().clone();
+        v.tab_view(&id).unwrap().clone()
+    });
+    settle(cx, "books to load with its foreign key", |cx| {
+        status(cx, &app).starts_with("Showing 1–3 of 3")
+            && cx.read_entity(&books_tab, |t, cx| t.has_foreign_key("author_id", cx))
+    });
+
+    // books.author_id is the third column; the first row (id 10) points at author 2.
+    cx.update_window(app.window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("fk-0-2", cx);
+    })
+    .unwrap();
+
+    settle(cx, "authors to open filtered", |cx| {
+        status(cx, &app).starts_with("Showing 1–1 of 1")
+    });
+    let active = cx
+        .read_entity(&app.view, |v, _| v.tabs().active().cloned())
+        .unwrap();
+    assert!(matches!(&active.kind, fg_core::TabKind::Table { path, .. } if path.name == "authors"));
+    let authors_tab = cx.read_entity(&app.view, |v, _| v.tab_view(&active.id).unwrap().clone());
+    cx.read_entity(&authors_tab, |t, cx| {
+        assert_eq!(t.value_at(0, 1, cx), Some(Value::Text("Bob".into())));
+        assert_eq!(
+            t.query().active_filter_count(),
+            1,
+            "the drawer shows the filter that was applied"
+        );
+    });
+    // The books tab is still open behind it.
+    assert_eq!(cx.read_entity(&app.view, |v, _| v.tabs().tabs().len()), 2);
+}
+
+#[gpui_kit::test]
+fn hidden_columns_are_remembered_for_the_next_time(cx: &mut TestAppContext) {
+    let env = Env::new("hidden");
+    let (service, app) = start(cx, &env);
+    let tab = open_items(cx, &app);
+    settle(cx, "first page", |cx| {
+        status(cx, &app).starts_with("Showing 1–300 of 1,000")
+    });
+
+    cx.update_window(app.window, |_, _, cx| {
+        tab.update(cx, |t, cx| t.toggle_column("note", cx))
+    })
+    .unwrap();
+
+    let id = service_connection_id(&service);
+    let path = app.path.clone();
+    settle(cx, "the hidden column to be saved", |_| {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (svc, id, path) = (service.clone(), id.clone(), path.clone());
+        rt.block_on(async move {
+            svc.load_table_view(&id, &path)
+                .await
+                .unwrap()
+                .is_some_and(|v| v.hidden_columns == ["note".to_string()])
+        })
+    });
+}

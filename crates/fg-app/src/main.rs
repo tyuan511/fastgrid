@@ -30,42 +30,47 @@ fn main() {
         Service::start(options, &KeychainKeyProvider::os())
     };
 
-    gpui_kit::application().run(move |cx| {
-        gpui_kit::init(cx);
-        fg_app::views::bind_keys(cx);
-        cx.activate(true);
-        match started {
-            Ok(service) => {
-                cx.set_global(AppState {
-                    service: service.clone(),
-                });
-                open_launcher(cx, service);
-            }
-            Err(e) => {
-                eprintln!("fastgrid could not start: {e}");
-                if matches!(e, Error::KeyUnavailable(_)) {
-                    eprintln!(
-                        "The data store exists but its encryption key is not in the system \
-                         keychain. Restore it by importing an encrypted backup or syncing."
-                    );
+    gpui_kit::application()
+        .with_assets(fg_app::views::FastgridAssets)
+        .run(move |cx| {
+            gpui_kit::init(cx);
+            fg_app::views::bind_keys(cx);
+            cx.activate(true);
+            match started {
+                Ok(service) => {
+                    cx.set_global(AppState {
+                        service: service.clone(),
+                    });
+                    fg_app::controller::apply_saved_appearance(service.clone(), cx);
+                    open_launcher(cx, service);
                 }
-                cx.quit();
+                Err(e) => {
+                    eprintln!("fastgrid could not start: {e}");
+                    if matches!(e, Error::KeyUnavailable(_)) {
+                        eprintln!(
+                            "The data store exists but its encryption key is not in the system \
+                         keychain. Restore it by importing an encrypted backup or syncing."
+                        );
+                    }
+                    cx.quit();
+                }
             }
-        }
-    });
+        });
 }
 
 fn open_launcher(cx: &mut App, service: Service) {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
             None,
-            size(px(640.), px(480.)),
+            size(px(820.), px(540.)),
             cx,
         ))),
         ..TitleBar::window_options()
     };
-    let view = fg_app::controller::launcher(service, cx);
-    if let Err(e) = gpui_kit::open_window(options, cx, |_, _| view) {
+    if let Err(e) = gpui_kit::open_window(options, cx, |window, cx| {
+        fg_app::theme_control::follow_system(window);
+        fg_app::controller::launcher(service, window, cx)
+    }) {
         eprintln!("failed to open the window: {e}");
         cx.quit();
     }

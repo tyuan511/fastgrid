@@ -35,6 +35,9 @@ fg-app/src/
 5. **调度器是确定性的，服务线程不是**。端到端测试里服务有自己的线程，必须在测试开头 `cx.executor().allow_parking()`，并用「`run_until_parked` + 真实 sleep」的轮询等待结果。
 6. **定时器是虚拟时间**。防抖（会话保存的 600ms）在测试里永远不会自己到点：用 `cx.executor().advance_clock(..)` 推进。
 7. **编辑代码时别用不带断言的字符串替换**。`cargo fmt` 会改写排版，替换悄悄不生效，代码照样编译通过（抽屉不显示的 bug 就是这样来的）。
+8. **回车可能触发两次**。输入框的 `PressEnter` 订阅和键位上的动作同时响应同一次按键：只保留动作一条通路。
+9. **`disabled()` 对启用的按钮是 `None`**，不是 `Some(false)`。断言用 `assert_ne!(.., Some(true))`。
+10. **拖拽用 `window.drag_to(from, to, cx)`**，两端元素都要 `.test_support()`（标签条的重排测试即是）。
 
 ## 手动运行应用
 

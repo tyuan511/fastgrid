@@ -1,3 +1,63 @@
+# Rust build artifacts
 /target
+
+# OS and Editor files
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+
+# Logs and temporary files
 *.log
+*.tmp
+*.bak
+
+# Security and Credentials (AGENTS.md rule 6: never commit secrets or keys)
+*.key
+*.pem
+*.pfx
+*.p12
+*.secret
+*.fgexport
+
+# -----------------------------------------------------------------------------
+# Database files & generated test fixtures
+# All SQLite databases, journal, WAL, and SHM files
+# -----------------------------------------------------------------------------
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
+# Generated fixture artifacts for all database engines (SQLite, Postgres, MySQL)
+fixtures/**/data/
+fixtures/**/volumes/
+fixtures/**/dumps/
+fixtures/**/output/
+fixtures/**/*.db*
+fixtures/**/*.sqlite*
+fixtures/**/*.dump
+fixtures/**/*.sql.gz
+fixtures/**/*.sql.tar.gz
+fixtures/**/*.rdb
+
+# Ensure generator scripts, schemas, and configurations remain tracked
+!fixtures/**/generate.sh
+!fixtures/**/generate.py
+!fixtures/**/*.sql
+!fixtures/**/docker-compose*.yml
+!fixtures/**/Dockerfile*
+!fixtures/**/README.md
+!fixtures/**/.gitkeep

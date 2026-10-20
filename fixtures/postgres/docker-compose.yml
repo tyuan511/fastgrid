@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: fastgrid-test-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: fastgrid
+      POSTGRES_PASSWORD: testpassword
+      POSTGRES_DB: fastgrid_test
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fastgrid -d fastgrid_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 5

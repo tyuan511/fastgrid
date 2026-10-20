@@ -11,4 +11,5 @@
 pub mod app_state;
 pub mod controller;
 pub mod model;
+pub mod theme_control;
 pub mod views;

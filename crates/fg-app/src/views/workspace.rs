@@ -4,6 +4,7 @@
 //! events ([`WorkspaceEvent`]) answered by [`crate::controller`].
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use fg_core::{
@@ -15,11 +16,9 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::command::{Command, CommandItem, CommandState};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::list::ListItem;
-use gpui_kit::component::tab::{Tab, TabBar};
+use gpui_kit::component::resizable::{ResizableState, h_resizable, resizable_panel};
 use gpui_kit::component::tree::{TreeEvent, TreeItem, TreeState, tree};
-use gpui_kit::component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, TitleBar, h_flex, v_flex,
-};
+use gpui_kit::component::{ActiveTheme as _, Sizable as _, TitleBar, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -28,11 +27,34 @@ use super::actions::{
     WORKSPACE_CONTEXT,
 };
 use super::grid::{TableTab, TableTabEvent};
-use super::style::environment_color;
+use super::icons::{Hugeicon, hugeicon};
 use crate::model::{
-    GridQuery, NodeKind, QuickItem, TabSet, TreeNode, build_tree, quick_items, quick_search,
-    table_title,
+    GridQuery, NodeKind, QuickItem, TabSet, TreeNode, build_tree, compact_count, quick_items,
+    quick_search, table_title,
 };
+
+/// A tab being dragged; also the little label that follows the pointer.
+#[derive(Clone)]
+struct DraggedTab {
+    id: TabId,
+    title: SharedString,
+}
+
+impl Render for DraggedTab {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        div()
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.tab_active)
+            .text_size(px(13.))
+            .shadow_md()
+            .child(self.title.clone())
+    }
+}
 
 /// What the workspace asks its owner to do.
 pub enum WorkspaceEvent {
@@ -43,9 +65,25 @@ pub enum WorkspaceEvent {
     },
     /// Reload the schema (the refresh button).
     RefreshSchema,
+    /// The theme button: system, light, dark.
+    CycleTheme,
     /// Tabs or layout changed: worth saving.
     SessionChanged,
 }
+
+/// What the sidebar needs to draw and activate one tree row.
+struct NodeMeta {
+    kind: NodeKind,
+    path: Option<ObjectPath>,
+    row_estimate: Option<u64>,
+    /// Matched character positions in the name, for bold highlighting.
+    matched: Vec<usize>,
+}
+
+/// Sidebar width: default, and the range the drag handle allows.
+const SIDEBAR_DEFAULT: f32 = 220.0;
+const SIDEBAR_MIN: f32 = 140.0;
+const SIDEBAR_MAX: f32 = 450.0;
 
 enum SchemaState {
     Loading,
@@ -61,11 +99,14 @@ pub struct WorkspaceView {
     filter: Entity<InputState>,
     tree: Entity<TreeState>,
     /// Tree node id -> the table it stands for, so a click can be resolved.
-    paths: HashMap<SharedString, ObjectPath>,
+    meta: Rc<HashMap<SharedString, NodeMeta>>,
+    split: Entity<ResizableState>,
+    sidebar_width: f32,
     collapsed: HashSet<SharedString>,
     tabs: TabSet,
     tab_views: HashMap<TabId, Entity<TableTab>>,
     sidebar_visible: bool,
+    details_visible: bool,
     focus: FocusHandle,
     quick: Option<QuickOpenState>,
     _subscriptions: Vec<Subscription>,
@@ -116,11 +157,14 @@ impl WorkspaceView {
             objects: BTreeMap::new(),
             filter,
             tree,
-            paths: HashMap::new(),
+            meta: Rc::new(HashMap::new()),
+            split: cx.new(|_| ResizableState::default()),
+            sidebar_width: SIDEBAR_DEFAULT,
             collapsed: HashSet::new(),
             tabs: TabSet::new(),
             tab_views: HashMap::new(),
             sidebar_visible: true,
+            details_visible: true,
             focus: cx.focus_handle(),
             quick: None,
             _subscriptions: vec![on_filter, on_tree],
@@ -192,7 +236,7 @@ impl WorkspaceView {
 
     /// The tables and views currently listed in the sidebar (after filtering), in display order.
     pub fn visible_tables(&self) -> Vec<ObjectPath> {
-        let mut shown: Vec<_> = self.paths.values().cloned().collect();
+        let mut shown: Vec<_> = self.meta.values().filter_map(|m| m.path.clone()).collect();
         shown.sort();
         shown
     }
@@ -236,8 +280,9 @@ impl WorkspaceView {
         let filter = self.filter.read(cx).value().to_string();
         let show_namespaces = self.namespaces.len() > 1;
         let nodes = build_tree(&self.namespaces, &self.objects, &filter, show_namespaces);
-        self.paths.clear();
-        collect_paths(&nodes, &mut self.paths);
+        let mut meta = HashMap::new();
+        collect_meta(&nodes, &mut meta);
+        self.meta = Rc::new(meta);
         let filtering = !filter.is_empty();
         let items = to_items(&nodes, &self.collapsed, filtering);
         self.tree.update(cx, |t, cx| t.set_items(items, cx));
@@ -253,9 +298,18 @@ impl WorkspaceView {
             let query_path = path.clone();
             let tab = cx.new(|cx| TableTab::new(query_path, window, cx));
             // Persist view state when the user changes the query, and let the controller load.
-            let on_tab = cx.subscribe(&tab, |_, _, _: &TableTabEvent, cx| {
-                cx.emit(WorkspaceEvent::SessionChanged);
-            });
+            let on_tab = cx.subscribe_in(
+                &tab,
+                window,
+                |this, _, event: &TableTabEvent, window, cx| match event {
+                    TableTabEvent::Reload => cx.emit(WorkspaceEvent::SessionChanged),
+                    // Saved by the controller together with the table's other view state.
+                    TableTabEvent::ViewChanged => {}
+                    TableTabEvent::FollowForeignKey { table, filter } => {
+                        this.open_table_filtered(table, filter.clone(), window, cx);
+                    }
+                },
+            );
             self._subscriptions.push(on_tab);
             self.tab_views.insert(id, tab.clone());
             cx.emit(WorkspaceEvent::TableOpened {
@@ -265,6 +319,23 @@ impl WorkspaceView {
         }
         cx.emit(WorkspaceEvent::SessionChanged);
         cx.notify();
+    }
+
+    /// Open `path` showing only the rows matching `filter` (following a foreign key).
+    pub fn open_table_filtered(
+        &mut self,
+        path: &ObjectPath,
+        filter: fg_core::Filter,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_table(path, window, cx);
+        let Some(id) = self.tabs.active_id().cloned() else {
+            return;
+        };
+        if let Some(tab) = self.tab_views.get(&id).cloned() {
+            tab.update(cx, |t, cx| t.apply_filter(filter, cx));
+        }
     }
 
     pub fn activate_tab(&mut self, id: &TabId, cx: &mut Context<Self>) {
@@ -299,6 +370,34 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    pub fn toggle_details(&mut self, cx: &mut Context<Self>) {
+        self.details_visible = !self.details_visible;
+        cx.notify();
+    }
+
+    pub fn details_visible(&self) -> bool {
+        self.details_visible
+    }
+
+    pub fn sidebar_width(&self) -> f32 {
+        self.sidebar_width
+    }
+
+    /// Set the sidebar width, kept within the range the drag handle allows.
+    pub fn set_sidebar_width(&mut self, width: f32, window: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar_width = width.clamp(SIDEBAR_MIN, SIDEBAR_MAX);
+        let target = px(self.sidebar_width);
+        // Only possible once the panels have been laid out at least once; until then the
+        // panel's initial size (the same value) applies.
+        self.split.update(cx, |s, cx| {
+            if s.sizes().len() >= 2 {
+                s.resize_panel(0, target, window, cx);
+            }
+        });
+        cx.emit(WorkspaceEvent::SessionChanged);
+        cx.notify();
+    }
+
     pub fn sidebar_visible(&self) -> bool {
         self.sidebar_visible
     }
@@ -307,6 +406,7 @@ impl WorkspaceView {
     pub fn session(&self) -> WorkspaceState {
         self.tabs.to_workspace(WorkspaceState {
             sidebar_visible: self.sidebar_visible,
+            sidebar_width: Some(self.sidebar_width),
             ..WorkspaceState::default()
         })
     }
@@ -315,6 +415,9 @@ impl WorkspaceView {
     /// schema is loaded.
     pub fn restore(&mut self, saved: &WorkspaceState, window: &mut Window, cx: &mut Context<Self>) {
         self.sidebar_visible = saved.sidebar_visible;
+        if let Some(width) = saved.sidebar_width {
+            self.set_sidebar_width(width, window, cx);
+        }
         let wanted_active = saved.active_tab.clone();
         let mut active_path = None;
         for tab in &saved.tabs {
@@ -334,13 +437,42 @@ impl WorkspaceView {
     }
 }
 
-fn collect_paths(nodes: &[TreeNode], out: &mut HashMap<SharedString, ObjectPath>) {
+fn collect_meta(nodes: &[TreeNode], out: &mut HashMap<SharedString, NodeMeta>) {
     for n in nodes {
-        if let Some(p) = &n.path {
-            out.insert(n.id.clone().into(), p.clone());
-        }
-        collect_paths(&n.children, out);
+        out.insert(
+            n.id.clone().into(),
+            NodeMeta {
+                kind: n.kind,
+                path: n.path.clone(),
+                row_estimate: n.row_estimate,
+                matched: n.matched.clone(),
+            },
+        );
+        collect_meta(&n.children, out);
     }
+}
+
+/// `text` with the characters at `positions` (character indices) in bold.
+fn highlighted(text: &str, positions: &[usize]) -> AnyElement {
+    if positions.is_empty() {
+        return SharedString::from(text.to_owned()).into_any_element();
+    }
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let highlights = positions
+        .iter()
+        .filter_map(|&p| chars.get(p))
+        .map(|&(start, c)| {
+            (
+                start..start + c.len_utf8(),
+                HighlightStyle {
+                    font_weight: Some(FontWeight::BOLD),
+                    ..Default::default()
+                },
+            )
+        });
+    StyledText::new(text.to_owned())
+        .with_highlights(highlights)
+        .into_any_element()
 }
 
 fn to_items(
@@ -367,20 +499,110 @@ fn to_items(
 impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let pill = environment_color(cx, self.config.environment, self.config.color);
         let view = cx.entity().downgrade();
+
+        let active_table_name = self.tabs.active().map(|t| match &t.kind {
+            TabKind::Table { path, .. } => table_title(path),
+            _ => "Query".to_owned(),
+        });
+        let db_name = match &self.config.params {
+            fg_core::ConnectionParams::File { path } => std::path::Path::new(path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(path)
+                .to_owned(),
+            fg_core::ConnectionParams::Network { database, host, .. } => {
+                database.clone().unwrap_or_else(|| host.clone())
+            }
+        };
+        let breadcrumb_text = match &active_table_name {
+            Some(table) => format!(
+                "{} : {} : {} : {}",
+                self.config.kind.display_name(),
+                self.config.name,
+                db_name,
+                table
+            ),
+            None => format!(
+                "{} : {} : {}",
+                self.config.kind.display_name(),
+                self.config.name,
+                db_name
+            ),
+        };
+
+        let is_dark = theme.background.l < 0.5;
+        let pill_bg = if is_dark {
+            hsla(140.0 / 360.0, 0.40, 0.16, 1.0)
+        } else {
+            hsla(130.0 / 360.0, 0.45, 0.92, 1.0)
+        };
+        let pill_border = if is_dark {
+            hsla(140.0 / 360.0, 0.50, 0.28, 1.0)
+        } else {
+            hsla(130.0 / 360.0, 0.45, 0.78, 1.0)
+        };
+        let pill_text = if is_dark {
+            hsla(130.0 / 360.0, 0.60, 0.85, 1.0)
+        } else {
+            hsla(140.0 / 360.0, 0.70, 0.20, 1.0)
+        };
 
         let title = TitleBar::new().child(
             h_flex()
                 .w_full()
-                .gap_3()
+                .gap_2()
                 .items_center()
+                .justify_between()
                 .child(
-                    Button::new("toggle-sidebar")
-                        .icon(IconName::PanelLeft)
-                        .ghost()
-                        .xsmall()
-                        .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .child(
+                            Button::new("toggle-sidebar")
+                                .icon(hugeicon(Hugeicon::SidebarLeft))
+                                .ghost()
+                                .xsmall()
+                                .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
+                        )
+                        .child(
+                            Button::new("refresh-schema")
+                                .icon(hugeicon(Hugeicon::Refresh))
+                                .ghost()
+                                .xsmall()
+                                .on_click(cx.listener(|_, _, _, cx| {
+                                    cx.emit(WorkspaceEvent::RefreshSchema)
+                                })),
+                        )
+                        .child(
+                            Button::new("sql-console")
+                                .icon(hugeicon(Hugeicon::Terminal))
+                                .ghost()
+                                .xsmall(),
+                        )
+                        .child(
+                            Button::new("history-btn")
+                                .icon(hugeicon(Hugeicon::History))
+                                .ghost()
+                                .xsmall(),
+                        )
+                        .child(
+                            Button::new("cycle-theme")
+                                .icon(match crate::theme_control::chosen(cx) {
+                                    fg_core::ThemeMode::Light => hugeicon(Hugeicon::Sun),
+                                    fg_core::ThemeMode::Dark => hugeicon(Hugeicon::Moon),
+                                    _ => hugeicon(Hugeicon::Sun),
+                                })
+                                .ghost()
+                                .xsmall()
+                                .tooltip(format!(
+                                    "Theme: {}",
+                                    crate::theme_control::label(crate::theme_control::chosen(cx))
+                                ))
+                                .on_click(
+                                    cx.listener(|_, _, _, cx| cx.emit(WorkspaceEvent::CycleTheme)),
+                                ),
+                        ),
                 )
                 .child(
                     h_flex()
@@ -388,26 +610,42 @@ impl Render for WorkspaceView {
                         .test_support()
                         .aria_label(self.config.name.clone())
                         .gap_2()
-                        .px_2p5()
+                        .px_3()
                         .py_0p5()
                         .items_center()
                         .rounded_md()
                         .border_1()
-                        .border_color(pill)
-                        .text_sm()
-                        .child(div().size_2().rounded_full().bg(pill))
-                        .child(self.config.name.clone())
+                        .border_color(pill_border)
+                        .bg(pill_bg)
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(pill_text)
+                        .child(breadcrumb_text),
+                )
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .child(div().size_2p5().rounded_full().bg(theme.warning))
                         .child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(self.config.kind.display_name()),
+                            Button::new("info-btn")
+                                .icon(hugeicon(Hugeicon::Info))
+                                .ghost()
+                                .xsmall(),
+                        )
+                        .child(
+                            Button::new("toggle-details")
+                                .icon(hugeicon(Hugeicon::SidebarRight))
+                                .ghost()
+                                .xsmall()
+                                .on_click(cx.listener(|this, _, _, cx| this.toggle_details(cx))),
                         ),
                 ),
         );
 
         let sidebar = self.render_sidebar(&view, cx);
         let main = self.render_main(window, cx);
+        let details = self.render_details_panel(cx);
 
         let overlay = self.render_quick_open(window, cx);
         v_flex()
@@ -436,8 +674,35 @@ impl Render for WorkspaceView {
                 h_flex()
                     .flex_1()
                     .min_h_0()
-                    .when(self.sidebar_visible, |d| d.child(sidebar))
-                    .child(main),
+                    .child(
+                        div().flex_1().min_w_0().h_full().child(
+                            h_resizable("workspace-split")
+                                .with_state(&self.split)
+                                .on_resize({
+                                    let view = cx.entity().downgrade();
+                                    move |state, _, cx| {
+                                        let width =
+                                            state.read(cx).sizes().first().map(|w| f32::from(*w));
+                                        let _ = view.update(cx, |this, cx| {
+                                            if let Some(w) = width {
+                                                this.sidebar_width = w;
+                                                cx.emit(WorkspaceEvent::SessionChanged);
+                                            }
+                                        });
+                                    }
+                                })
+                                .child(
+                                    resizable_panel()
+                                        .size(px(self.sidebar_width))
+                                        .size_range(px(SIDEBAR_MIN)..px(SIDEBAR_MAX))
+                                        .fixed()
+                                        .visible(self.sidebar_visible)
+                                        .child(sidebar),
+                                )
+                                .child(resizable_panel().child(main)),
+                        ),
+                    )
+                    .when(self.details_visible, |d| d.child(details)),
             )
             .children(overlay)
     }
@@ -454,9 +719,9 @@ impl WorkspaceView {
 
         let items = quick.shown().into_iter().map(|i| {
             let icon = if i.kind == ObjectKind::View {
-                IconName::Eye
+                hugeicon(Hugeicon::View)
             } else {
-                IconName::LayoutDashboard
+                hugeicon(Hugeicon::Table)
             };
             let mut item = CommandItem::new().label(i.path.name.clone()).icon(icon);
             if let Some(ns) = &i.path.namespace {
@@ -535,37 +800,90 @@ impl WorkspaceView {
                 .child(message.clone())
                 .into_any_element(),
             SchemaState::Ready => {
-                let paths = self.paths.clone();
+                let meta = Rc::clone(&self.meta);
                 tree(&self.tree, move |ix, entry, selected, _, cx| {
                     let item = entry.item();
-                    let id = item.id.clone();
                     let theme = cx.theme().clone();
-                    let target = paths.get(&id).cloned();
-                    let is_folder = entry.is_folder();
-                    let view = view.clone();
-                    let icon = if let Some(p) = &target {
-                        // The icon depends on the kind; views get the eye.
-                        let _ = p;
-                        IconName::LayoutDashboard
-                    } else if entry.is_expanded() {
-                        IconName::FolderOpen
-                    } else {
-                        IconName::FolderClosed
+                    let info = meta.get(&item.id);
+                    // 16px of indent per level, rows 24px tall.
+                    let indent = px(8.0 + 16.0 * entry.depth() as f32);
+
+                    if entry.is_folder() {
+                        // Section header: TABLES (18)
+                        let chevron = if entry.is_expanded() {
+                            Hugeicon::ArrowDown
+                        } else {
+                            Hugeicon::ArrowRight
+                        };
+                        return ListItem::new(ix).h(px(24.)).py_0().pl(indent).child(
+                            h_flex()
+                                .gap_1()
+                                .items_center()
+                                .child(
+                                    hugeicon(chevron)
+                                        .size_3()
+                                        .text_color(theme.muted_foreground),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(10.))
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(theme.muted_foreground)
+                                        .child(item.label.to_uppercase()),
+                                ),
+                        );
+                    }
+
+                    let icon = match info.map(|m| m.kind) {
+                        Some(NodeKind::Object(ObjectKind::View)) => Hugeicon::View,
+                        _ => Hugeicon::Table,
                     };
+                    let icon_color = if selected {
+                        gpui::white()
+                    } else if icon == Hugeicon::View {
+                        hsla(270.0 / 360.0, 0.80, 0.60, 1.0)
+                    } else {
+                        hsla(205.0 / 360.0, 0.90, 0.48, 1.0)
+                    };
+                    let target = info.and_then(|m| m.path.clone());
+                    let estimate = info.and_then(|m| m.row_estimate).map(compact_count);
+                    let matched = info.map(|m| m.matched.clone()).unwrap_or_default();
+                    let view = view.clone();
                     ListItem::new(ix)
+                        .h(px(24.))
+                        .py_0()
                         .selected(selected)
-                        .pl(px(8.0 + 14.0 * entry.depth() as f32))
+                        .pl(indent)
                         .child(
                             h_flex()
+                                .w_full()
                                 .gap_2()
                                 .items_center()
-                                .text_sm()
-                                .child(Icon::new(icon).size_4().text_color(theme.muted_foreground))
-                                .child(item.label.clone()),
+                                .justify_between()
+                                .child(
+                                    h_flex()
+                                        .gap_2()
+                                        .items_center()
+                                        .text_sm()
+                                        .child(hugeicon(icon).size_4().text_color(icon_color))
+                                        .child(highlighted(&item.label, &matched)),
+                                )
+                                .when_some(estimate, |d, e| {
+                                    d.child(
+                                        div()
+                                            .pr_2()
+                                            .text_xs()
+                                            .text_color(if selected {
+                                                gpui::white().opacity(0.8)
+                                            } else {
+                                                theme.muted_foreground
+                                            })
+                                            .child(e),
+                                    )
+                                }),
                         )
                         .on_click(move |event, window, cx| {
                             if event.click_count() >= 2
-                                && !is_folder
                                 && let Some(path) = target.clone()
                             {
                                 let _ =
@@ -580,50 +898,215 @@ impl WorkspaceView {
         v_flex()
             .id("sidebar")
             .test_support()
-            .w(px(240.))
-            .h_full()
-            .flex_shrink_0()
-            .border_r_1()
-            .border_color(theme.sidebar_border)
+            .size_full()
             .bg(theme.sidebar)
             .child(
-                div().p_2().child(
+                h_flex()
+                    .p_1()
+                    .m_2()
+                    .rounded_md()
+                    .bg(theme.muted.opacity(0.6))
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_center()
+                            .py_0p5()
+                            .rounded_sm()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .bg(theme.background)
+                            .text_color(theme.foreground)
+                            .child("Items"),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_center()
+                            .py_0p5()
+                            .rounded_sm()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .cursor_pointer()
+                            .child("Queries"),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_center()
+                            .py_0p5()
+                            .rounded_sm()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .cursor_pointer()
+                            .child("History"),
+                    ),
+            )
+            .child(
+                div().px_2().pb_2().child(
                     Input::new(&self.filter)
                         .id("sidebar-filter")
+                        .small()
                         .cleanable(true),
                 ),
             )
             .child(div().flex_1().min_h_0().child(body))
+            .child(
+                h_flex()
+                    .h_7()
+                    .px_2()
+                    .items_center()
+                    .justify_between()
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .bg(theme.sidebar)
+                    .child(
+                        Button::new("sidebar-add")
+                            .icon(hugeicon(Hugeicon::Plus))
+                            .ghost()
+                            .xsmall(),
+                    )
+                    .child(
+                        Button::new("sidebar-menu")
+                            .icon(hugeicon(Hugeicon::ArrowDown))
+                            .ghost()
+                            .xsmall(),
+                    ),
+            )
             .into_any_element()
     }
 
-    fn render_main(&mut self, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    /// The tab strip, 32px high: icon, title and close button per tab, active tab raised, tabs
+    /// draggable to reorder. `None` when nothing is open.
+    fn render_tab_strip(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.tabs.is_empty() {
+            return None;
+        }
         let theme = cx.theme().clone();
-        let active_index = self.tabs.active_index().unwrap_or(0);
-        let tabs: Vec<Tab> = self
+        let active = self.tabs.active_id().cloned();
+        let tabs: Vec<AnyElement> = self
             .tabs
             .tabs()
             .iter()
-            .map(|t| {
+            .enumerate()
+            .map(|(index, t)| {
                 let title = match &t.kind {
                     TabKind::Table { path, .. } => table_title(path),
                     _ => "Query".to_owned(),
                 };
-                let (select_id, close_id) = (t.id.clone(), t.id.clone());
-                Tab::new()
-                    .label(title)
-                    .on_click(cx.listener(move |this, _, _, cx| this.activate_tab(&select_id, cx)))
-                    .suffix(
+                let is_active = active.as_ref() == Some(&t.id);
+                let icon = match &t.kind {
+                    TabKind::Table { path, .. } if self.is_view(path) => Hugeicon::View,
+                    TabKind::Table { .. } => Hugeicon::Table,
+                    _ => Hugeicon::Terminal,
+                };
+                let icon_color = if is_active {
+                    theme.tab_active_foreground
+                } else if icon == Hugeicon::View {
+                    hsla(270.0 / 360.0, 0.80, 0.60, 1.0)
+                } else {
+                    hsla(205.0 / 360.0, 0.90, 0.48, 1.0)
+                };
+                let (select_id, close_id, drag_id) = (t.id.clone(), t.id.clone(), t.id.clone());
+                let drag_title = title.clone();
+                let hover_bg = theme.tab_active;
+                h_flex()
+                    .id(SharedString::from(format!("tab-{}", t.id)))
+                    .test_support()
+                    .aria_label(title.clone())
+                    .h_full()
+                    .min_w(px(110.))
+                    .max_w(px(220.))
+                    .flex_shrink_0()
+                    .px_3()
+                    .gap_2()
+                    .items_center()
+                    .border_r_1()
+                    .border_color(theme.border)
+                    .text_size(px(13.))
+                    .cursor_pointer()
+                    .when(is_active, |d| {
+                        d.bg(theme.tab_active)
+                            .text_color(theme.tab_active_foreground)
+                    })
+                    .when(!is_active, |d| {
+                        d.bg(theme.tab)
+                            .text_color(theme.tab_foreground)
+                            .hover(move |s| s.bg(hover_bg))
+                    })
+                    .child(hugeicon(icon).size_3p5().text_color(icon_color))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(title),
+                    )
+                    .child(
                         Button::new(SharedString::from(format!("close-tab-{}", t.id)))
-                            .icon(IconName::Close)
+                            .icon(hugeicon(Hugeicon::Close))
                             .ghost()
                             .xsmall()
-                            .on_click(
-                                cx.listener(move |this, _, _, cx| this.close_tab(&close_id, cx)),
-                            ),
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_tab(&close_id, cx);
+                            })),
                     )
+                    .on_click(cx.listener(move |this, _, _, cx| this.activate_tab(&select_id, cx)))
+                    // Dragging a tab onto another puts it in that tab's place.
+                    .on_drag(
+                        DraggedTab {
+                            id: drag_id,
+                            title: drag_title.into(),
+                        },
+                        |dragged, _, _, cx| cx.new(|_| dragged.clone()),
+                    )
+                    .drag_over::<DraggedTab>(move |style, _, _, cx| {
+                        style.bg(cx.theme().drop_target)
+                    })
+                    .on_drop(cx.listener(move |this, dragged: &DraggedTab, _, cx| {
+                        this.move_tab_to(&dragged.id, index, cx);
+                    }))
+                    .into_any_element()
             })
             .collect();
+
+        Some(
+            h_flex()
+                .id("tab-strip")
+                .test_support()
+                .h(px(32.))
+                .w_full()
+                .flex_shrink_0()
+                .overflow_hidden()
+                .border_b_1()
+                .border_color(theme.border)
+                .bg(theme.tab_bar)
+                .children(tabs)
+                .into_any_element(),
+        )
+    }
+
+    /// Whether `path` is a view (tab icon).
+    fn is_view(&self, path: &ObjectPath) -> bool {
+        self.objects
+            .values()
+            .flatten()
+            .any(|o| &o.path == path && o.kind == ObjectKind::View)
+    }
+
+    /// Move a tab to another tab's position (drag and drop).
+    pub fn move_tab_to(&mut self, id: &TabId, to: usize, cx: &mut Context<Self>) {
+        if let Some(from) = self.tabs.tabs().iter().position(|t| &t.id == id) {
+            self.tabs.move_tab(from, to);
+            cx.emit(WorkspaceEvent::SessionChanged);
+            cx.notify();
+        }
+    }
+
+    fn render_main(&mut self, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let strip = self.render_tab_strip(cx);
 
         let content: AnyElement = match self.tabs.active().and_then(|t| self.tab_views.get(&t.id)) {
             Some(tab) => tab.clone().into_any_element(),
@@ -643,14 +1126,76 @@ impl WorkspaceView {
             .flex_1()
             .min_w_0()
             .h_full()
-            .when(!tabs.is_empty(), |d| {
-                d.child(
-                    TabBar::new("tabs")
-                        .selected_index(active_index)
-                        .children(tabs),
-                )
-            })
+            .children(strip)
             .child(div().flex_1().min_h_0().child(content))
+            .into_any_element()
+    }
+
+    fn render_details_panel(&self, cx: &App) -> AnyElement {
+        let theme = cx.theme().clone();
+        v_flex()
+            .id("details-panel")
+            .test_support()
+            .w(px(240.))
+            .h_full()
+            .border_l_1()
+            .border_color(theme.border)
+            .bg(theme.sidebar)
+            .child(
+                h_flex()
+                    .p_1()
+                    .m_1p5()
+                    .rounded_md()
+                    .bg(theme.muted.opacity(0.6))
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_center()
+                            .py_0p5()
+                            .rounded_sm()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .bg(theme.background)
+                            .text_color(theme.foreground)
+                            .child("Details"),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_center()
+                            .py_0p5()
+                            .rounded_sm()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .cursor_pointer()
+                            .child("Assistant"),
+                    ),
+            )
+            .child(
+                div().px_2().pb_2().child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.background)
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("🔍 Search for field..."),
+                ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child("No row selected"),
+            )
             .into_any_element()
     }
 }
@@ -671,6 +1216,7 @@ pub fn open_workspace_window(
         ..TitleBar::window_options()
     };
     gpui_kit::open_window(options, cx, |window, cx| {
+        crate::theme_control::follow_system(window);
         let view = cx.new(|cx| WorkspaceView::new(config, window, cx));
         // Shortcuts only reach a window that has focus somewhere inside it.
         let focus = view.read(cx).focus.clone();

@@ -41,14 +41,37 @@ pub fn list_objects(conn: &Connection, ns: &str) -> Result<Vec<ObjectInfo>> {
          WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY name",
         quote(ns)
     );
-    query_rows(conn, &sql, |r| {
+    let mut objects = query_rows(conn, &sql, |r| {
         let name: String = r.get(0)?;
         let ty: String = r.get(1)?;
         Ok(ObjectInfo::new(
             ObjectPath::new(Some(ns), name),
             kind_of(&ty),
         ))
+    })?;
+    let estimates = row_estimates(conn, ns);
+    for o in &mut objects {
+        o.row_estimate = estimates.get(&o.path.name).copied();
+    }
+    Ok(objects)
+}
+
+/// SQLite has no cheap row count, but `ANALYZE` leaves one in `sqlite_stat1` (`stat` starts with
+/// the table's row count). Tables never analysed simply have no estimate.
+fn row_estimates(conn: &Connection, ns: &str) -> BTreeMap<String, u64> {
+    let sql = format!("SELECT tbl, stat FROM {}.sqlite_stat1", quote(ns));
+    query_rows(conn, &sql, |r| {
+        let tbl: String = r.get(0)?;
+        let stat: String = r.get(1)?;
+        Ok((tbl, stat))
     })
+    .unwrap_or_default() // no sqlite_stat1 table: nothing analysed
+    .into_iter()
+    .filter_map(|(tbl, stat)| {
+        let rows = stat.split_whitespace().next()?.parse::<u64>().ok()?;
+        Some((tbl, rows))
+    })
+    .collect()
 }
 
 fn namespace_of(path: &ObjectPath) -> &str {

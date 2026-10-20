@@ -597,3 +597,226 @@ fn selection_text_for_rows_and_columns_is_spreadsheet_friendly(cx: &mut TestAppC
     .unwrap();
     assert_eq!(text(cx, &f).as_deref(), Some("1\n2"));
 }
+
+// ---- foreign keys ------------------------------------------------------------------------------
+
+use fg_app::model::JumpTarget;
+
+fn authors_target() -> JumpTarget {
+    JumpTarget {
+        column: "name".into(),
+        table: ObjectPath::new(Some("main"), "authors"),
+        referenced_column: "author_name".into(),
+    }
+}
+
+#[gpui_kit::test]
+fn followable_cells_have_an_arrow_that_asks_to_open_the_referenced_row(cx: &mut TestAppContext) {
+    let f = open(cx);
+    cx.update_window(f.window, |_, _, cx| {
+        f.view
+            .update(cx, |t, cx| t.set_foreign_keys(vec![authors_target()], cx))
+    })
+    .unwrap();
+    load(cx, &f, 3, Some(3)); // names: "item 1", NULL, "item 3"
+
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let log = Rc::clone(&events);
+    cx.update(|cx| {
+        cx.subscribe(&f.view, move |_, e: &TableTabEvent, _| {
+            log.borrow_mut().push(e.clone())
+        })
+        .detach();
+    });
+
+    cx.update_window(f.window, |_, window, cx| {
+        assert!(
+            window.try_find("fk-0-1").is_some(),
+            "a value can be followed"
+        );
+        assert!(
+            window.try_find("fk-1-1").is_none(),
+            "a NULL has nothing to follow"
+        );
+        assert!(
+            window.try_find("fk-0-0").is_none(),
+            "only foreign-key columns get arrows"
+        );
+        window.click("fk-0-1", cx);
+    })
+    .unwrap();
+
+    let got = events.borrow().clone();
+    assert_eq!(
+        got,
+        vec![TableTabEvent::FollowForeignKey {
+            table: ObjectPath::new(Some("main"), "authors"),
+            filter: Filter {
+                column: "author_name".into(),
+                op: FilterOp::Eq,
+                values: vec![Value::Text("item 1".into())],
+                enabled: true,
+            },
+        }]
+    );
+}
+
+#[gpui_kit::test]
+fn the_header_marks_foreign_key_columns(cx: &mut TestAppContext) {
+    let f = open(cx);
+    load(cx, &f, 1, None);
+    cx.update_window(f.window, |_, _, cx| {
+        assert!(!f.view.read(cx).has_foreign_key("name", cx));
+        f.view
+            .update(cx, |t, cx| t.set_foreign_keys(vec![authors_target()], cx));
+        assert!(f.view.read(cx).has_foreign_key("name", cx));
+        assert!(!f.view.read(cx).has_foreign_key("id", cx));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn a_jump_wins_over_saved_filters_whichever_arrives_first(cx: &mut TestAppContext) {
+    let jump = Filter {
+        column: "id".into(),
+        op: FilterOp::Eq,
+        values: vec![Value::Int(7)],
+        enabled: true,
+    };
+    let saved = |path: ObjectPath| {
+        let mut q = fg_app::model::GridQuery::new(path, 300);
+        q.set_filters(
+            vec![Filter {
+                column: "name".into(),
+                op: FilterOp::IsNull,
+                values: vec![],
+                enabled: true,
+            }],
+            None,
+        );
+        q
+    };
+
+    // A new tab: the jump arrives before the controller has restored the saved view state.
+    let f = open(cx);
+    cx.update_window(f.window, |_, _, cx| {
+        f.view.update(cx, |t, cx| {
+            t.apply_filter(jump.clone(), cx);
+            t.restore_query(saved(ObjectPath::new(Some("main"), "items")), cx);
+        });
+        assert_eq!(f.view.read(cx).query().filters, vec![jump.clone()]);
+    })
+    .unwrap();
+
+    // An already open tab: the filter replaces its rules and the grid reloads.
+    let g = open(cx);
+    cx.update_window(g.window, |_, _, cx| {
+        g.view.update(cx, |t, cx| {
+            t.restore_query(saved(ObjectPath::new(Some("main"), "items")), cx)
+        });
+        g.view.update(cx, |t, cx| t.apply_filter(jump.clone(), cx));
+        assert_eq!(g.view.read(cx).query().filters, vec![jump.clone()]);
+    })
+    .unwrap();
+    assert_eq!(*g.events.borrow(), vec![TableTabEvent::Reload]);
+}
+
+// ---- column visibility -------------------------------------------------------------------------
+
+fn counts(cx: &mut TestAppContext, f: &Fixture) -> (usize, usize) {
+    cx.update_window(f.window, |_, _, cx| f.view.read(cx).column_counts(cx))
+        .unwrap()
+}
+
+#[gpui_kit::test]
+fn columns_can_be_hidden_and_shown_from_the_panel(cx: &mut TestAppContext) {
+    let f = open(cx);
+    load(cx, &f, 3, Some(3));
+    assert_eq!(counts(cx, &f), (2, 2));
+
+    cx.update_window(f.window, |_, window, cx| {
+        assert!(window.try_find("columns-panel").is_none());
+        window.click("columns-toggle", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("columns-panel").is_some());
+        window.click("col-visible-name", cx);
+    })
+    .unwrap();
+    assert_eq!(counts(cx, &f), (1, 2));
+    assert_eq!(*f.events.borrow(), vec![TableTabEvent::ViewChanged]);
+    cx.update_window(f.window, |_, _, cx| {
+        assert_eq!(f.view.read(cx).hidden_columns(cx), vec!["name".to_string()]);
+    })
+    .unwrap();
+
+    // The last visible column cannot be hidden: a grid with no columns is useless.
+    cx.update_window(f.window, |_, window, cx| window.click("col-visible-id", cx))
+        .unwrap();
+    assert_eq!(counts(cx, &f), (1, 2));
+    assert_eq!(
+        f.events.borrow().len(),
+        1,
+        "nothing changed, nothing announced"
+    );
+
+    cx.update_window(f.window, |_, window, cx| {
+        window.click("columns-show-all", cx)
+    })
+    .unwrap();
+    assert_eq!(counts(cx, &f), (2, 2));
+    assert_eq!(f.events.borrow().len(), 2);
+}
+
+#[gpui_kit::test]
+fn hidden_columns_survive_a_reload_and_are_saved_with_the_view(cx: &mut TestAppContext) {
+    let f = open(cx);
+    load(cx, &f, 3, Some(3));
+    cx.update_window(f.window, |_, _, cx| {
+        f.view.update(cx, |t, cx| t.toggle_column("name", cx))
+    })
+    .unwrap();
+
+    // A new result with the same columns keeps them hidden.
+    load(cx, &f, 5, Some(5));
+    assert_eq!(counts(cx, &f), (1, 2));
+
+    let state = cx
+        .update_window(f.window, |_, _, cx| f.view.read(cx).view_state(cx))
+        .unwrap();
+    assert_eq!(state.hidden_columns, vec!["name".to_string()]);
+
+    // Restoring is silent: it is not a user change.
+    let g = open(cx);
+    load(cx, &g, 2, Some(2));
+    cx.update_window(g.window, |_, _, cx| {
+        g.view.update(cx, |t, cx| {
+            t.restore_hidden_columns(state.hidden_columns.clone(), cx)
+        })
+    })
+    .unwrap();
+    assert_eq!(counts(cx, &g), (1, 2));
+    assert!(g.events.borrow().is_empty());
+}
+
+#[gpui_kit::test]
+fn copying_a_row_leaves_hidden_columns_out(cx: &mut TestAppContext) {
+    let f = open(cx);
+    load(cx, &f, 2, Some(2)); // row 0: 1, "item 1"
+    cx.update_window(f.window, |_, _, cx| {
+        f.view.update(cx, |t, cx| {
+            t.toggle_column("id", cx);
+            t.select_row(0, cx);
+        });
+        assert_eq!(
+            f.view.read(cx).selection_text(cx).as_deref(),
+            Some("item 1")
+        );
+        // Selecting a cell counts columns as shown: column 0 on screen is now "name".
+        f.view.update(cx, |t, cx| t.select_cell(0, 0, cx));
+        assert_eq!(
+            f.view.read(cx).selection_text(cx).as_deref(),
+            Some("item 1")
+        );
+    })
+    .unwrap();
+}

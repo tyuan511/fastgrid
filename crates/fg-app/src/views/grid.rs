@@ -8,8 +8,11 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use fg_core::{ColumnMeta, ObjectPath, Value};
+use std::collections::{HashMap, HashSet};
+
+use fg_core::{ColumnMeta, Filter, FilterOp, ObjectPath, TableViewState, Value};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::table::{
     Column, ColumnSort, DataTable, TableDelegate, TableSelection, TableState,
 };
@@ -19,39 +22,62 @@ use gpui_kit::*;
 
 use super::actions::{CopySelection, GRID_CONTEXT};
 use super::filter_drawer::{FilterDrawer, FilterDrawerEvent};
+use super::icons::{Hugeicon, hugeicon};
 use crate::model::{
-    Align, CellKind, DEFAULT_PAGE_SIZE, FilterDraft, GridQuery, PAGE_SIZES, SortState, align_for,
-    copy_text, display, to_tsv,
+    Align, CellKind, DEFAULT_PAGE_SIZE, FilterDraft, GridQuery, JumpTarget, PAGE_SIZES, SortState,
+    align_for, copy_text, display, to_tsv,
 };
 
 /// A click on a column header, handed from the table delegate to the owning view.
 type SortRequest = Rc<RefCell<Option<String>>>;
+/// A click on a foreign-key arrow: (row, column) of the cell.
+type JumpRequest = Rc<RefCell<Option<(usize, usize)>>>;
 
 pub struct GridDelegate {
     metas: Vec<ColumnMeta>,
+    /// Columns the user hid, by name. Hidden columns are still fetched, just not shown.
+    hidden: HashSet<String>,
+    /// Indices into `metas` / each row of the columns being shown, in order.
+    visible: Vec<usize>,
     columns: Vec<Column>,
     rows: Vec<Vec<Value>>,
     sort: SortState,
     pending_sort: SortRequest,
+    /// Columns that can be followed to another table, by column name.
+    jumps: HashMap<String, JumpTarget>,
+    pending_jump: JumpRequest,
     loading: bool,
 }
 
 impl GridDelegate {
-    fn new(pending_sort: SortRequest) -> Self {
+    fn new(pending_sort: SortRequest, pending_jump: JumpRequest) -> Self {
         Self {
             metas: Vec::new(),
+            hidden: HashSet::new(),
+            visible: Vec::new(),
             columns: Vec::new(),
             rows: Vec::new(),
             sort: SortState::default(),
             pending_sort,
+            jumps: HashMap::new(),
+            pending_jump,
             loading: false,
         }
     }
 
+    /// The data column behind the `ix`-th column on screen.
+    fn data_index(&self, ix: usize) -> Option<usize> {
+        self.visible.get(ix).copied()
+    }
+
     fn rebuild_columns(&mut self) {
+        self.visible = (0..self.metas.len())
+            .filter(|&i| !self.hidden.contains(&self.metas[i].name))
+            .collect();
         self.columns = self
-            .metas
+            .visible
             .iter()
+            .map(|&i| &self.metas[i])
             .map(|m| {
                 let mut col = Column::new(m.name.clone(), m.name.clone())
                     .width(px(default_width(m)))
@@ -115,7 +141,7 @@ impl TableDelegate for GridDelegate {
     ) {
         // Our own `SortState` decides the cycle (asc, desc, off) and supports several keys;
         // the table only tells us which header was clicked.
-        if let Some(meta) = self.metas.get(col_ix) {
+        if let Some(meta) = self.data_index(col_ix).and_then(|i| self.metas.get(i)) {
             *self.pending_sort.borrow_mut() = Some(meta.name.clone());
             cx.notify();
         }
@@ -128,7 +154,7 @@ impl TableDelegate for GridDelegate {
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let Some(meta) = self.metas.get(col_ix) else {
+        let Some(meta) = self.data_index(col_ix).and_then(|i| self.metas.get(i)) else {
             return div().into_any_element();
         };
         let multiple_keys = self.sort.keys().len() > 1;
@@ -152,6 +178,9 @@ impl TableDelegate for GridDelegate {
                     .text_color(theme.muted_foreground)
                     .child(short_type(meta)),
             )
+            .when(self.jumps.contains_key(&meta.name), |d| {
+                d.child(div().text_xs().text_color(theme.info).child("↗"))
+            })
             .when_some(priority, |d, p| {
                 d.child(
                     div()
@@ -171,13 +200,20 @@ impl TableDelegate for GridDelegate {
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         let theme = cx.theme().clone();
+        // `col_ix` counts the columns on screen; the data may have hidden ones in between.
+        let col_ix = self.data_index(col_ix).unwrap_or(usize::MAX);
         let value = self
             .rows
             .get(row_ix)
             .and_then(|r| r.get(col_ix))
             .unwrap_or(&Value::Null);
         let cell = display(value);
-        match cell.kind {
+        let followable = !value.is_null()
+            && self
+                .metas
+                .get(col_ix)
+                .is_some_and(|m| self.jumps.contains_key(&m.name));
+        let element = match cell.kind {
             CellKind::Null => div()
                 .px_1p5()
                 .rounded_sm()
@@ -215,10 +251,39 @@ impl TableDelegate for GridDelegate {
                 .child(cell.text)
                 .into_any_element(),
             CellKind::Text => div().child(cell.text).into_any_element(),
+        };
+        if !followable {
+            return element;
         }
+        // A small arrow at the right edge opens the referenced row.
+        h_flex()
+            .w_full()
+            .gap_1()
+            .items_center()
+            .justify_between()
+            .child(div().min_w_0().overflow_hidden().child(element))
+            .child(
+                div()
+                    .id(SharedString::from(format!("fk-{row_ix}-{col_ix}")))
+                    .test_support()
+                    .aria_label("Open the referenced row")
+                    .px_1()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .text_xs()
+                    .text_color(theme.info)
+                    .hover(|d| d.bg(theme.muted))
+                    .child("↗")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        *this.delegate().pending_jump.borrow_mut() = Some((row_ix, col_ix));
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
     }
 
     fn cell_text(&self, row_ix: usize, col_ix: usize, _: &App) -> String {
+        let col_ix = self.data_index(col_ix).unwrap_or(usize::MAX);
         self.rows
             .get(row_ix)
             .and_then(|r| r.get(col_ix))
@@ -238,16 +303,25 @@ fn short_type(meta: &ColumnMeta) -> String {
 }
 
 /// What the grid asks its owner to do.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TableTabEvent {
     /// The query changed (page, sort, page size...): fetch again.
     Reload,
+    /// The user clicked a foreign-key arrow: show `table` filtered to `filter`.
+    FollowForeignKey { table: ObjectPath, filter: Filter },
+    /// Something that is remembered per table but needs no new data changed (hidden columns).
+    ViewChanged,
 }
 
 pub struct TableTab {
     table: Entity<TableState<GridDelegate>>,
     drawer: Entity<FilterDrawer>,
     drawer_open: bool,
+    columns_open: bool,
+    /// Set once the saved view state was applied; before that a jump must wait for it.
+    restored: bool,
+    /// A foreign-key jump that arrived before the saved filters were restored.
+    pending_filter: Option<Filter>,
     query: GridQuery,
     loading: bool,
     error: Option<SharedString>,
@@ -266,7 +340,8 @@ impl TableTab {
 
     pub fn with_query(query: GridQuery, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let pending: SortRequest = Rc::new(RefCell::new(None));
-        let delegate = GridDelegate::new(Rc::clone(&pending));
+        let pending_jump: JumpRequest = Rc::new(RefCell::new(None));
+        let delegate = GridDelegate::new(Rc::clone(&pending), Rc::clone(&pending_jump));
         let table = cx.new(|cx| TableState::new(delegate, window, cx).cell_selectable(true));
         let drawer = cx.new(|cx| FilterDrawer::new(window, cx));
         let on_apply = cx.subscribe(&drawer, |this, _, event: &FilterDrawerEvent, cx| {
@@ -281,6 +356,10 @@ impl TableTab {
             if let Some(column) = clicked {
                 this.toggle_sort(&column, cx);
             }
+            let jump = pending_jump.borrow_mut().take();
+            if let Some((row, col)) = jump {
+                this.follow_foreign_key(row, col, cx);
+            }
         });
         let initial = FilterDraft::from_applied(&query.filters, query.raw_where.as_deref());
         drawer.update(cx, |d, cx| d.load(initial, cx));
@@ -288,6 +367,9 @@ impl TableTab {
             table,
             drawer,
             drawer_open: false,
+            columns_open: false,
+            restored: false,
+            pending_filter: None,
             query,
             loading: false,
             error: None,
@@ -300,6 +382,12 @@ impl TableTab {
 
     /// Replace the query (restoring what was saved for this table) before the first load.
     pub fn restore_query(&mut self, query: GridQuery, cx: &mut Context<Self>) {
+        let mut query = query;
+        self.restored = true;
+        // A foreign-key jump that arrived first wins over whatever filters were saved.
+        if let Some(filter) = self.pending_filter.take() {
+            query.set_filters(vec![filter], None);
+        }
         let draft = FilterDraft::from_applied(&query.filters, query.raw_where.as_deref());
         self.drawer.update(cx, |d, cx| d.load(draft, cx));
         self.query = query;
@@ -386,12 +474,20 @@ impl TableTab {
         let table = self.table.read(cx);
         let d = table.delegate();
         match table.selection() {
-            TableSelection::Cell(r, c) => d.rows.get(r)?.get(c).map(copy_text),
+            TableSelection::Cell(r, c) => d.rows.get(r)?.get(d.data_index(c)?).map(copy_text),
             TableSelection::Row(r) => {
+                // What is copied is what is shown: hidden columns stay out.
                 let row = d.rows.get(r)?;
-                Some(to_tsv(&[row.iter().map(copy_text).collect()]))
+                let shown: Vec<String> = d
+                    .visible
+                    .iter()
+                    .filter_map(|&i| row.get(i))
+                    .map(copy_text)
+                    .collect();
+                Some(to_tsv(&[shown]))
             }
             TableSelection::Column(c) => {
+                let c = d.data_index(c)?;
                 let lines: Vec<Vec<String>> = d
                     .rows
                     .iter()
@@ -421,6 +517,130 @@ impl TableTab {
         if let Some(text) = self.selection_text(cx) {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
+    }
+
+    /// Columns that can be followed to another table (from the table's foreign keys).
+    pub fn set_foreign_keys(&mut self, targets: Vec<JumpTarget>, cx: &mut Context<Self>) {
+        self.table.update(cx, |t, cx| {
+            t.delegate_mut().jumps = targets.into_iter().map(|j| (j.column.clone(), j)).collect();
+            t.refresh(cx);
+        });
+    }
+
+    pub fn has_foreign_key(&self, column: &str, cx: &App) -> bool {
+        self.table.read(cx).delegate().jumps.contains_key(column)
+    }
+
+    fn follow_foreign_key(&mut self, row: usize, col: usize, cx: &mut Context<Self>) {
+        let d = self.table.read(cx).delegate();
+        let Some(meta) = d.metas.get(col) else { return };
+        let Some(target) = d.jumps.get(&meta.name) else {
+            return;
+        };
+        let Some(value) = d.rows.get(row).and_then(|r| r.get(col)).cloned() else {
+            return;
+        };
+        cx.emit(TableTabEvent::FollowForeignKey {
+            table: target.table.clone(),
+            filter: Filter {
+                column: target.referenced_column.clone(),
+                op: FilterOp::Eq,
+                values: vec![value],
+                enabled: true,
+            },
+        });
+    }
+
+    /// Show only the rows matching `filter` (used when arriving through a foreign key). If the
+    /// tab's saved view state has not been restored yet, the filter is applied right after it.
+    pub fn apply_filter(&mut self, filter: Filter, cx: &mut Context<Self>) {
+        if !self.restored {
+            self.pending_filter = Some(filter);
+            return;
+        }
+        self.query.set_filters(vec![filter], None);
+        let draft = FilterDraft::from_applied(&self.query.filters, None);
+        self.drawer.update(cx, |d, cx| d.load(draft, cx));
+        cx.emit(TableTabEvent::Reload);
+        cx.notify();
+    }
+
+    // ---- column visibility ---------------------------------------------------------------------
+
+    /// Hidden column names, sorted.
+    pub fn hidden_columns(&self, cx: &App) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .table
+            .read(cx)
+            .delegate()
+            .hidden
+            .iter()
+            .cloned()
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// `(shown, total)` for the `Columns (5/8)` label.
+    pub fn column_counts(&self, cx: &App) -> (usize, usize) {
+        let d = self.table.read(cx).delegate();
+        (d.visible.len(), d.metas.len())
+    }
+
+    /// Replace the hidden set without announcing it (restoring what was saved).
+    pub fn restore_hidden_columns(&mut self, names: Vec<String>, cx: &mut Context<Self>) {
+        self.table.update(cx, |t, cx| {
+            let d = t.delegate_mut();
+            d.hidden = names.into_iter().collect();
+            d.rebuild_columns();
+            t.refresh(cx);
+        });
+        cx.notify();
+    }
+
+    /// Show or hide one column. The last visible column cannot be hidden.
+    pub fn toggle_column(&mut self, name: &str, cx: &mut Context<Self>) {
+        let changed = self.table.update(cx, |t, cx| {
+            let d = t.delegate_mut();
+            if d.hidden.contains(name) {
+                d.hidden.remove(name);
+            } else if d.visible.len() > 1 {
+                d.hidden.insert(name.to_owned());
+            } else {
+                return false;
+            }
+            d.rebuild_columns();
+            t.refresh(cx);
+            true
+        });
+        if changed {
+            cx.emit(TableTabEvent::ViewChanged);
+            cx.notify();
+        }
+    }
+
+    pub fn show_all_columns(&mut self, cx: &mut Context<Self>) {
+        if !self.hidden_columns(cx).is_empty() {
+            self.restore_hidden_columns(Vec::new(), cx);
+            cx.emit(TableTabEvent::ViewChanged);
+        }
+    }
+
+    pub fn toggle_columns_panel(&mut self, cx: &mut Context<Self>) {
+        self.columns_open = !self.columns_open;
+        cx.notify();
+    }
+
+    pub fn columns_panel_open(&self) -> bool {
+        self.columns_open
+    }
+
+    /// Everything remembered per table: query state plus hidden columns.
+    pub fn view_state(&self, cx: &App) -> TableViewState {
+        self.query.to_view_state(TableViewState {
+            hidden_columns: self.hidden_columns(cx),
+            ..TableViewState::default()
+        })
     }
 
     pub fn toggle_filters(&mut self, cx: &mut Context<Self>) {
@@ -557,12 +777,50 @@ impl Render for TableTab {
         };
         let page_size = page.size();
         let filter_count = self.query.active_filter_count();
+        let (shown, total) = self.column_counts(cx);
         let sizes = PAGE_SIZES.iter().map(|&n| {
             Button::new(SharedString::from(format!("page-size-{n}")))
                 .label(n.to_string())
                 .xsmall()
                 .when(n == page_size, |b| b.primary())
                 .on_click(cx.listener(move |this, _, _, cx| this.set_page_size(n, cx)))
+        });
+
+        // The column list: one checkbox per column of the result.
+        let column_panel = self.columns_open.then(|| {
+            let hidden = self.table.read(cx).delegate().hidden.clone();
+            let boxes: Vec<AnyElement> = self
+                .table
+                .read(cx)
+                .delegate()
+                .metas
+                .iter()
+                .map(|m| {
+                    let name = m.name.clone();
+                    Checkbox::new(SharedString::from(format!("col-visible-{name}")))
+                        .label(name.clone())
+                        .checked(!hidden.contains(&name))
+                        .on_click(cx.listener(move |this, _, _, cx| this.toggle_column(&name, cx)))
+                        .into_any_element()
+                })
+                .collect();
+            v_flex()
+                .id("columns-panel")
+                .test_support()
+                .gap_2()
+                .p_3()
+                .border_t_1()
+                .border_color(theme.border)
+                .bg(theme.background)
+                .child(h_flex().flex_wrap().gap_x_4().gap_y_1().children(boxes))
+                .child(
+                    h_flex().child(
+                        Button::new("columns-show-all")
+                            .label("Show all")
+                            .xsmall()
+                            .on_click(cx.listener(|this, _, _, cx| this.show_all_columns(cx))),
+                    ),
+                )
         });
 
         v_flex()
@@ -590,7 +848,9 @@ impl Render for TableTab {
                     .child(DataTable::new(&self.table).stripe(true)),
             )
             .when(self.drawer_open, |d| d.child(self.drawer.clone()))
+            .children(column_panel)
             .child(
+                // Status bar, 28px: Filters, Columns, page size, row range | page buttons.
                 h_flex()
                     .h_7()
                     .px_3()
@@ -602,16 +862,78 @@ impl Render for TableTab {
                     .bg(theme.status_bar)
                     .text_xs()
                     .text_color(theme.muted_foreground)
+                    // Left: Data | Structure | Index | + Row | page sizes
                     .child(
                         h_flex()
-                            .gap_3()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                h_flex()
+                                    .p_0p5()
+                                    .rounded_md()
+                                    .bg(theme.muted.opacity(0.6))
+                                    .gap_0p5()
+                                    .child(
+                                        div()
+                                            .px_2()
+                                            .py_0p5()
+                                            .rounded_sm()
+                                            .bg(theme.primary)
+                                            .text_color(gpui::white())
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .child("Data"),
+                                    )
+                                    .child(
+                                        div()
+                                            .px_2()
+                                            .py_0p5()
+                                            .rounded_sm()
+                                            .text_color(theme.muted_foreground)
+                                            .cursor_pointer()
+                                            .hover(|d| d.text_color(theme.foreground))
+                                            .child("Structure"),
+                                    )
+                                    .child(
+                                        div()
+                                            .px_2()
+                                            .py_0p5()
+                                            .rounded_sm()
+                                            .text_color(theme.muted_foreground)
+                                            .cursor_pointer()
+                                            .hover(|d| d.text_color(theme.foreground))
+                                            .child("Index"),
+                                    ),
+                            )
+                            .child(
+                                Button::new("add-row")
+                                    .icon(hugeicon(Hugeicon::Plus))
+                                    .label("Row")
+                                    .ghost()
+                                    .xsmall(),
+                            )
+                            .child(h_flex().gap_1().children(sizes)),
+                    )
+                    // Center: 1-300 of 1,000,000 rows
+                    .child(
+                        div()
+                            .id("grid-status")
+                            .test_support()
+                            .aria_label(status.clone())
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(status),
+                    )
+                    // Right: Filter | Columns | Pagination
+                    .child(
+                        h_flex()
+                            .gap_2()
                             .items_center()
                             .child(
                                 Button::new("filters-toggle")
+                                    .icon(hugeicon(Hugeicon::Filter))
                                     .label(if filter_count > 0 {
                                         format!("Filters ({filter_count})")
                                     } else {
-                                        "Filters".to_owned()
+                                        "Filter".to_owned()
                                     })
                                     .xsmall()
                                     .when(filter_count > 0 || self.drawer_open, |b| b.primary())
@@ -620,47 +942,57 @@ impl Render for TableTab {
                                     ),
                             )
                             .child(
-                                div()
-                                    .id("grid-status")
-                                    .test_support()
-                                    .aria_label(status.clone())
-                                    .child(status),
+                                Button::new("columns-toggle")
+                                    .icon(hugeicon(Hugeicon::Columns))
+                                    .label(format!("Columns ({shown}/{total})"))
+                                    .xsmall()
+                                    .when(shown < total || self.columns_open, |b| b.primary())
+                                    .disabled(total == 0)
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.toggle_columns_panel(cx)),
+                                    ),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_0p5()
+                                    .items_center()
+                                    .child(
+                                        Button::new("page-first")
+                                            .label("«")
+                                            .xsmall()
+                                            .disabled(!has_prev)
+                                            .on_click(
+                                                cx.listener(|this, _, _, cx| this.first_page(cx)),
+                                            ),
+                                    )
+                                    .child(
+                                        Button::new("page-prev")
+                                            .icon(hugeicon(Hugeicon::ArrowLeft))
+                                            .xsmall()
+                                            .disabled(!has_prev)
+                                            .on_click(
+                                                cx.listener(|this, _, _, cx| this.prev_page(cx)),
+                                            ),
+                                    )
+                                    .child(
+                                        Button::new("page-next")
+                                            .icon(hugeicon(Hugeicon::ArrowRight))
+                                            .xsmall()
+                                            .disabled(!has_next)
+                                            .on_click(
+                                                cx.listener(|this, _, _, cx| this.next_page(cx)),
+                                            ),
+                                    )
+                                    .child(
+                                        Button::new("page-last")
+                                            .label("»")
+                                            .xsmall()
+                                            .disabled(page.total().is_none() || !has_next)
+                                            .on_click(
+                                                cx.listener(|this, _, _, cx| this.last_page(cx)),
+                                            ),
+                                    ),
                             ),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .items_center()
-                            .child(
-                                Button::new("page-first")
-                                    .label("«")
-                                    .xsmall()
-                                    .disabled(!has_prev)
-                                    .on_click(cx.listener(|this, _, _, cx| this.first_page(cx))),
-                            )
-                            .child(
-                                Button::new("page-prev")
-                                    .label("‹")
-                                    .xsmall()
-                                    .disabled(!has_prev)
-                                    .on_click(cx.listener(|this, _, _, cx| this.prev_page(cx))),
-                            )
-                            .child(
-                                Button::new("page-next")
-                                    .label("›")
-                                    .xsmall()
-                                    .disabled(!has_next)
-                                    .on_click(cx.listener(|this, _, _, cx| this.next_page(cx))),
-                            )
-                            .child(
-                                Button::new("page-last")
-                                    .label("»")
-                                    .xsmall()
-                                    .disabled(page.total().is_none() || !has_next)
-                                    .on_click(cx.listener(|this, _, _, cx| this.last_page(cx))),
-                            )
-                            .child(div().w_2())
-                            .children(sizes),
                     ),
             )
     }

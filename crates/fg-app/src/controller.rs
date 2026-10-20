@@ -9,10 +9,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use fg_core::{
-    ConnectionConfig, ConnectionParams, DbKind, GridSettings, ObjectInfo, ObjectPath, Result,
-    TableViewState,
-};
+use fg_core::{AppearanceSettings, ConnectionConfig, GridSettings, ObjectInfo, ObjectPath, Result};
 use fg_driver::Event;
 use fg_service::{BrowseOptions, OpenConnection, PasswordUpdate, Service};
 use gpui_kit::*;
@@ -22,15 +19,45 @@ use crate::views::{
     open_workspace_window, restore_query, rows_from,
 };
 
-/// Create the launcher view and connect it to the service.
-pub fn launcher(service: Service, cx: &mut App) -> Entity<Launcher> {
-    let view = cx.new(|_| Launcher::new());
+/// Apply the saved light / dark / system choice (call once at startup).
+pub fn apply_saved_appearance(service: Service, cx: &mut App) {
+    cx.spawn(async move |cx| {
+        let saved = service
+            .setting::<AppearanceSettings>()
+            .await
+            .unwrap_or_default();
+        cx.update(|cx| crate::theme_control::set_and_apply(saved.theme, cx));
+    })
+    .detach();
+}
+
+/// Switch to the next theme choice and remember it.
+fn cycle_theme(service: &Service, cx: &mut App) {
+    let next = crate::theme_control::next(crate::theme_control::chosen(cx));
+    crate::theme_control::set_and_apply(next, cx);
+    let service = service.clone();
+    cx.spawn(async move |_| {
+        let mut saved = service
+            .setting::<AppearanceSettings>()
+            .await
+            .unwrap_or_default();
+        saved.theme = next;
+        let _ = service.set_setting(saved).await;
+    })
+    .detach();
+}
+
+/// Create the launcher view and connect it to the service. Call from the window's builder.
+pub fn launcher(service: Service, window: &mut Window, cx: &mut App) -> Entity<Launcher> {
+    let view = cx.new(|cx| Launcher::new(window, cx));
     reload(&view, &service, cx);
 
     let events_service = service.clone();
     cx.subscribe(&view, move |view, event: &LauncherEvent, cx| match event {
         LauncherEvent::Open(id) => open(&view, &events_service, id.clone(), cx),
-        LauncherEvent::AddSqlite => add_sqlite(&view, &events_service, cx),
+        LauncherEvent::Save(config) => save(&view, &events_service, (**config).clone(), cx),
+        LauncherEvent::Delete(id) => delete(&view, &events_service, id.clone(), cx),
+        LauncherEvent::CycleTheme => cycle_theme(&events_service, cx),
     })
     .detach();
 
@@ -75,6 +102,7 @@ fn open(view: &Entity<Launcher>, service: &Service, id: fg_core::ConnectionId, c
             let _ = view.update(cx, |v, cx| v.set_opening(None, cx));
             let outcome = match result {
                 Ok(conn) => open_connection_window(service.clone(), conn, cx)
+                    .map(|_| ())
                     .map_err(|e| format!("Could not open the window: {e}")),
                 Err(e) => Err(format!("Could not connect: {e}")),
             };
@@ -86,40 +114,26 @@ fn open(view: &Entity<Launcher>, service: &Service, id: fg_core::ConnectionId, c
     .detach();
 }
 
-/// Pick a SQLite file and save it as a connection.
-fn add_sqlite(view: &Entity<Launcher>, service: &Service, cx: &mut App) {
-    let picked = cx.prompt_for_paths(PathPromptOptions {
-        files: true,
-        directories: false,
-        multiple: false,
-        prompt: Some("Open SQLite database".into()),
-    });
+/// Save a new, edited or duplicated connection.
+fn save(view: &Entity<Launcher>, service: &Service, config: ConnectionConfig, cx: &mut App) {
     let (view, service) = (view.downgrade(), service.clone());
     cx.spawn(async move |cx| {
-        let path = match picked.await {
-            Ok(Ok(Some(mut paths))) if !paths.is_empty() => paths.remove(0),
-            _ => return,
-        };
-        let name = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "SQLite".into());
-        let config = ConnectionConfig::new(
-            name,
-            DbKind::Sqlite,
-            ConnectionParams::File {
-                path: path.to_string_lossy().into_owned(),
-            },
-        );
-        match service.save_connection(config, PasswordUpdate::Keep).await {
-            Ok(saved) => {
-                let _ = view.update(cx, |v, cx| v.select(saved.id, cx));
-            }
-            Err(e) => {
-                let _ = view.update(cx, |v, cx| {
-                    v.set_message(Some(format!("Could not save the connection: {e}")), cx);
-                });
-            }
+        let outcome = service.save_connection(config, PasswordUpdate::Keep).await;
+        let _ = view.update(cx, |v, cx| match outcome {
+            Ok(saved) => v.select(saved.id, cx),
+            Err(e) => v.set_message(Some(format!("Could not save the connection: {e}")), cx),
+        });
+    })
+    .detach();
+}
+
+fn delete(view: &Entity<Launcher>, service: &Service, id: fg_core::ConnectionId, cx: &mut App) {
+    let (view, service) = (view.downgrade(), service.clone());
+    cx.spawn(async move |cx| {
+        if let Err(e) = service.delete_connection(&id).await {
+            let _ = view.update(cx, |v, cx| {
+                v.set_message(Some(format!("Could not delete the connection: {e}")), cx);
+            });
         }
     })
     .detach();
@@ -153,6 +167,7 @@ fn wire_workspace(
             attach_table(&service, &conn, path.clone(), tab.clone(), cx);
         }
         WorkspaceEvent::RefreshSchema => load_schema(&view, &conn, None, cx),
+        WorkspaceEvent::CycleTheme => cycle_theme(&service, cx),
         WorkspaceEvent::SessionChanged => {
             // Save shortly after the last change, not on every click.
             let (service, id, weak) = (service.clone(), conn.id().clone(), view.downgrade());
@@ -248,6 +263,9 @@ fn attach_table(
                 cx,
             );
         }
+        // The workspace window opens the referenced table; nothing to load for this tab.
+        TableTabEvent::FollowForeignKey { .. } => {}
+        TableTabEvent::ViewChanged => save_view(&reload_service, &reload_conn, &reload_tab, cx),
     })
     .detach();
 
@@ -264,12 +282,18 @@ fn attach_table(
             .setting::<GridSettings>()
             .await
             .map_or(crate::model::DEFAULT_PAGE_SIZE, |g| g.page_size);
+        let hidden = saved.hidden_columns.clone();
+        let targets = foreign_key_targets(&first_conn, &path).await;
         let query = restore_query(path, page_size, &saved);
         cx.update(|cx| {
             let Some(tab) = first_tab.upgrade() else {
                 return;
             };
-            tab.update(cx, |t, cx| t.restore_query(query, cx));
+            tab.update(cx, |t, cx| {
+                t.set_foreign_keys(targets, cx);
+                t.restore_query(query, cx);
+                t.restore_hidden_columns(hidden, cx);
+            });
             run_load(&first_service, &first_conn, &tab, &loads, cx);
         });
     })
@@ -328,9 +352,7 @@ fn run_load(
             }
         }
         // Remember how this table was being viewed.
-        if let Ok(state) = page_tab.read_with(cx, |t, _| {
-            t.query().to_view_state(TableViewState::default())
-        }) {
+        if let Ok(state) = page_tab.read_with(cx, |t, cx| t.view_state(cx)) {
             let _ = page_service
                 .save_table_view(page_conn.id(), &page_query.path, state)
                 .await;
@@ -352,4 +374,35 @@ fn run_load(
     let mut loads = loads.borrow_mut();
     loads.page = Some(page);
     loads.count = count;
+}
+
+/// Which columns of `path` can be followed to another table. A failure just means no arrows.
+async fn foreign_key_targets(
+    conn: &Arc<OpenConnection>,
+    path: &ObjectPath,
+) -> Vec<crate::model::JumpTarget> {
+    let Ok(detail) = conn.describe(path).await else {
+        return Vec::new();
+    };
+    // A key that names no column refers to the target's primary key: look those tables up first.
+    let mut primary_keys = std::collections::HashMap::new();
+    for target in crate::model::tables_needing_primary_key(&detail) {
+        if let Ok(d) = conn.describe(&target).await
+            && let [pk] = d.primary_key().as_slice()
+        {
+            primary_keys.insert(target, (*pk).to_owned());
+        }
+    }
+    crate::model::jump_targets(&detail, |t| primary_keys.get(t).cloned())
+}
+
+/// Save what is remembered per table (sorting, filters, hidden columns).
+fn save_view(service: &Service, conn: &Arc<OpenConnection>, tab: &Entity<TableTab>, cx: &mut App) {
+    let path = tab.read(cx).query().path().clone();
+    let state = tab.read(cx).view_state(cx);
+    let (service, id) = (service.clone(), conn.id().clone());
+    cx.spawn(async move |_| {
+        let _ = service.save_table_view(&id, &path, state).await;
+    })
+    .detach();
 }
