@@ -1,5 +1,5 @@
 [package]
-name = "ft-sql"
+name = "fg-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,4 +9,10 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-ft-core.workspace = true
+fg-service.workspace = true
+fg-mcp.workspace = true
+tokio.workspace = true
+
+[[bin]]
+name = "fastgrid-cli"
+path = "src/main.rs"

@@ -6,17 +6,17 @@ members = ["crates/*"]
 version = "0.0.1"
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://github.com/OWNER/fast-table"
+repository = "https://github.com/OWNER/fastgrid"
 rust-version = "1.85"
 
 [workspace.dependencies]
 # internal
-ft-core = { path = "crates/ft-core" }
-ft-driver = { path = "crates/ft-driver" }
-ft-store = { path = "crates/ft-store" }
-ft-sql = { path = "crates/ft-sql" }
-ft-service = { path = "crates/ft-service" }
-ft-mcp = { path = "crates/ft-mcp" }
+fg-core = { path = "crates/fg-core" }
+fg-driver = { path = "crates/fg-driver" }
+fg-store = { path = "crates/fg-store" }
+fg-sql = { path = "crates/fg-sql" }
+fg-service = { path = "crates/fg-service" }
+fg-mcp = { path = "crates/fg-mcp" }
 
 # external (versions pinned as each crate starts using them)
 thiserror = "2"

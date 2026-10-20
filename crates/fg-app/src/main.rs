@@ -10,7 +10,7 @@ impl Render for Root {
             .flex()
             .items_center()
             .justify_center()
-            .child(Button::new("hello").primary().label("fast-table"))
+            .child(Button::new("hello").primary().label("fastgrid"))
     }
 }
 

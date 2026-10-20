@@ -3,22 +3,22 @@
 ## Layering
 
 ```
-ft-app (GPUI)   ft-cli (headless)
+fg-app (GPUI)   fg-cli (headless)
       \            /
-       ft-service  <---- ft-mcp (stdio / local HTTP)
+       fg-service  <---- fg-mcp (stdio / local HTTP)
       /    |     \
-ft-driver ft-store ft-sql
+fg-driver fg-store fg-sql
       \    |     /
-        ft-core
+        fg-core
 ```
 
-Rule: dependencies point downward only. `ft-core` has no IO. `ft-app` is the only crate that
-depends on GPUI. `ft-mcp` and `ft-cli` must work without a display.
+Rule: dependencies point downward only. `fg-core` has no IO. `fg-app` is the only crate that
+depends on GPUI. `fg-mcp` and `fg-cli` must work without a display.
 
 ## Key decisions
 
 1. **Runtimes**: GPUI keeps its own executor. Database IO runs on a dedicated tokio runtime owned by
-   `ft-service`; results return to the UI over channels. The UI thread only renders and applies
+   `fg-service`; results return to the UI over channels. The UI thread only renders and applies
    small state updates.
 2. **Drivers**: native `tokio-postgres` and `mysql_async` rather than sqlx. We need streaming rows
    and exact control over dynamic type decoding, not compile-time checked queries.
@@ -35,7 +35,7 @@ depends on GPUI. `ft-mcp` and `ft-cli` must work without a display.
 
 ## Error handling
 
-All fallible paths return `ft_core::Error`. `unwrap` / `expect` are linted (warn) and must not be
+All fallible paths return `fg_core::Error`. `unwrap` / `expect` are linted (warn) and must not be
 used on production paths.
 
 ## Testing

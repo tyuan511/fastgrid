@@ -1573,6 +1573,78 @@ dependencies = [
 ]
 
 [[package]]
+name = "fg-app"
+version = "0.0.1"
+dependencies = [
+ "fg-service",
+ "gpui-kit",
+]
+
+[[package]]
+name = "fg-cli"
+version = "0.0.1"
+dependencies = [
+ "fg-mcp",
+ "fg-service",
+ "tokio",
+]
+
+[[package]]
+name = "fg-core"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "fg-driver"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "fg-core",
+ "tokio",
+]
+
+[[package]]
+name = "fg-mcp"
+version = "0.0.1"
+dependencies = [
+ "fg-core",
+ "fg-service",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "fg-service"
+version = "0.0.1"
+dependencies = [
+ "fg-core",
+ "fg-driver",
+ "fg-sql",
+ "fg-store",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "fg-sql"
+version = "0.0.1"
+dependencies = [
+ "fg-core",
+]
+
+[[package]]
+name = "fg-store"
+version = "0.0.1"
+dependencies = [
+ "fg-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "filedescriptor"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1751,78 +1823,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "76ee7a02da4d231650c7cea31349b889be2f45ddb3ef3032d2ec8185f6313fd2"
 dependencies = [
  "libc",
-]
-
-[[package]]
-name = "ft-app"
-version = "0.0.1"
-dependencies = [
- "ft-service",
- "gpui-kit",
-]
-
-[[package]]
-name = "ft-cli"
-version = "0.0.1"
-dependencies = [
- "ft-mcp",
- "ft-service",
- "tokio",
-]
-
-[[package]]
-name = "ft-core"
-version = "0.0.1"
-dependencies = [
- "serde",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "ft-driver"
-version = "0.0.1"
-dependencies = [
- "async-trait",
- "ft-core",
- "tokio",
-]
-
-[[package]]
-name = "ft-mcp"
-version = "0.0.1"
-dependencies = [
- "ft-core",
- "ft-service",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "ft-service"
-version = "0.0.1"
-dependencies = [
- "ft-core",
- "ft-driver",
- "ft-sql",
- "ft-store",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "ft-sql"
-version = "0.0.1"
-dependencies = [
- "ft-core",
-]
-
-[[package]]
-name = "ft-store"
-version = "0.0.1"
-dependencies = [
- "ft-core",
- "serde",
- "serde_json",
 ]
 
 [[package]]

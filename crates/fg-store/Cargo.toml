@@ -1,5 +1,5 @@
 [package]
-name = "ft-driver"
+name = "fg-store"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,6 +9,6 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-ft-core.workspace = true
-async-trait.workspace = true
-tokio.workspace = true
+fg-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true

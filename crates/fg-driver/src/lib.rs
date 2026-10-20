@@ -1,7 +1,7 @@
 //! Database driver abstraction. `mysql` and `postgres` backends will implement [`Driver`].
 
 use async_trait::async_trait;
-use ft_core::{ConnectionConfig, Result};
+use fg_core::{ConnectionConfig, Result};
 
 #[async_trait]
 pub trait Driver: Send + Sync {

@@ -1,4 +1,4 @@
-# fast-table
+# fastgrid
 
 A fast, stable, cross-platform database client written in Rust on [GPUI Kit](https://gpui-kit.com),
 with a built-in MCP server so external AI agents can query your databases safely.
@@ -10,7 +10,7 @@ with a built-in MCP server so external AI agents can query your databases safely
 - **Interaction** modeled on TablePlus: tabs, schema tree, inline-editable grid, command palette.
 - **Features** aiming at dbx-level coverage: SQL editor, structure editing, import/export.
 - **Performance and stability** first: virtualized grid, streamed results, cancellable queries.
-- **MCP for external agents**: `fast-table-cli mcp --stdio`, read-only by default, audited.
+- **MCP for external agents**: `fastgrid-cli mcp --stdio`, read-only by default, audited.
 - macOS, Windows, Linux. Apache-2.0, free.
 
 Phase 1 databases: MySQL (and MariaDB), PostgreSQL.
@@ -19,21 +19,21 @@ Phase 1 databases: MySQL (and MariaDB), PostgreSQL.
 
 | Crate | Role |
 |---|---|
-| `ft-core` | Domain types (connection, value, error). No IO. |
-| `ft-driver` | `Driver` trait + MySQL / PostgreSQL backends |
-| `ft-store` | Local SQLite store, keychain access |
-| `ft-sql` | Statement splitting and classification, completion |
-| `ft-service` | Pools, query tasks, metadata cache, policy; shared by GUI and MCP |
-| `ft-mcp` | MCP server (stdio + local HTTP) |
-| `ft-cli` | Headless binary `fast-table-cli` |
-| `ft-app` | GPUI desktop app `fast-table` |
+| `fg-core` | Domain types (connection, value, error). No IO. |
+| `fg-driver` | `Driver` trait + MySQL / PostgreSQL backends |
+| `fg-store` | Local SQLite store, keychain access |
+| `fg-sql` | Statement splitting and classification, completion |
+| `fg-service` | Pools, query tasks, metadata cache, policy; shared by GUI and MCP |
+| `fg-mcp` | MCP server (stdio + local HTTP) |
+| `fg-cli` | Headless binary `fastgrid-cli` |
+| `fg-app` | GPUI desktop app `fastgrid` |
 
 More: [architecture](docs/architecture.md) · [roadmap](docs/roadmap.md) · [MCP security](docs/mcp-security.md)
 
 ## Develop
 
 ```bash
-cargo run -p ft-app          # GUI
-cargo run -p ft-cli          # headless
+cargo run -p fg-app          # GUI
+cargo run -p fg-cli          # headless
 cargo test --workspace
 ```

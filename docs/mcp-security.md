@@ -4,13 +4,13 @@ External agents can run SQL, so safety is designed in from day one, not bolted o
 
 ## Transports
 
-- `fast-table-cli mcp --stdio` (primary): headless, configurable in Claude Desktop, Cursor, Claude Code.
+- `fastgrid-cli mcp --stdio` (primary): headless, configurable in Claude Desktop, Cursor, Claude Code.
 - Local streamable HTTP while the GUI runs: binds to 127.0.0.1 only, random bearer token.
 
 ## Policy
 
 1. **Read-only by default.** Enforced twice: session level (PostgreSQL `SET TRANSACTION READ ONLY`,
-   MySQL `START TRANSACTION READ ONLY`) and statement classification in `ft-sql`.
+   MySQL `START TRANSACTION READ ONLY`) and statement classification in `fg-sql`.
 2. **Writes are opt-in per connection** and require explicit confirmation in the GUI for each
    statement. Headless mode denies writes.
 3. **Limits**: max rows and statement timeout enforced server-side; truncated results are flagged to the agent.

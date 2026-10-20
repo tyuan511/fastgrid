@@ -1,5 +1,5 @@
 [package]
-name = "ft-service"
+name = "fg-service"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,9 +9,9 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-ft-core.workspace = true
-ft-driver.workspace = true
-ft-store.workspace = true
-ft-sql.workspace = true
+fg-core.workspace = true
+fg-driver.workspace = true
+fg-store.workspace = true
+fg-sql.workspace = true
 tokio.workspace = true
 tracing.workspace = true
