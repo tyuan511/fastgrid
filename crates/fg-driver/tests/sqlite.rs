@@ -337,23 +337,31 @@ async fn read_only_session_blocks_writes() {
 #[tokio::test]
 async fn cancel_interrupts_a_long_query() {
     let s = memory().await;
-    let stream = s
-        .execute(
-            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000000000) SELECT sum(i) FROM n",
-            &[],
-            ExecOptions::default(),
-        )
-        .await
-        .unwrap();
-    let cancel = s.cancel_handle();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        cancel.cancel();
-    });
-    let result = tokio::time::timeout(Duration::from_secs(10), stream.collect())
-        .await
-        .expect("query was not cancelled in time");
-    assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+    // Delay 0 is the interesting one: the cancel can land after the driver's first checkpoint but
+    // before SQLite starts stepping, and an interrupt delivered in that window is forgotten by
+    // SQLite. Every delay must still stop the query.
+    for delay_ms in [0u64, 1, 5, 20, 60, 100] {
+        let stream = s
+            .execute(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000000000) SELECT sum(i) FROM n",
+                &[],
+                ExecOptions::default(),
+            )
+            .await
+            .unwrap();
+        let cancel = s.cancel_handle();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            cancel.cancel();
+        });
+        let result = tokio::time::timeout(Duration::from_secs(10), stream.collect())
+            .await
+            .unwrap_or_else(|_| panic!("delay {delay_ms}: query was not cancelled in time"));
+        assert!(
+            matches!(result, Err(Error::Cancelled)),
+            "delay {delay_ms}: {result:?}"
+        );
+    }
 
     // The session stays usable afterwards.
     s.ping().await.unwrap();

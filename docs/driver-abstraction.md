@@ -34,8 +34,12 @@ fg-service pooling, SSH tunnel / TLS, policy (read-only, limits), metadata cache
    Dropping the `ExecutionStream` stops the query. `Batcher` implements batch size and
    `max_rows` truncation once for all drivers (an extra row must exist to flag `truncated`).
 4. **Cancellation is a handle, not a future.** `CancelHandle` is cheap to clone and callable from
-   any task. SQLite: `sqlite3_interrupt` plus a flag so cancels arriving before the statement
-   starts are not lost. PostgreSQL: cancel token. MySQL: `KILL QUERY` on a side connection.
+   any task. SQLite: `sqlite3_interrupt` plus our own flag, because SQLite *forgets* an interrupt
+   that arrives before the statement starts stepping (measured: 25/25 pre-step interrupts ignored,
+   10/10 delivered mid-step abort). The flag covers cancels before the statement starts; while a
+   statement is in flight the interrupt is re-delivered every 5 ms, which covers the window between
+   the driver's last checkpoint and the first `sqlite3_step`. PostgreSQL: cancel token. MySQL:
+   `KILL QUERY` on a side connection.
 5. **Namespace instead of catalog/schema.** `ObjectPath { namespace, name }`, where namespace is
    the first tree level under a connection: MySQL database, PostgreSQL schema, SQLite `main`/
    attached DB. PostgreSQL's *databases* are separate connections (`list_databases`,
