@@ -70,7 +70,7 @@
 - [x] 系统钥匙串：`KeychainKeyProvider`（`keyring` 4.x，条目 `device-key:<store_id>`）；逻辑用内存后端测试。
       **真实钥匙串还需在三端各手动验证一次：`cargo test -p fg-service -- --ignored os_keychain`（macOS 已通过编译，三端均未实测）**
 - [ ] 首次启动与钥匙串丢失的引导：`KeyUnavailable` 时给出明确提示（从同步或加密备份恢复）；引导用户导出加密备份
-- [ ] 片段（`snippet`）与编辑器草稿（`document`）的读写接口（M2 需要时补，表结构不用改）
+- [x] 片段（`snippet`）与编辑器草稿（`document`）的读写接口：`fg-store` 加密 CRUD（墓碑删除；草稿按 `updated_at` 排序；片段按 `sort_order` 再 `updated_at`；连接删除级联其草稿与连接作用域片段，全局片段保留；`StoredDocument` / `StoredSnippet` 把不可读记录和缺失分开，保存拒绝覆盖不可读行），`Service` 转发同一组方法。**界面未做**，仍属 M2
 - [x] `fg-service`：按连接的会话池（独占租约，`:memory:` 只用 1 个会话）、任务生命周期（流式结果、取消、丢弃即取消）、
       元数据缓存（TTL + `refresh`）、tokio runtime 桥接（公共 API 为 `async`，可从任意执行器调用）、
       连接增删改与密码（加密存储）、`test_connection`、`subscribe()` 事件、工作区 / 表视图 / 设置的读写、
@@ -125,29 +125,62 @@
 
 ## M2 SQL 编辑器 + 一级安全模式（3w）
 
-对应调研报告 §7、§8。
+对应调研报告 §7、§8。无界面的策略与落盘已有；编辑器、执行快捷键、结果区、L1 确认框、补全、查询历史与安全模式切换已落地。**不要把本里程碑标成完成**：hover / 跳转定义、崩溃恢复、完整的连接级安全模式界面仍未做，视觉也没有人眼验证过。
 
-- [ ] 编辑器：基于 gpui-kit 的 Editor，SQL 语法高亮（Tree-sitter）、行号、多光标
-- [ ] 执行：`⌘↵` 运行当前语句（分号感知并高亮）、`⌘⇧↵` 运行全部、选中优先；`Esc` / `⌘.` 取消
-- [ ] 结果区：多结果集标签、消息/日志（耗时、影响行数）、错误位置下划线（用 `QueryError.position`）
-- [ ] 补全：关键字 / 表 / 列（依赖元数据缓存），列优先于表优先于关键字
-- [ ] 格式化 SQL；注释切换
-- [ ] 查询历史（`⌘Y`）与收藏片段，持久化到 `fg-store`；未保存内容崩溃恢复
-- [ ] EXPLAIN：文本形式展示（SQLite 的 `EXPLAIN QUERY PLAN`）
-- [ ] 安全模式 L0 / L1 / 只读：连接级设置；L1 拦截 `DROP` / `TRUNCATE` / 无 `WHERE` 的 `UPDATE`/`DELETE`，弹确认框并展示语句
-- [ ] 环境色标驱动默认安全级别（生产 → L1）
+无界面，已落地：
+
+- [x] 执行策略：`plan(sql, kind, safe_mode)` 给出每条语句的分类、危险原因、是否需要确认，以及原文中的字节偏移。`OpenConnection::run` 在租会话前拒绝。每次尝试恰好一行历史（`Ok` / `Error` / `Cancelled` / `NotRun`）。非编辑器调用另写一行审计，身份是传入的 client id，不是固定标签。`RunOptions` 只能通过 `gui` / `gui_confirmed`（绑定该脚本的摘要）/ `agent(client)` 构造。
+- [x] L1 拒绝逻辑：Alert 对危险语句要求确认；Strict 对每个可能写入的语句要求确认。只读（含未知安全模式）拒绝写，确认不能覆盖。`execute` 走同一分类且没有确认通道。`SafeMode::Strict` 的口令再认证**没有实现**。
+- [x] 历史与审计落盘，以及 `Service` 上的 history / audit / documents / snippets、`exec_settings` / `set_exec_settings`、`drain_records`。审计拒绝重复 `AuditId`（含墓碑）。安全相关设置走严格读取，普通设置仍宽松。
+- [x] `max_rows` 与语句超时在 `fg-service::run` 强制：`ExecSettings`、单次选项、连接 `timeouts.statement_secs`（仅超时）取最严；设置不能读或不能解密反序列化时失败关闭。截断会标出。SQLite 由服务按语句计时。
+
+界面，已落地（行为有无界面测试；**画面没有被人眼验证过**）：
+
+- [x] 编辑器：`component::input::EditorState` + Tree-sitter SQL 高亮（`language("sql")`，`crates/fg-app/tests/editor_grammar.rs` 钉住语法在运行时确实注册）、行号、多光标、查找 / 替换、撤销重做全部来自库。`crates/fg-app/src/views/query_tab.rs`。
+- [x] 执行：`⌘↵` 运行光标所在语句、`⌘⇧↵` 运行全部、有选区则运行选区（`model::run_target` 决定，运行内容在事件被处理时才从缓冲区取，所以跑的就是屏幕上那串字）；`⌘.` 取消（`RunStream::canceller`）。`⌘T` / 顶栏 SQL 徽标新建查询标签。
+- [x] 结果区：按驱动给的 `index` 分标签（`Result 1 · 3 rows` / `Result 2 · 7 affected`），截断在该标签与状态行都标出；状态行汇总行数 / 耗时 / 跑了几条语句；`Notice` 进消息区；语句跑成功但历史或审计没写进去时用 `record-error` 明确告知（不静默）。
+- [x] 多类型标签：`WorkspaceView` 的标签内容改成 `TabContent::Table | Query`，会话能同时保存并恢复表标签与查询标签；查询标签绑定 `document`，改动 600ms 防抖落盘（`Service::save_document`），读不懂的草稿（新版本写的）只读展示且不回写。
+- [x] L1 / L2 确认框：plan 要求确认时先弹内联确认区，展示语句 + 危险原因 +（生产连接时）PRODUCTION 标记；点「Run anyway」才用 `gui_confirmed(同一段 SQL)` 重跑。拒绝时什么都不发（不碰数据库、不写历史）。
+
+界面与其余行为，仍未做：
+
+- [x] 补全（经 `fg-lsp` 的作用域分析）：`i.` 解析到 `items` 是因为 `i` 被声明成它的别名，不是名字前缀碰巧对上。列 > 作用域内关系 > 表 > 关键字；`alias.` 只给该关系的列；CTE 与 JOIN 别名各自解析；大小写不敏感；同名不重推；上限 50 条。数据来自元数据缓存（schema 落地后逐表 `describe` 灌入，不在敲键时查库）。
+- [x] **SQL language server `fg-lsp` + `fastgrid-cli lsp`**：进程层的完整实现——`wire.rs` 是 `Content-Length` 分帧（长度按**字节**算，UTF-16 位置换算在 `protocol.rs` 里做一次），`protocol.rs` 是纯函数式的「请求 → 响应」状态机（`initialize` / `initialized` / `shutdown` / `exit`、`didOpen` / `didChange` / `didClose`、`completion`、`diagnostic`、`publishDiagnostics`），`fg-cli` 只负责 stdin/stdout 的循环。客户端可以通过 `initializationOptions.fastgrid` 传 schema（`kind` + `tables[].columns[]`），进程才有列可补全。**进程级测试**（`crates/fg-cli/tests/lsp_process.rs`，7 个）真的 spawn 二进制、走管道：`initialize` 应答、别名解析出列、`didOpen` 推空诊断、畸形消息不断连、stdout 只有协议字节、`exit` 后正常退出。
+- [x] **SQL 分析核心 `fg-lsp`**（补全与诊断的所在地，而不是编辑器侧）：`scope.rs` 解析一条语句在光标处能看见什么（`FROM` / `JOIN` / 逗号列表 / `AS` 别名 / 限定名 / CTE / 派生表，后出现的别名遮蔽先出现的，只有光标所在那条语句被分析）；`complete.rs` 在此基础上排序候选；`diagnostics.rs` 解决「错误属于哪条语句」——靠「产生了几个结果集」推断失败的是第几条，所以**多语句脚本现在也能正确下划线**。纯函数、无 IO，schema 由调用方通过 `Catalog` 提供。前缀匹配器已删除，不并存。
+   - 已接入编辑器的 `CompletionProvider`；`HoverProvider` / `DefinitionProvider` 的挂点还在（`gpui_base::input::Lsp`），是后续增量。
+   - **CTE 与派生表的列已解析**：递归分析子查询的 `SELECT` 列表（`SELECT *` 按它自己的 `FROM` 展开、`AS name` 改名、类型从内层表带出），显式列名列表优先；CTE 体里的表**不会**泄漏到外层作用域；递归 CTE 与 `AS MATERIALIZED` 都处理；嵌套超过 8 层就停止（`MAX_DEPTH`），不会爆栈。
+- [x] 格式化 SQL（`⌥⇧F`）：`fg-sql::format_sql` 是纯函数——子句各占一行、括号内按层缩进并在逗号处换行、关键字统一大写、字符串 / 引号标识符 / 注释原样保留、语句之间空一行；幂等（`format_sql(format_sql(x)) == format_sql(x)`，有测试）。刻意保守：不做需要语法树的重新排版，宁可少格式化也不改语义。
+- [x] 注释切换（`⌘/`）：`fg-sql::toggle_line_comments`，用 lexer 判断某行是否**真的**是行注释（`SELECT '--x'` 不会被当成注释），只给非空行加/去 `--`，保留缩进；整段选中时若已全注释则取消、否则全部注释（混合选择按其他编辑器的惯例全注释）。只做行注释，块注释不做。
+- [x] 查询历史界面（`⌘Y` / 顶栏按钮）：右侧抽屉，按语句搜索、按结果着色（ok / error / cancelled / not run）、显示耗时与相对时间，点一条把语句填进当前查询标签。数据走 `Service::history`（加密历史记录），不另存一份。
+- [x] 收藏片段界面（`⌘⇧S` 打开 / `⌘⇧K` 把当前语句存为片段）：右侧抽屉，按标题 / SQL / 标签搜索，点一条填进当前查询标签，可删除；读不懂的片段单独提示且不可编辑。存储走 `fg-store` 的加密 `snippet` 记录（M1.1 已勾选），界面不另存副本。
+- [ ] 未保存内容的崩溃恢复：现在只有 600ms 防抖的 `save_document`，没有独立的崩溃日记。
+- [x] EXPLAIN（`⌘⇧E`）：走同一条受检路径 `OpenConnection::run` 跑 `EXPLAIN QUERY PLAN …`（SQLite）/ `EXPLAIN …`（其他引擎），计划就是引擎返回的行，直接显示在结果区；因为被分类的是 `EXPLAIN` 本身（读），**只读连接也能解释一条写语句**，且这次尝试照样进历史。
+- [x] 安全模式切换：顶栏锁形按钮按 Normal → Alert → Strict → ReadOnly 循环（只读时图标变实锁），tooltip 说明当前级别，改动立刻写回连接配置并关闭旧连接，所以下一条语句就按新级别执行。L1 / L2 确认对话框也在上面勾选。
+- [ ] 完整的连接级安全模式设置界面（下拉、说明文字、按环境给建议值）。现在只有这个循环按钮；默认映射已在 `Environment::default_safe_mode`（生产与未知 → Alert）
+
+~~已知 API 缺口：多语句脚本的错误无法归属~~ —— **已解决**，不需要驱动改动：`fg-lsp::diagnostic_for` 用「产生了几个结果集」推断失败的是第几条语句（服务按顺序执行、遇错即停），再把语句内偏移加上语句起点。测试：`fg-lsp` 的 `a_failure_in_the_third_statement_is_attributed_to_it`、`a_position_is_relative_to_the_statement_not_the_script`；界面上是 `a_multi_statement_failure_underlines_the_statement_that_failed`。
+
+另外两条待办：确认框目前是标签内的内联区，不是模态；`⌘↵` 之后对象树不会因为 DDL 自动刷新（手动 `⌘R`）。
 
 **验收**
 
-- 在 10 万行结果上执行查询，UI 在流式接收时保持响应，可中途取消
-- 语句拆分与分类通过针对字符串、注释、嵌套引号的测试集
-- L1 对「无 WHERE 的 DELETE」必定拦截（有测试）；只读模式下任何写语句都被拒绝
+- 在 10 万行结果上执行查询，UI 在流式接收时保持响应，可中途取消（执行与取消路径已实现且有测试；**十万行的界面表现未实测**，需要 `fixtures/sqlite/m1_test.db` 手工跑一次）
+- 语句拆分与分类通过针对字符串、注释、嵌套引号的测试集（M1.0 已覆盖，`cargo test -p fg-sql`）
+- L1 对「无 WHERE 的 DELETE」必定拦截（有测试）；只读模式下任何写语句都被拒绝（无界面部分已有测试；确认框也已实现并有 e2e：点确认前表里 3 行不变，点完才删）
+
+无界面已经能量化的部分（本次核对，不代表 M2 或 M1 完成）：
+
+- `cargo test -p fg-service --test run_policy --test policy_gaps`：`run_policy` 11 passed / 0 failed，`policy_gaps` 28 passed / 0 failed。覆盖 L1 / Strict / 只读拒绝、确认摘要不能换脚本重放、`max_rows` 截断、历史四种结果、审计只记非编辑器调用且使用 client id、启动 SQL 白名单、设置失败关闭、丢弃流仍记录。
+- `cargo test -p fg-service --test foreign_executor`：3 passed。用**非 tokio 执行器**（普通线程 + 手搓 block_on）驱动 `run` / `next` / `collect`，钉住「GUI 的 executor 上不能有 tokio reactor 依赖」这条契约（这条是 e2e 先炸出来、再补的回归测试）。
+- `cargo test -p fg-app --test query_tab_view --test query_tab_e2e`：`query_tab_view` 33 passed（无头驱动真实编辑器：`⌘↵` / `⌘⇧↵` / `⌘.`、选区优先、确认框出现与拒绝、结果分标签、截断标记、错误下划线、陈旧结果丢弃、读不懂的草稿只读），`query_tab_e2e` 4 passed（真实 SQLite + 加密存储 + Service + controller + 视图：跑查询进历史、Alert 下的 DELETE 点确认前不生效、ReadOnly 拒绝 UPDATE 且记 `NotRun`、草稿防抖落盘并可读回）。
+- `cargo test --workspace`：570 passed / 0 failed / 2 ignored，exit 0。2 个 ignored 是钥匙串实测与百万行性能，不是失败。
 
 ---
 
 ## M2.5 MCP 只读 MVP（1w）
 
-目的：尽早让 `fg-service` 被第二个调用方（外部 agent）验证，暴露抽象问题。
+目的：尽早让 `fg-service` 被第二个调用方（外部 agent）验证，暴露抽象问题。**尚未开始。**
+进程内 `RunOptions::agent` 不是引擎级只读租约：它只去掉确认并携带身份，Development / Normal 连接上仍可通过 `run()` 写入。本里程碑的传输层必须补上 [mcp-security.md](mcp-security.md) 列出的检查（已认证身份、`mcp_exposed` / 环境 / `allow_write`、自己的上限与超时、不接受 agent 确认、工具层拒绝也审计、引擎级只读叠加分类）。在那之前不能把 `run()` 的分类说成 agent 只读。
 
 - [ ] `fastgrid-cli mcp --stdio`（`rmcp`）：无头运行，与 GUI 共享 `fg-store` 里的连接配置
 - [ ] 工具：`list_connections`、`list_namespaces`、`describe_table`、`run_query`（强制只读 + `max_rows` + 超时）

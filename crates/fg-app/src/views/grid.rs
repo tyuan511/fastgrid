@@ -21,11 +21,12 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::actions::{CopySelection, GRID_CONTEXT};
+use super::cells::CellSelection;
 use super::filter_drawer::{FilterDrawer, FilterDrawerEvent};
 use super::icons::{Hugeicon, hugeicon};
 use crate::model::{
-    Align, CellKind, DEFAULT_PAGE_SIZE, FilterDraft, GridQuery, JumpTarget, PAGE_SIZES, SortState,
-    align_for, copy_text, display, to_tsv,
+    Align, DEFAULT_PAGE_SIZE, FilterDraft, GridQuery, JumpTarget, PAGE_SIZES, SortState, align_for,
+    copy_text, to_tsv,
 };
 
 /// A click on a column header, handed from the table delegate to the owning view.
@@ -47,6 +48,8 @@ pub struct GridDelegate {
     jumps: HashMap<String, JumpTarget>,
     pending_jump: JumpRequest,
     loading: bool,
+    /// The selected (row, column) on screen, mirrored from the table so cells can paint it.
+    selected: Option<(usize, usize)>,
 }
 
 impl GridDelegate {
@@ -62,6 +65,7 @@ impl GridDelegate {
             jumps: HashMap::new(),
             pending_jump,
             loading: false,
+            selected: None,
         }
     }
 
@@ -81,6 +85,7 @@ impl GridDelegate {
             .map(|m| {
                 let mut col = Column::new(m.name.clone(), m.name.clone())
                     .width(px(default_width(m)))
+                    .p_0()
                     .sortable();
                 if align_for(m.data_type.category) == Align::Right {
                     col.align = TextAlign::Right;
@@ -163,8 +168,7 @@ impl TableDelegate for GridDelegate {
             .indicator(&meta.name)
             .filter(|_| multiple_keys)
             .map(|(p, _)| p);
-        h_flex()
-            .size_full()
+        let header = h_flex()
             .gap_1p5()
             .items_center()
             .child(
@@ -172,24 +176,19 @@ impl TableDelegate for GridDelegate {
                     .font_weight(FontWeight::MEDIUM)
                     .child(meta.name.clone()),
             )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(short_type(meta)),
-            )
             .when(self.jumps.contains_key(&meta.name), |d| {
-                d.child(div().text_xs().text_color(theme.info).child("↗"))
+                d.child(div().text_size(px(13.)).text_color(theme.info).child("↗"))
             })
             .when_some(priority, |d, p| {
                 d.child(
                     div()
-                        .text_xs()
+                        .text_size(px(13.))
                         .text_color(theme.muted_foreground)
                         .child(p.to_string()),
                 )
             })
-            .into_any_element()
+            .into_any_element();
+        super::cells::th_frame(header, cx)
     }
 
     fn render_td(
@@ -201,62 +200,29 @@ impl TableDelegate for GridDelegate {
     ) -> impl IntoElement {
         let theme = cx.theme().clone();
         // `col_ix` counts the columns on screen; the data may have hidden ones in between.
+        let screen_col = col_ix;
         let col_ix = self.data_index(col_ix).unwrap_or(usize::MAX);
         let value = self
             .rows
             .get(row_ix)
             .and_then(|r| r.get(col_ix))
             .unwrap_or(&Value::Null);
-        let cell = display(value);
         let followable = !value.is_null()
             && self
                 .metas
                 .get(col_ix)
                 .is_some_and(|m| self.jumps.contains_key(&m.name));
-        let element = match cell.kind {
-            CellKind::Null => div()
-                .px_1p5()
-                .rounded_sm()
-                .bg(theme.muted)
-                .text_xs()
-                .italic()
-                .text_color(theme.muted_foreground)
-                .child(cell.text)
-                .into_any_element(),
-            CellKind::Pill => div()
-                .px_1p5()
-                .rounded_sm()
-                .bg(theme.muted)
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(cell.text)
-                .into_any_element(),
-            CellKind::Number => div()
-                .w_full()
-                .text_right()
-                .font_family(theme.mono_font_family.clone())
-                .child(cell.text)
-                .into_any_element(),
-            CellKind::Mono => div()
-                .font_family(theme.mono_font_family.clone())
-                .child(cell.text)
-                .into_any_element(),
-            CellKind::Bool => div()
-                .font_family(theme.mono_font_family.clone())
-                .text_color(if cell.text == "true" {
-                    theme.success
-                } else {
-                    theme.muted_foreground
-                })
-                .child(cell.text)
-                .into_any_element(),
-            CellKind::Text => div().child(cell.text).into_any_element(),
+        let element = super::cells::cell_element(value, cx);
+        let selection = match self.selected {
+            Some((r, c)) if r == row_ix && c == screen_col => CellSelection::Cell,
+            Some((r, _)) if r == row_ix => CellSelection::Row,
+            _ => CellSelection::None,
         };
         if !followable {
-            return element;
+            return super::cells::td_frame(element, selection, cx);
         }
         // A small arrow at the right edge opens the referenced row.
-        h_flex()
+        let linked = h_flex()
             .w_full()
             .gap_1()
             .items_center()
@@ -270,7 +236,7 @@ impl TableDelegate for GridDelegate {
                     .px_1()
                     .rounded_sm()
                     .cursor_pointer()
-                    .text_xs()
+                    .text_size(px(13.))
                     .text_color(theme.info)
                     .hover(|d| d.bg(theme.muted))
                     .child("↗")
@@ -279,7 +245,8 @@ impl TableDelegate for GridDelegate {
                         cx.notify();
                     })),
             )
-            .into_any_element()
+            .into_any_element();
+        super::cells::td_frame(linked, selection, cx)
     }
 
     fn cell_text(&self, row_ix: usize, col_ix: usize, _: &App) -> String {
@@ -292,16 +259,6 @@ impl TableDelegate for GridDelegate {
     }
 }
 
-/// `varchar(255)` is long; the badge shows the type's base name.
-fn short_type(meta: &ColumnMeta) -> String {
-    let native = meta.data_type.native.to_lowercase();
-    native
-        .split(['(', ' '])
-        .next()
-        .unwrap_or_default()
-        .to_owned()
-}
-
 /// What the grid asks its owner to do.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TableTabEvent {
@@ -311,6 +268,22 @@ pub enum TableTabEvent {
     FollowForeignKey { table: ObjectPath, filter: Filter },
     /// Something that is remembered per table but needs no new data changed (hidden columns).
     ViewChanged,
+}
+
+/// A selected row's full field details for the inspector panel.
+#[derive(Debug, Clone)]
+pub struct SelectedRowData {
+    pub row_ix: usize,
+    pub fields: Vec<FieldDetail>,
+}
+
+/// One field's metadata and formatted text in the selected row.
+#[derive(Debug, Clone)]
+pub struct FieldDetail {
+    pub name: String,
+    pub data_type: String,
+    pub value_text: String,
+    pub is_null: bool,
 }
 
 pub struct TableTab {
@@ -342,7 +315,11 @@ impl TableTab {
         let pending: SortRequest = Rc::new(RefCell::new(None));
         let pending_jump: JumpRequest = Rc::new(RefCell::new(None));
         let delegate = GridDelegate::new(Rc::clone(&pending), Rc::clone(&pending_jump));
-        let table = cx.new(|cx| TableState::new(delegate, window, cx).cell_selectable(true));
+        let table = cx.new(|cx| {
+            TableState::new(delegate, window, cx)
+                .cell_selectable(true)
+                .row_header(false)
+        });
         let drawer = cx.new(|cx| FilterDrawer::new(window, cx));
         let on_apply = cx.subscribe(&drawer, |this, _, event: &FilterDrawerEvent, cx| {
             let FilterDrawerEvent::Apply(applied) = event;
@@ -351,7 +328,17 @@ impl TableTab {
             cx.emit(TableTabEvent::Reload);
             cx.notify();
         });
-        let observer = cx.observe(&table, move |this, _, cx| {
+        let observer = cx.observe(&table, move |this, table, cx| {
+            let selected = match table.read(cx).selection() {
+                TableSelection::Cell(r, c) => Some((r, c)),
+                _ => None,
+            };
+            if table.read(cx).delegate().selected != selected {
+                table.update(cx, |t, cx| {
+                    t.delegate_mut().selected = selected;
+                    cx.notify();
+                });
+            }
             let clicked = pending.borrow_mut().take();
             if let Some(column) = clicked {
                 this.toggle_sort(&column, cx);
@@ -360,6 +347,7 @@ impl TableTab {
             if let Some((row, col)) = jump {
                 this.follow_foreign_key(row, col, cx);
             }
+            cx.notify();
         });
         let initial = FilterDraft::from_applied(&query.filters, query.raw_where.as_deref());
         drawer.update(cx, |d, cx| d.load(initial, cx));
@@ -410,6 +398,41 @@ impl TableTab {
             .cloned()
     }
 
+    /// Returns the selected row data (column names, types, values) if a cell or row is selected.
+    pub fn selected_row_detail(&self, cx: &App) -> Option<SelectedRowData> {
+        let table = self.table.read(cx);
+        let d = table.delegate();
+        let row_ix = match table.selection() {
+            TableSelection::Cell(r, _) => r,
+            TableSelection::Row(r) => r,
+            _ => return None,
+        };
+        let row = d.rows.get(row_ix)?;
+        let mut fields = Vec::with_capacity(d.metas.len());
+        for (i, meta) in d.metas.iter().enumerate() {
+            let val = row.get(i).unwrap_or(&Value::Null);
+            let is_null = val.is_null();
+            let value_text = copy_text(val);
+            fields.push(FieldDetail {
+                name: meta.name.clone(),
+                data_type: meta.data_type.native.clone(),
+                value_text,
+                is_null,
+            });
+        }
+        Some(SelectedRowData { row_ix, fields })
+    }
+
+    /// The selected row index, if any.
+    pub fn selected_row_index(&self, cx: &App) -> Option<usize> {
+        let table = self.table.read(cx);
+        match table.selection() {
+            TableSelection::Cell(r, _) => Some(r),
+            TableSelection::Row(r) => Some(r),
+            _ => None,
+        }
+    }
+
     pub fn column_names(&self, cx: &App) -> Vec<String> {
         self.table
             .read(cx)
@@ -452,6 +475,16 @@ impl TableTab {
     pub fn last_page(&mut self, cx: &mut Context<Self>) {
         if self.query.page.last() {
             cx.emit(TableTabEvent::Reload);
+        }
+    }
+
+    /// One entry point for the shared pager widget, which knows only which button was pressed.
+    fn navigate(&mut self, nav: super::cells::PageNav, cx: &mut Context<Self>) {
+        match nav {
+            super::cells::PageNav::First => self.first_page(cx),
+            super::cells::PageNav::Prev => self.prev_page(cx),
+            super::cells::PageNav::Next => self.next_page(cx),
+            super::cells::PageNav::Last => self.last_page(cx),
         }
     }
 
@@ -502,14 +535,17 @@ impl TableTab {
     pub fn select_cell(&mut self, row: usize, col: usize, cx: &mut Context<Self>) {
         self.table
             .update(cx, |t, cx| t.set_selected_cell(row, col, cx));
+        cx.notify();
     }
 
     pub fn select_row(&mut self, row: usize, cx: &mut Context<Self>) {
         self.table.update(cx, |t, cx| t.set_selected_row(row, cx));
+        cx.notify();
     }
 
     pub fn select_column(&mut self, col: usize, cx: &mut Context<Self>) {
         self.table.update(cx, |t, cx| t.set_selected_col(col, cx));
+        cx.notify();
     }
 
     /// Put the current selection on the clipboard (what `⌘C` does).
@@ -778,12 +814,40 @@ impl Render for TableTab {
         let page_size = page.size();
         let filter_count = self.query.active_filter_count();
         let (shown, total) = self.column_counts(cx);
-        let sizes = PAGE_SIZES.iter().map(|&n| {
-            Button::new(SharedString::from(format!("page-size-{n}")))
-                .label(n.to_string())
-                .xsmall()
-                .when(n == page_size, |b| b.primary())
-                .on_click(cx.listener(move |this, _, _, cx| this.set_page_size(n, cx)))
+        let is_zh = crate::views::style::is_zh_locale();
+        let selected_info = self.selected_row_index(cx).map(|sel| {
+            let total_str = page
+                .total()
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| self.loaded_rows.to_string());
+            if is_zh {
+                format!("第 {} 行（共 {} 行）", sel + 1, total_str)
+            } else {
+                format!("{} of {} rows selected", sel + 1, total_str)
+            }
+        });
+        let display_status = selected_info.unwrap_or_else(|| status.clone());
+
+        let filter_label = if is_zh {
+            if filter_count > 0 {
+                format!("过滤器 ({filter_count})")
+            } else {
+                "过滤器".to_owned()
+            }
+        } else if filter_count > 0 {
+            format!("Filters ({filter_count})")
+        } else {
+            "Filter".to_owned()
+        };
+
+        let columns_label = if is_zh {
+            format!("列 ({shown}/{total})")
+        } else {
+            format!("Columns ({shown}/{total})")
+        };
+
+        let sizes = super::cells::page_size_buttons(cx, &PAGE_SIZES, page_size, |this, n, cx| {
+            this.set_page_size(n, cx)
         });
 
         // The column list: one checkbox per column of the result.
@@ -817,7 +881,7 @@ impl Render for TableTab {
                     h_flex().child(
                         Button::new("columns-show-all")
                             .label("Show all")
-                            .xsmall()
+                            .small()
                             .on_click(cx.listener(|this, _, _, cx| this.show_all_columns(cx))),
                     ),
                 )
@@ -842,17 +906,20 @@ impl Render for TableTab {
                 )
             })
             .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .child(DataTable::new(&self.table).stripe(true)),
+                div().flex_1().min_h_0().child(
+                    DataTable::new(&self.table)
+                        .with_size(px(30.))
+                        .bordered(false)
+                        .header_row_height(px(34.))
+                        .stripe(false),
+                ),
             )
             .when(self.drawer_open, |d| d.child(self.drawer.clone()))
             .children(column_panel)
             .child(
                 // Status bar, 28px: Filters, Columns, page size, row range | page buttons.
                 h_flex()
-                    .h_7()
+                    .h(px(44.))
                     .px_3()
                     .gap_3()
                     .items_center()
@@ -860,11 +927,12 @@ impl Render for TableTab {
                     .border_t_1()
                     .border_color(theme.border)
                     .bg(theme.status_bar)
-                    .text_xs()
+                    .text_size(px(13.))
                     .text_color(theme.muted_foreground)
                     // Left: Data | Structure | Index | + Row | page sizes
                     .child(
                         h_flex()
+                            .flex_shrink_0()
                             .gap_2()
                             .items_center()
                             .child(
@@ -907,35 +975,37 @@ impl Render for TableTab {
                             .child(
                                 Button::new("add-row")
                                     .icon(hugeicon(Hugeicon::Plus))
-                                    .label("Row")
+                                    .label(if is_zh { "行" } else { "Row" })
                                     .ghost()
-                                    .xsmall(),
+                                    .small(),
                             )
-                            .child(h_flex().gap_1().children(sizes)),
+                            .child(sizes),
                     )
-                    // Center: 1-300 of 1,000,000 rows
+                    // Center: 1-300 of 1,000,000 rows / X of Y rows selected
                     .child(
                         div()
                             .id("grid-status")
                             .test_support()
                             .aria_label(status.clone())
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(status),
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_center()
+                            .text_color(theme.foreground)
+                            .child(display_status),
                     )
                     // Right: Filter | Columns | Pagination
                     .child(
                         h_flex()
+                            .flex_shrink_0()
                             .gap_2()
                             .items_center()
                             .child(
                                 Button::new("filters-toggle")
                                     .icon(hugeicon(Hugeicon::Filter))
-                                    .label(if filter_count > 0 {
-                                        format!("Filters ({filter_count})")
-                                    } else {
-                                        "Filter".to_owned()
-                                    })
-                                    .xsmall()
+                                    .label(filter_label)
+                                    .small()
                                     .when(filter_count > 0 || self.drawer_open, |b| b.primary())
                                     .on_click(
                                         cx.listener(|this, _, _, cx| this.toggle_filters(cx)),
@@ -944,54 +1014,28 @@ impl Render for TableTab {
                             .child(
                                 Button::new("columns-toggle")
                                     .icon(hugeicon(Hugeicon::Columns))
-                                    .label(format!("Columns ({shown}/{total})"))
-                                    .xsmall()
+                                    .label(columns_label)
+                                    .small()
                                     .when(shown < total || self.columns_open, |b| b.primary())
                                     .disabled(total == 0)
                                     .on_click(
                                         cx.listener(|this, _, _, cx| this.toggle_columns_panel(cx)),
                                     ),
                             )
+                            .child(super::cells::pager(
+                                cx,
+                                "grid",
+                                super::cells::PagerState {
+                                    has_prev,
+                                    has_next,
+                                    has_total: page.total().is_some(),
+                                },
+                                |this, nav, cx| this.navigate(nav, cx),
+                            ))
                             .child(
-                                h_flex()
-                                    .gap_0p5()
-                                    .items_center()
-                                    .child(
-                                        Button::new("page-first")
-                                            .label("«")
-                                            .xsmall()
-                                            .disabled(!has_prev)
-                                            .on_click(
-                                                cx.listener(|this, _, _, cx| this.first_page(cx)),
-                                            ),
-                                    )
-                                    .child(
-                                        Button::new("page-prev")
-                                            .icon(hugeicon(Hugeicon::ArrowLeft))
-                                            .xsmall()
-                                            .disabled(!has_prev)
-                                            .on_click(
-                                                cx.listener(|this, _, _, cx| this.prev_page(cx)),
-                                            ),
-                                    )
-                                    .child(
-                                        Button::new("page-next")
-                                            .icon(hugeicon(Hugeicon::ArrowRight))
-                                            .xsmall()
-                                            .disabled(!has_next)
-                                            .on_click(
-                                                cx.listener(|this, _, _, cx| this.next_page(cx)),
-                                            ),
-                                    )
-                                    .child(
-                                        Button::new("page-last")
-                                            .label("»")
-                                            .xsmall()
-                                            .disabled(page.total().is_none() || !has_next)
-                                            .on_click(
-                                                cx.listener(|this, _, _, cx| this.last_page(cx)),
-                                            ),
-                                    ),
+                                hugeicon(Hugeicon::Sliders)
+                                    .size_5()
+                                    .text_color(theme.muted_foreground),
                             ),
                     ),
             )

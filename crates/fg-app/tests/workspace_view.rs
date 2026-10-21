@@ -488,3 +488,56 @@ fn dragging_a_tab_onto_another_reorders_the_strip(cx: &mut TestAppContext) {
     .unwrap();
     assert_eq!(titles(cx, &f), ["orders", "users"]);
 }
+
+#[gpui_kit::test]
+fn selecting_a_row_in_a_table_populates_the_details_inspector(cx: &mut TestAppContext) {
+    let f = open(cx);
+    cx.update_window(f.window, |_, window, _| {
+        assert!(window.try_find("details-panel").is_some());
+        assert!(window.try_find("details-filter").is_some());
+    })
+    .unwrap();
+
+    open_table(cx, &f, "users");
+    let tab = cx.read_entity(&f.view, |v, _| {
+        let id = v.tabs().active_id().unwrap();
+        v.tab_view(id).unwrap().clone()
+    });
+
+    cx.update_window(f.window, |_, window, cx| {
+        tab.update(cx, |t, cx| {
+            let generation = t.begin_load(cx);
+            t.set_columns(
+                generation,
+                vec![
+                    fg_core::ColumnMeta::new(
+                        "id",
+                        fg_core::DataType::new("INTEGER", fg_core::TypeCategory::Integer),
+                    ),
+                    fg_core::ColumnMeta::new(
+                        "username",
+                        fg_core::DataType::new("TEXT", fg_core::TypeCategory::Text),
+                    ),
+                ],
+                cx,
+            );
+            t.append_rows(
+                generation,
+                vec![vec![
+                    fg_core::Value::Int(42),
+                    fg_core::Value::Text("alice".into()),
+                ]],
+                cx,
+            );
+            t.finish(generation, 5, cx);
+            t.select_row(0, cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+
+    cx.update_window(f.window, |_, window, _| {
+        assert!(window.try_find("details-panel").is_some());
+    })
+    .unwrap();
+}

@@ -23,3 +23,28 @@ pub fn environment_color(cx: &App, environment: Environment, tag: Option<TagColo
         },
     }
 }
+
+/// Detects if the current system environment is set to Chinese.
+pub fn is_zh_locale() -> bool {
+    static IS_ZH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *IS_ZH.get_or_init(|| {
+        if let Ok(lang) = std::env::var("LANG")
+            && (lang.starts_with("zh") || lang.starts_with("ZH"))
+        {
+            return true;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if let Ok(output) = std::process::Command::new("defaults")
+                .args(["read", "-g", "AppleLanguages"])
+                .output()
+            {
+                let s = String::from_utf8_lossy(&output.stdout);
+                if s.contains("zh-Hans") || s.contains("zh-Hant") || s.contains("zh_CN") {
+                    return true;
+                }
+            }
+        }
+        false
+    })
+}

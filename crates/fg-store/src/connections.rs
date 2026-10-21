@@ -1,4 +1,7 @@
-use fg_core::{ConnectionConfig, ConnectionGroup, ConnectionId, GroupId, Result, UnixMillis};
+use fg_core::{
+    ConnectionConfig, ConnectionGroup, ConnectionId, GroupId, Result, SecretKind, SecretRecord,
+    UnixMillis,
+};
 
 use crate::Store;
 use crate::kinds;
@@ -23,6 +26,14 @@ impl StoredConnection {
     }
 }
 
+/// How [`Store::save_connection_with_password`] treats the database password.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectionPassword {
+    Keep,
+    Set(String),
+    Clear,
+}
+
 /// Records that belong to a connection and go away with it. Audit entries deliberately do not:
 /// they must outlive the connection.
 const OWNED_BY_CONNECTION: &[&str] = &[
@@ -37,11 +48,73 @@ const OWNED_BY_CONNECTION: &[&str] = &[
 impl Store {
     /// Insert or update. Sets `created_at` on first save and `updated_at` every time; returns the
     /// stored version.
-    pub fn save_connection(&self, mut c: ConnectionConfig) -> Result<ConnectionConfig> {
+    pub fn save_connection(&self, c: ConnectionConfig) -> Result<ConnectionConfig> {
+        self.save_connection_with_password(c, ConnectionPassword::Keep)
+    }
+
+    /// Save the connection and its password change in one transaction.
+    ///
+    /// A failure of the password step rolls the config write back, so a stricter policy cannot
+    /// land on disk without the password that belongs to it.
+    pub fn save_connection_with_password(
+        &self,
+        mut c: ConnectionConfig,
+        password: ConnectionPassword,
+    ) -> Result<ConnectionConfig> {
         let now = UnixMillis::now();
         c.created_at.get_or_insert(now);
         c.updated_at = Some(now);
-        self.put_json(kinds::CONNECTION, c.id.as_str(), None, Some(now.0), &c)?;
+        let config_enc = self.seal_value(kinds::CONNECTION, c.id.as_str(), &c)?;
+        let secret_id = SecretKind::DatabasePassword.record_id(&c.id);
+        let secret_enc = match &password {
+            ConnectionPassword::Keep | ConnectionPassword::Clear => None,
+            ConnectionPassword::Set(value) => {
+                let record = SecretRecord {
+                    connection_id: c.id.clone(),
+                    kind: SecretKind::DatabasePassword,
+                    value: value.clone(),
+                };
+                Some(self.seal_value(kinds::SECRET, &secret_id, &record)?)
+            }
+        };
+        let id = c.id.clone();
+        self.with_write_tx(|tx| {
+            Self::replace_row(
+                tx,
+                &crate::SealedRow {
+                    kind: kinds::CONNECTION,
+                    id: id.as_str(),
+                    parent_id: None,
+                    sort_ts: Some(now.0),
+                    device_id: &self.device_id,
+                    key_id: self.key_id,
+                    enc: &config_enc,
+                },
+            )?;
+            match &password {
+                ConnectionPassword::Keep => Ok(()),
+                ConnectionPassword::Set(_) => {
+                    let enc = secret_enc.as_deref().ok_or_else(|| {
+                        fg_core::Error::Storage("password payload was not sealed".into())
+                    })?;
+                    Self::replace_row(
+                        tx,
+                        &crate::SealedRow {
+                            kind: kinds::SECRET,
+                            id: &secret_id,
+                            parent_id: Some(id.as_str()),
+                            sort_ts: None,
+                            device_id: &self.device_id,
+                            key_id: self.key_id,
+                            enc,
+                        },
+                    )
+                }
+                ConnectionPassword::Clear => {
+                    Self::tombstone_tx(tx, kinds::SECRET, &secret_id, &self.device_id, self.key_id)
+                }
+            }
+        })?;
         Ok(c)
     }
 

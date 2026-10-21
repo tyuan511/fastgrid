@@ -56,7 +56,12 @@ pub enum SafeMode {
     Normal,
     /// Level 1: confirm dangerous statements.
     Alert,
-    /// Level 2: re-authenticate (database password) before any write.
+    /// Level 2: confirm every statement that may write.
+    ///
+    /// Password re-authentication before any write is the intended policy and is not
+    /// implemented yet. Until it is, this mode is strictly stronger than [`SafeMode::Alert`]:
+    /// every statement whose class may write needs confirmation, not only dangerous ones.
+    /// A read-only connection is still stricter, because confirmation cannot authorize a write.
     Strict,
     /// No writes at all.
     ReadOnly,

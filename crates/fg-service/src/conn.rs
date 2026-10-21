@@ -1,28 +1,59 @@
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use fg_core::{
-    Capabilities, ConnectionConfig, ConnectionId, Dialect, Error, ObjectInfo, ObjectPath, Relation,
-    Result, TableDetail, TableQuery, Value,
+    Capabilities, ConnectionConfig, ConnectionId, DbKind, Dialect, Error, ObjectInfo, ObjectPath,
+    Relation, Result, SafeMode, TableDetail, TableQuery, Value,
 };
 use fg_driver::{Driver, ExecOptions};
 use fg_sql::{BuildOptions, build_count, build_select};
-use tokio::runtime::Handle;
+use fg_store::Store;
+use tokio::runtime::{Handle, Runtime};
 use tokio::sync::broadcast;
 
 use crate::ServiceEvent;
 use crate::cache::TtlCache;
 use crate::pool::SessionPool;
+use crate::run::Recorder;
 use crate::task::TaskStream;
 
 /// Runs futures on the service's tokio runtime. The public API is `async`, but the callers (the
 /// GUI's executor, an MCP server) are not tokio: the driver code needs a tokio context, so every
 /// public method hops onto the runtime and awaits the join handle, which works from anywhere.
+/// Keeps an owned runtime alive until the last stream drops it, then shuts it down off the
+/// async worker. An external runtime is not wrapped: its owner shuts it down.
 #[derive(Clone)]
 pub(crate) struct Rt {
     pub handle: Handle,
+    pub shared: Option<Arc<SharedRuntime>>,
+}
+
+pub(crate) struct SharedRuntime {
+    runtime: Mutex<Option<Runtime>>,
+}
+
+impl SharedRuntime {
+    pub fn new(runtime: Runtime) -> Arc<Self> {
+        Arc::new(Self {
+            runtime: Mutex::new(Some(runtime)),
+        })
+    }
+}
+
+impl Drop for SharedRuntime {
+    fn drop(&mut self) {
+        if let Some(runtime) = self
+            .runtime
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .take()
+        {
+            runtime.shutdown_background();
+        }
+    }
 }
 
 impl Rt {
@@ -63,16 +94,19 @@ pub enum Refresh {
 
 pub struct OpenConnection {
     pub(crate) rt: Rt,
-    config: ConnectionConfig,
+    pub(crate) config: ConnectionConfig,
     driver: Arc<dyn Driver>,
-    pool: Arc<SessionPool>,
+    pub(crate) pool: Arc<SessionPool>,
+    /// History, audit and exec settings. A refusal records here without leasing a session.
+    pub(crate) store: Arc<Mutex<Store>>,
     namespaces: TtlCache<(), Vec<String>>,
     objects: TtlCache<Option<String>, Arc<Vec<ObjectInfo>>>,
     details: TtlCache<ObjectPath, Arc<TableDetail>>,
     relations: TtlCache<Option<String>, Arc<Vec<Relation>>>,
     /// Shared with the service so a settings change applies to open connections.
-    max_cell_bytes: Arc<AtomicUsize>,
+    pub(crate) max_cell_bytes: Arc<AtomicUsize>,
     events: broadcast::Sender<ServiceEvent>,
+    pub(crate) recorder: Recorder,
 }
 
 impl OpenConnection {
@@ -82,26 +116,41 @@ impl OpenConnection {
         config: ConnectionConfig,
         driver: Arc<dyn Driver>,
         pool: Arc<SessionPool>,
+        store: Arc<Mutex<Store>>,
         ttl: Duration,
         max_cell_bytes: Arc<AtomicUsize>,
         events: broadcast::Sender<ServiceEvent>,
+        recorder: Recorder,
     ) -> Arc<Self> {
         Arc::new(Self {
             rt,
             config,
             driver,
             pool,
+            store,
             namespaces: TtlCache::new(ttl),
             objects: TtlCache::new(ttl),
             details: TtlCache::new(ttl),
             relations: TtlCache::new(ttl),
             max_cell_bytes,
             events,
+            recorder,
         })
     }
 
     pub fn id(&self) -> &ConnectionId {
         &self.config.id
+    }
+
+    /// Engine of this connection. `plan` needs it and must not open a session to find out.
+    pub fn kind(&self) -> DbKind {
+        self.config.kind
+    }
+
+    /// Safe mode that `run` will enforce. Unknown modes are already collapsed to read-only, so a
+    /// caller planning a dialog sees the same decision the service will make.
+    pub fn safe_mode(&self) -> SafeMode {
+        self.config.effective_safe_mode()
     }
 
     pub fn config(&self) -> &ConnectionConfig {
@@ -242,19 +291,47 @@ impl OpenConnection {
 
     // ---- statements --------------------------------------------------------------------------
 
-    /// Run SQL (one or several statements) and stream the results. Dropping the stream stops it.
+    /// Driver SQL for the grid and tests.
+    ///
+    /// This is not a second policy. The same classification `run` uses is applied first, and a
+    /// refusal returns [`Error::PolicyDenied`] without leasing a session. There is no
+    /// confirmation on this path: alert and strict writes are refused, and a read-only write
+    /// cannot be forced through by a `PRAGMA` in the same script. User-typed and agent SQL
+    /// should call [`Self::run`], which also records every attempt. A refusal here is recorded
+    /// as `NotRun`; a statement that passes is constructed SQL and is not a history entry.
+    ///
+    /// Dropping the stream stops the statement. The session is read-only again before the
+    /// statement starts when the connection is read-only, so a previous utility cannot stick.
     pub async fn execute(
         self: &Arc<Self>,
         sql: &str,
         params: &[Value],
         options: ExecOptions,
     ) -> Result<TaskStream> {
+        self.pool.ensure_current()?;
+        let planned = crate::run::plan(sql, self.kind(), self.safe_mode());
+        if let Some(refusal) = crate::run::blocking_refusal(&planned, false) {
+            crate::run::record_blocked(self, sql, &planned, refusal).await?;
+            return Err(Error::PolicyDenied(crate::run::refusal_message(refusal)));
+        }
+        self.execute_unchecked(sql, params, options).await
+    }
+
+    /// Session lease plus driver execute. Callers have already classified the script, or they
+    /// built it themselves (browse, count).
+    pub(crate) async fn execute_unchecked(
+        self: &Arc<Self>,
+        sql: &str,
+        params: &[Value],
+        options: ExecOptions,
+    ) -> Result<TaskStream> {
+        self.pool.ensure_current()?;
         let this = Arc::clone(self);
         let (sql, params) = (sql.to_owned(), params.to_vec());
         self.rt
             .run(async move {
                 let lease = this.pool.acquire().await?;
-                let stream = lease.session()?.execute(&sql, &params, options).await?;
+                let stream = lease.run_statement(&sql, &params, options).await?;
                 TaskStream::new(stream, lease)
             })
             .await
@@ -295,8 +372,7 @@ impl OpenConnection {
                 let built = build_select(&query, this.driver.dialect(), &build)?;
                 let lease = this.pool.acquire().await?;
                 let stream = lease
-                    .session()?
-                    .execute(&built.sql, &built.params, this.exec_options())
+                    .run_statement(&built.sql, &built.params, this.exec_options())
                     .await?;
                 TaskStream::new(stream, lease)
             })
@@ -317,8 +393,7 @@ impl OpenConnection {
                 let built = build_count(&query, this.driver.dialect(), &build)?;
                 let lease = this.pool.acquire().await?;
                 let stream = lease
-                    .session()?
-                    .execute(&built.sql, &built.params, ExecOptions::default())
+                    .run_statement(&built.sql, &built.params, ExecOptions::default())
                     .await?;
                 let sets = TaskStream::new(stream, lease)?.collect().await?;
                 match sets

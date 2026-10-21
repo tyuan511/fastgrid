@@ -10,10 +10,22 @@ fg-app (GPUI)   fg-cli (headless)
 fg-driver fg-store fg-sql
       \    |     /
         fg-core
+           ^
+         fg-lsp   (pure analysis: scope, completion, diagnostics)
 ```
 
 Rule: dependencies point downward only. `fg-core` has no IO. `fg-app` is the only crate that
 depends on GPUI. `fg-mcp` and `fg-cli` must work without a display.
+
+`fg-lsp` is the SQL language server: analysis over `fg-core` and `fg-sql`'s token stream (what
+relations are in scope at a byte offset, what to complete there, which statement a failure belongs
+to), plus the LSP wire format and protocol state machine. Analysis has no IO and no database handle -
+the caller passes the schema it knows - so the GUI editor and `fastgrid-cli lsp` share one answer.
+
+Two layers inside it, kept apart on purpose: `protocol` is a pure request/response function (no IO,
+testable without a process) and `wire` is the `Content-Length` framing. `fg-cli` is then a
+`read -> handle -> write` loop and nothing else. An external editor (VS Code, Neovim) talks to
+`fastgrid-cli lsp` over stdio; the GUI talks to the same `Server` in process.
 
 The multi-database contracts (Driver / Session / Dialect / Capabilities) are described in
 [driver-abstraction.md](driver-abstraction.md).
@@ -29,12 +41,33 @@ The multi-database contracts (Driver / Session / Dialect / Capabilities) are des
    Large blobs / long text are loaded lazily.
 4. **Large tables**: paged (default 1000 rows) with prefetch plus a virtualized grid. Never
    `SELECT *` the whole table.
-5. **Cancellation**: every query is a task. PostgreSQL: cancel token / `pg_cancel_backend`.
-   MySQL: `KILL QUERY`.
+5. **Cancellation**: every query is a task. `TaskCanceller` forwards the driver's cancel only while that
+   task is running, so a late cancel cannot hit the next lease of the session. Dropping an unfinished
+   `TaskStream` or `RunStream` cancels it. PostgreSQL: cancel token / `pg_cancel_backend`. MySQL:
+   `KILL QUERY`. SQLite: `sqlite3_interrupt`, plus a generation flag so a cancel issued before the
+   statement starts is not cleared by `reset`. A statement timeout is not the same mechanism: when
+   `Capabilities::statement_timeout` is false, `fg-service::run` arms its own per-statement timer
+   (reset at each `ResultStart`; time waiting on the consumer is not counted) and cancels that
+   statement. Engines that enforce a timeout themselves still receive one value for the script.
 6. **Metadata**: lazy schema tree with TTL cache and manual refresh; feeds completion and MCP resources.
 7. **Encryption**: every record in the local store is encrypted with a per-device key held in the OS keychain (`keyring`); passwords are encrypted records too, never stored in the clear, never logged. Sync (M9) and backups use separate password-derived keys. See [encryption-and-sync.md](encryption-and-sync.md) and [data-model.md](data-model.md).
 8. **TLS / SSH**: rustls everywhere (no OpenSSL), `russh` for tunnels.
 9. **Crash safety**: unsaved editor content journaled to SQLite (WAL) and restored on restart.
+10. **Arbitrary SQL**: `fg-sql` classifies; `fg-service` decides policy and records; drivers stay
+    policy-blind. The checked entry point is `OpenConnection::run` (`plan` before a session is
+    leased). Row caps and statement timeouts are enforced there, not in the UI: the effective
+    value is the strictest `Some` among the per-call `RunOptions`, `ExecSettings` (settings key
+    `exec`), and, for the timeout only, the connection's `timeouts.statement_secs`. A caller
+    cannot raise a stored cap. If those settings cannot be read or decrypted into `ExecSettings`,
+    the call fails closed instead of falling open to the default cap. `SafeMode::Strict` confirms
+    every statement that may write; password re-authentication is not implemented.
+11. **Recording survives a dropped stream.** History and audit go through one process-lifetime
+    writer thread (`fastgrid-record`). Dropping a stream only notifies that thread; it does not
+    spawn, and it does not need the tokio runtime to still be alive, so a shutting-down runtime
+    cannot panic the drop or skip the notify. A writer that has already exited is a failed record
+    (warned on the drop path), not a silent success. `RunStream` also holds an `Arc` of the service
+    runtime until the stream is dropped, so dropping `Service` first does not abandon a record the
+    execution task has not finished writing.
 
 ## Error handling
 
@@ -62,6 +95,11 @@ used on production paths.
   the task is `Running`, under the same lock the task takes before releasing its lease, and the
   session is not reused before that. Dropping an unfinished `TaskStream` cancels it. Regression
   tests: `crates/fg-service/tests/e2e.rs` (`a_late_cancel_cannot_hit_the_next_task`).
+- **Policy stays above the driver.** `fg-sql` classifies a script; `OpenConnection::run` applies
+  safe mode, caps and recording; drivers do not see `SafeMode` or confirmation. `execute` is
+  classification-guarded and has no confirmation path. A config save bumps a per-connection epoch
+  and closes the open pool in the service's own task, so a stale open cannot keep running under
+  the previous policy after the save has landed.
 - **Metadata** (namespaces, objects, table details, relations) is cached with a TTL and refreshed
   explicitly (`Refresh`), which also broadcasts `ServiceEvent::MetadataChanged`.
 - **Browsing** compiles a declarative `TableQuery` with `fg-sql` using the cached primary key as the

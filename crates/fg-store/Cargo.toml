@@ -8,6 +8,10 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Planted payloads and other hooks integration tests need. Off in production builds.
+test-seams = []
+
 [dependencies]
 fg-core.workspace = true
 fg-crypto.workspace = true

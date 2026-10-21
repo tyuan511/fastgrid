@@ -24,13 +24,13 @@
 | `connection` | UUIDv7 | — | ✓ | `ConnectionConfig` |
 | `group` | UUIDv7 | — | ✓ | `ConnectionGroup` |
 | `secret` | `<连接ID>:<种类>` | 连接 | ✓ | 密码、SSH 口令（`SecretRecord`） |
-| `snippet` | UUIDv7 | 连接（可空） | ✓ | 片段 |
-| `document` | UUIDv7 | 连接 | ✓ | 编辑器草稿 |
-| `history` | UUIDv7 | 连接 | ✓ | 查询历史，`sort_ts` = 执行时间 |
-| `audit` | UUIDv7 | 连接（可空） | ✓ | 审计日志，只追加，连接删除后保留 |
+| `snippet` | UUIDv7 | 连接（可空，空则全局） | ✓ | 片段。明文 `sort_ts` = `updated_at`。可读行的列表顺序是载荷里的 `sort_order` 升序，再 `updated_at` 降序，不靠 SQL 排这一列 |
+| `document` | UUIDv7 | 连接 | ✓ | 编辑器草稿。`sort_ts` = `updated_at`（调用方拥有时间戳，存储不改写） |
+| `history` | UUIDv7 | 连接 | ✓ | 查询历史，`sort_ts` = 执行时间（`executed_at`） |
+| `audit` | UUIDv7 | 连接（可空） | ✓ | 审计日志，只追加，连接删除后保留。`sort_ts` = `at`。插入拒绝重复 id，含已墓碑的 id |
 | `workspace` | `<连接ID>:<设备ID>` | 连接 | ✓ | 每台设备各自的布局 |
 | `table_view` | 随机 UUID | 连接 | ✓ | 过滤、排序、列宽；表名在密文里 |
-| `setting` | 设置组名 | — | ✓ | 主题、网格、快捷键…… |
+| `setting` | 设置组名 | — | ✓ | 主题、网格、编辑器、快捷键、`exec`（行数上限、语句超时、历史保留条数）等 |
 | `mcp_client` | UUIDv7 | — | ✗ | 单设备的 MCP 令牌哈希 |
 
 规则：
@@ -54,6 +54,9 @@
 
 - 记录**原样保留**，在 UI 里显示为「不可用（由新版本创建）」，不会被静默删除或覆盖（`Loaded::Unreadable`，含解密后的原始 JSON）。
 - 导出备份时同样不会丢。
+- `document` / `snippet` 把「没有这条记录」（从未写入或已墓碑）和「有记录但本版本读不懂」分开：`Store::document` 对缺失返回 `None`，对不可读返回 `StoredDocument::Unreadable`；`snippets` 同样列出 `StoredSnippet::Unreadable`，不把它当成不存在。`save_document` / `save_snippet` 用 `put_json_if_readable`，检查和写入在同一事务里，拒绝覆盖不可读行。
+- 连接删除会墓碑其子记录：`secret`、连接作用域的 `snippet`、`document`、`history`、`workspace`、`table_view`。`parent_id` 为空的全局片段不在其中。`audit` 不级联删除。
+- 普通设置（外观、网格）走 `setting()`：缺失或不可读都回默认值，以免坏行阻止启动，且不覆盖原行。安全相关的 `ExecSettings`（键 `exec`）走 `setting_strict`：缺失仍是默认值；不可读则 `Error::Storage`，调用方不得把它当成默认的 100_000 行上限。
 
 ## 3. 其他面向外部的结构
 

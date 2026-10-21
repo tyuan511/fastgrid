@@ -1,0 +1,17 @@
+[package]
+name = "fg-lsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "fg_lsp"
+
+[dependencies]
+fg-core.workspace = true
+fg-sql.workspace = true
+serde_json.workspace = true

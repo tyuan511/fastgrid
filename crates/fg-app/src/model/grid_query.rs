@@ -8,6 +8,11 @@ use super::format::group_digits;
 pub const PAGE_SIZES: [u32; 3] = [100, 300, 1000];
 pub const DEFAULT_PAGE_SIZE: u32 = 300;
 
+/// Query results page over rows that are already in memory, so their size is a hard cap rather
+/// than a fetch hint: 1000 rows is the most one page of a result shows.
+pub const RESULT_PAGE_SIZES: [u32; 3] = [100, 500, 1000];
+pub const DEFAULT_RESULT_PAGE_SIZE: u32 = 1000;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageState {
     page: u64,
@@ -34,6 +39,11 @@ impl PageState {
 
     pub fn offset(&self) -> u64 {
         self.page * u64::from(self.size)
+    }
+
+    /// The 0-based page number on screen.
+    pub fn number(&self) -> u64 {
+        self.page
     }
 
     pub fn total(&self) -> Option<u64> {
@@ -96,6 +106,29 @@ impl PageState {
         let first_row = self.offset();
         self.size = size.max(1);
         self.page = first_row / u64::from(self.size);
+    }
+
+    /// The rows of the current page, for data that is already in memory (a query result). Clamps to
+    /// the available rows, so a page that shrank after a smaller page size does not panic.
+    pub fn window(&self, total: usize) -> std::ops::Range<usize> {
+        let start = usize::try_from(self.offset())
+            .unwrap_or(usize::MAX)
+            .min(total);
+        let end = start.saturating_add(self.size as usize).min(total);
+        start..end
+    }
+
+    /// Point at `page` (clamped) and record how many rows this page holds. Used by the result grid,
+    /// where the row count is known up front instead of fetched.
+    pub fn goto(&mut self, page: u64, total: u64) -> bool {
+        let pages = total.div_ceil(u64::from(self.size)).max(1);
+        let wanted = page.min(pages - 1);
+        let changed = wanted != self.page;
+        self.page = wanted;
+        self.total = Some(total);
+        self.loaded =
+            usize::try_from((total - self.offset()).min(u64::from(self.size))).unwrap_or(0);
+        changed
     }
 
     /// `Showing 1–300 of 14,200`, `Showing 301–420` (total not known yet) or `No rows`.

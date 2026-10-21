@@ -20,14 +20,23 @@ const PAGE: usize = 500;
 
 impl Store {
     /// Append-only: there is intentionally no edit and no per-entry delete.
+    ///
+    /// Insert, not replace. The primary key rejects a duplicate id, including a tombstone, so a
+    /// replay cannot resurrect or overwrite an entry that was already written.
     pub fn append_audit(&self, e: &AuditEntry) -> Result<()> {
-        self.put_json(
+        self.insert_json(
             kinds::AUDIT,
             e.id.as_str(),
             e.connection_id.as_ref().map(ConnectionId::as_str),
             Some(e.at.0),
             e,
         )
+        .map_err(|err| match err {
+            fg_core::Error::Storage(message) if message.contains("already exists") => {
+                fg_core::Error::Storage(format!("audit entry {} already exists", e.id.as_str()))
+            }
+            other => other,
+        })
     }
 
     /// Newest first.
@@ -196,5 +205,32 @@ mod tests {
         let left = s.query_audit(&AuditFilter::default()).unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].statement, "new");
+    }
+
+    #[test]
+    fn duplicate_audit_id_is_refused_and_the_original_survives() {
+        let s = store();
+        let original = entry(Actor::User, 1, "first");
+        s.append_audit(&original).unwrap();
+        let mut replay = original.clone();
+        replay.statement = "replaced".into();
+        replay.outcome = Outcome::Ok;
+        let err = s.append_audit(&replay).unwrap_err();
+        assert!(matches!(err, fg_core::Error::Storage(_)), "{err:?}");
+        let left = s.query_audit(&AuditFilter::default()).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].statement, "first");
+        assert_eq!(left[0].outcome, Outcome::NotRun);
+    }
+
+    #[test]
+    fn a_tombstoned_audit_id_cannot_be_reused() {
+        let s = store();
+        let original = entry(Actor::User, 1, "first");
+        s.append_audit(&original).unwrap();
+        assert_eq!(s.purge_audit_before(UnixMillis(2)).unwrap(), 1);
+        let err = s.append_audit(&original).unwrap_err();
+        assert!(matches!(err, fg_core::Error::Storage(_)), "{err:?}");
+        assert!(s.query_audit(&AuditFilter::default()).unwrap().is_empty());
     }
 }

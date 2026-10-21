@@ -1,13 +1,17 @@
-//! A small, tolerant SQL lexer shared by the splitter and the classifier.
+//! A small, tolerant SQL lexer shared by the splitter and the classifier, and by `fg-lsp`.
 //!
 //! It only needs to know where strings, identifiers and comments begin and end for the three
 //! supported engines; it never rejects input (an unterminated string simply runs to the end and
 //! is flagged), because it runs on text the user is still typing.
+//!
+//! The items below are public because `fg-lsp` analyses scopes and needs the same token stream: a
+//! second lexer would be a second source of truth for where a string ends. They are not part of
+//! fastgrid's stable surface - the vocabulary there is `fg-core`.
 
 use fg_core::DbKind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Flavor {
+pub enum Flavor {
     Sqlite,
     Postgres,
     MySql,
@@ -25,7 +29,7 @@ impl From<DbKind> for Flavor {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Kind {
+pub enum Kind {
     Whitespace,
     LineComment,
     BlockComment,
@@ -41,7 +45,7 @@ pub(crate) enum Kind {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Token {
+pub struct Token {
     pub kind: Kind,
     pub start: usize,
     pub end: usize,
@@ -75,7 +79,7 @@ fn is_word_char(c: char, flavor: Flavor) -> bool {
     c == '_' || c.is_alphanumeric() || (c == '$' && flavor != Flavor::Sqlite)
 }
 
-pub(crate) fn lex(sql: &str, flavor: Flavor) -> Vec<Token> {
+pub fn lex(sql: &str, flavor: Flavor) -> Vec<Token> {
     let bytes = sql.as_bytes();
     let mut tokens = Vec::new();
     let mut i = 0;

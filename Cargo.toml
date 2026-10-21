@@ -10,11 +10,19 @@ repository = "https://github.com/tyuan511/fastgrid"
 rust-version = "1.92"
 
 [workspace.dependencies]
+# Pinned to the version gpui-base already resolves, so the completion provider speaks the
+# same lsp_types as the editor it feeds.
+lsp-types = "0.97"
+# The editor's completion trait returns anyhow::Result, so providers must name it.
+anyhow = "1"
+# Driving a `Task` to completion in tests.
+futures = "0.3"
 # internal
 fg-core = { path = "crates/fg-core" }
 fg-driver = { path = "crates/fg-driver" }
 fg-store = { path = "crates/fg-store" }
 fg-crypto = { path = "crates/fg-crypto" }
+fg-lsp = { path = "crates/fg-lsp" }
 fg-sql = { path = "crates/fg-sql" }
 fg-service = { path = "crates/fg-service" }
 fg-mcp = { path = "crates/fg-mcp" }

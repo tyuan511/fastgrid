@@ -32,6 +32,14 @@ struct Control {
 pub struct TaskCanceller(Arc<Control>);
 
 impl TaskCanceller {
+    /// A canceller that does nothing. Used when a stream has no driver task yet.
+    pub(crate) fn noop() -> Self {
+        Self(Arc::new(Control {
+            state: Mutex::new(State::Finished),
+            driver_cancel: CancelHandle::new(|| {}),
+        }))
+    }
+
     pub fn cancel(&self) {
         if let Ok(state) = self.0.state.lock()
             && *state == State::Running

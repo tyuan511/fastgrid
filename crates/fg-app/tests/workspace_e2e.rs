@@ -181,8 +181,10 @@ fn paging_and_sorting_fetch_the_right_rows(cx: &mut TestAppContext) {
     });
 
     // Next page.
-    cx.update_window(app.window, |_, window, cx| window.click("page-next", cx))
-        .unwrap();
+    cx.update_window(app.window, |_, window, cx| {
+        window.click("grid-page-next", cx)
+    })
+    .unwrap();
     settle(cx, "page 2", |cx| {
         status(cx, &app).starts_with("Showing 301–600 of 1,000")
     });
@@ -249,7 +251,7 @@ fn changing_the_page_size_shows_that_many_rows(cx: &mut TestAppContext) {
     });
     cx.update_window(app.window, |_, window, _| {
         assert_eq!(
-            window.find("page-next").disabled(),
+            window.find("grid-page-next").disabled(),
             Some(true),
             "nothing after the last row"
         );

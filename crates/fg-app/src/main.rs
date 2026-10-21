@@ -62,9 +62,10 @@ fn open_launcher(cx: &mut App, service: Service) {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
             None,
-            size(px(820.), px(540.)),
+            size(px(680.), px(480.)),
             cx,
         ))),
+        window_min_size: Some(size(px(680.), px(480.))),
         ..TitleBar::window_options()
     };
     if let Err(e) = gpui_kit::open_window(options, cx, |window, cx| {

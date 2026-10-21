@@ -9,12 +9,14 @@
 mod audit;
 mod bundle;
 mod connections;
+mod documents;
 mod history;
 mod keys;
 mod migrations;
 mod record;
 mod secrets;
 mod settings;
+mod snippets;
 mod workspace;
 
 use std::path::{Path, PathBuf};
@@ -25,10 +27,13 @@ use rusqlite::Connection;
 
 pub use audit::AuditFilter;
 pub use bundle::{ApplyOutcome, ExportOptions, ExportScope, ImportReport, SyncRecord};
-pub use connections::StoredConnection;
+pub use connections::{ConnectionPassword, StoredConnection};
+pub use documents::StoredDocument;
 pub use keys::{DeviceKeyProvider, MemoryKeyProvider};
 pub use migrations::{MIGRATIONS, Migration, Step, latest_version};
 pub use record::Loaded;
+pub(crate) use record::SealedRow;
+pub use snippets::StoredSnippet;
 
 /// Record kinds. A new kind needs no schema change.
 pub mod kinds {

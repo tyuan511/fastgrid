@@ -227,14 +227,16 @@ async fn startup_sql_runs_on_every_session() {
     let env = Env::new("startup");
     let svc = env.service_with(|o| o.max_sessions_per_connection = 1);
     let mut cfg = env.sqlite("boot");
-    cfg.startup_sql = vec!["CREATE TEMP TABLE boot (x); INSERT INTO boot VALUES (42)".into()];
+    // Startup SQL may set session state. It may not create tables: that is a write, and a
+    // read-only connection must be able to refuse it. A pragma still proves the script ran.
+    cfg.startup_sql = vec!["PRAGMA cache_size = 1234".into()];
     let saved = svc
         .save_connection(cfg, PasswordUpdate::Keep)
         .await
         .unwrap();
     let conn = svc.open(&saved.id).await.unwrap();
-    let sets = run(&conn, "SELECT x FROM boot").await;
-    assert_eq!(int(&sets[0].rows[0][0]), 42);
+    let sets = run(&conn, "PRAGMA cache_size").await;
+    assert_eq!(int(&sets[0].rows[0][0]).abs(), 1234);
 }
 
 #[tokio::test]
@@ -257,14 +259,17 @@ async fn read_only_safe_mode_is_enforced_by_the_session() {
         int(&run(&conn, "SELECT count(*) FROM items").await[0].rows[0][0]),
         1000
     );
-    let err = conn
+    let err = match conn
         .execute("DELETE FROM items", &[], ExecOptions::default())
         .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap_err();
-    assert!(matches!(err, Error::Query(_)), "{err:?}");
+    {
+        Err(err) => err,
+        Ok(_) => panic!("a read-only write must be refused before the engine"),
+    };
+    assert!(
+        matches!(err, Error::PolicyDenied(_)),
+        "a read-only write is refused before the engine: {err:?}"
+    );
 }
 
 #[tokio::test]

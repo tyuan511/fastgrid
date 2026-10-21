@@ -11,7 +11,11 @@ pub struct QueryError {
     pub message: String,
     /// Native error code or SQLSTATE, when the engine provides one.
     pub code: Option<String>,
-    /// 0-based character offset into the statement, when the engine provides one.
+    /// Byte offset into the statement text, when the engine reports one. Drivers normalise the
+    /// engine's own units to bytes so callers can map the position onto a buffer without knowing
+    /// the engine: SQLite's `pzErrOffset` is already bytes, PostgreSQL's `PG_DIAG` positions are
+    /// characters, so a PostgreSQL driver must convert before filling this in. Not a script
+    /// offset - the statement that failed is identified separately.
     pub position: Option<usize>,
 }
 

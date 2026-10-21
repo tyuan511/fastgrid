@@ -8,7 +8,7 @@ mod meta;
 mod run;
 mod types;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -125,6 +125,14 @@ struct Cancel {
     cancelled: Arc<AtomicBool>,
     /// Set for as long as one of this session's statements may be inside SQLite.
     in_flight: Arc<AtomicBool>,
+    /// Incremented by [`Cancel::begin_statement`]. A cancel targets this generation when a
+    /// statement is reserved, or sets `preempt` when nothing has reserved yet.
+    generation: Arc<AtomicU64>,
+    cancelled_through: Arc<AtomicU64>,
+    preempt: Arc<AtomicBool>,
+    /// True from `begin_statement` until the statement guard drops. Distinguishes "cancel the
+    /// statement that is about to start" from "cancel whatever begins next".
+    reserved: Arc<AtomicBool>,
 }
 
 impl Cancel {
@@ -133,12 +141,33 @@ impl Cancel {
             interrupt,
             cancelled: Arc::new(AtomicBool::new(false)),
             in_flight: Arc::new(AtomicBool::new(false)),
+            generation: Arc::new(AtomicU64::new(0)),
+            cancelled_through: Arc::new(AtomicU64::new(0)),
+            preempt: Arc::new(AtomicBool::new(false)),
+            reserved: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Forget the previous statement's cancel; call before starting a new one.
-    fn reset(&self) {
+    /// Reserve this statement and clear a cancel that belonged to the previous one.
+    ///
+    /// Returns true when a cancel already arrived for this attempt. A blind `store(false)` would
+    /// drop that cancel, and `sqlite3_interrupt` is a no-op when no statement is running, so the
+    /// statement would then run under a retired policy. The next `begin_statement` is not
+    /// poisoned: a cancel of this generation does not match the following one.
+    fn begin_statement(&self) -> bool {
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.reserved.store(true, Ordering::SeqCst);
         self.cancelled.store(false, Ordering::SeqCst);
+        let blocked = self.preempt.swap(false, Ordering::SeqCst)
+            || self.cancelled_through.load(Ordering::SeqCst) >= generation;
+        if blocked {
+            self.cancelled.store(true, Ordering::SeqCst);
+            self.interrupt.interrupt();
+            self.reserved.store(false, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
     }
 
     /// The flag `run::run` reads at its checkpoints.
@@ -150,15 +179,28 @@ impl Cancel {
     /// included, so the retry loop below cannot outlive the statement.
     fn statement(&self) -> InFlight {
         self.in_flight.store(true, Ordering::SeqCst);
-        InFlight(self.in_flight.clone())
+        InFlight {
+            in_flight: self.in_flight.clone(),
+            reserved: self.reserved.clone(),
+        }
     }
 
     fn handle(&self) -> CancelHandle {
         let interrupt = self.interrupt.clone();
         let cancelled = self.cancelled.clone();
         let in_flight = self.in_flight.clone();
+        let generation = self.generation.clone();
+        let cancelled_through = self.cancelled_through.clone();
+        let preempt = self.preempt.clone();
+        let reserved = self.reserved.clone();
         CancelHandle::new(move || {
             cancelled.store(true, Ordering::SeqCst);
+            if reserved.load(Ordering::SeqCst) {
+                let current = generation.load(Ordering::SeqCst);
+                let _ = cancelled_through.fetch_max(current, Ordering::SeqCst);
+            } else {
+                preempt.store(true, Ordering::SeqCst);
+            }
             interrupt.interrupt();
             if !in_flight.load(Ordering::SeqCst) {
                 // Nothing is stepping yet; the flag alone is enough, the statement will read it
@@ -182,11 +224,15 @@ impl Cancel {
     }
 }
 
-struct InFlight(Arc<AtomicBool>);
+struct InFlight {
+    in_flight: Arc<AtomicBool>,
+    reserved: Arc<AtomicBool>,
+}
 
 impl Drop for InFlight {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
+        self.in_flight.store(false, Ordering::SeqCst);
+        self.reserved.store(false, Ordering::SeqCst);
     }
 }
 
@@ -258,8 +304,12 @@ impl Session for SqliteSession {
         options: ExecOptions,
     ) -> Result<ExecutionStream> {
         let (tx, stream) = ExecutionStream::channel(self.cancel.handle());
-        // Reset before spawning so a cancel issued right after this call is not lost.
-        self.cancel.reset();
+        // A cancel that arrived before this call must survive. Clearing the flag unconditionally
+        // lets a statement run after the pool has already retired the session.
+        if self.cancel.begin_statement() {
+            let _ = tx.try_send(Err(Error::Cancelled));
+            return Ok(stream);
+        }
         let conn = self.conn.clone();
         let cancel = self.cancel.clone();
         let sql = sql.to_owned();
@@ -372,5 +422,20 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(usable, "the retry loop outlived its statement");
+    }
+
+    #[test]
+    fn a_cancel_before_begin_statement_is_not_cleared() {
+        let conn = Connection::open_in_memory().unwrap();
+        let cancel = Cancel::new(Arc::new(conn.get_interrupt_handle()));
+        cancel.handle().cancel();
+        assert!(
+            cancel.begin_statement(),
+            "a cancel that arrived first must refuse the statement"
+        );
+        assert!(
+            !cancel.begin_statement(),
+            "the following statement on this session must not stay poisoned"
+        );
     }
 }

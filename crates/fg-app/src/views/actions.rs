@@ -12,6 +12,14 @@ pub const WORKSPACE_CONTEXT: &str = "Workspace";
 pub const GRID_CONTEXT: &str = "TableTab";
 /// The connection list.
 pub const LAUNCHER_CONTEXT: &str = "Launcher";
+/// The query-history panel, which has its own keys while it is open.
+pub const HISTORY_CONTEXT: &str = "HistoryPanel";
+/// The snippets panel, which has its own keys while it is open.
+pub const SNIPPETS_CONTEXT: &str = "SnippetsPanel";
+/// The SQL editor. GPUI Kit pushes the context `Input mode=editor` on its editor element; the
+/// binding grammar is `identifier && key == value`, so that context matches like this. Scoping run
+/// and cancel to the editor keeps those keys usable in the grid and the sidebar.
+pub const EDITOR_CONTEXT: &str = "Input && mode == editor";
 
 gpui_kit::actions!(
     fastgrid,
@@ -28,6 +36,22 @@ gpui_kit::actions!(
         LauncherPrev,
         LauncherOpen,
         NewConnection,
+        NewQuery,
+        ToggleHistory,
+        HistoryOpen,
+        HistoryNext,
+        HistoryPrev,
+        HistoryDismiss,
+        ToggleSnippets,
+        SaveSnippet,
+        SnippetOpen,
+        SnippetDismiss,
+        RunStatement,
+        RunAll,
+        CancelQuery,
+        FormatSql,
+        ToggleComment,
+        ExplainQuery,
     ]
 );
 
@@ -48,5 +72,28 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("up", LauncherPrev, Some(LAUNCHER_CONTEXT)),
         KeyBinding::new("enter", LauncherOpen, Some(LAUNCHER_CONTEXT)),
         KeyBinding::new("secondary-n", NewConnection, Some(LAUNCHER_CONTEXT)),
+        // A new query tab, reachable whether or not the editor has focus.
+        KeyBinding::new("secondary-t", NewQuery, Some(WORKSPACE_CONTEXT)),
+        KeyBinding::new("secondary-y", ToggleHistory, Some(WORKSPACE_CONTEXT)),
+        KeyBinding::new("enter", HistoryOpen, Some(HISTORY_CONTEXT)),
+        KeyBinding::new("down", HistoryNext, Some(HISTORY_CONTEXT)),
+        KeyBinding::new("up", HistoryPrev, Some(HISTORY_CONTEXT)),
+        KeyBinding::new("escape", HistoryDismiss, Some(HISTORY_CONTEXT)),
+        // Snippets: `⌘⇧S` opens the panel, `⌘⇧K` saves the current statement as one.
+        KeyBinding::new("secondary-shift-s", ToggleSnippets, Some(WORKSPACE_CONTEXT)),
+        KeyBinding::new("secondary-shift-k", SaveSnippet, Some(WORKSPACE_CONTEXT)),
+        KeyBinding::new("enter", SnippetOpen, Some(SNIPPETS_CONTEXT)),
+        KeyBinding::new("escape", SnippetDismiss, Some(SNIPPETS_CONTEXT)),
+        // Scoped to the editor: deeper context than the library's own `secondary-enter` newline,
+        // so it wins without touching the grid's keys.
+        KeyBinding::new("secondary-enter", RunStatement, Some(EDITOR_CONTEXT)),
+        KeyBinding::new("secondary-shift-enter", RunAll, Some(EDITOR_CONTEXT)),
+        // `secondary-period` is the library's "code actions" inside an editor. fastgrid has no code
+        // actions yet and needs a cancel key that does not fight Escape (search overlay, IME).
+        KeyBinding::new("secondary-.", CancelQuery, Some(EDITOR_CONTEXT)),
+        // `⌥⇧F` and `⌘/` are the two editor actions that never leave the buffer.
+        KeyBinding::new("alt-shift-f", FormatSql, Some(EDITOR_CONTEXT)),
+        KeyBinding::new("secondary-/", ToggleComment, Some(EDITOR_CONTEXT)),
+        KeyBinding::new("secondary-shift-e", ExplainQuery, Some(EDITOR_CONTEXT)),
     ]);
 }

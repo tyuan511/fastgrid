@@ -239,6 +239,47 @@ impl SettingGroup for PrivacySettings {
     const KEY: &'static str = "privacy";
 }
 
+fn default_exec_max_rows() -> Option<u64> {
+    Some(100_000)
+}
+
+fn default_history_keep() -> usize {
+    2000
+}
+
+/// Caps and retention for arbitrary SQL (`OpenConnection::run`), shared by the GUI, CLI and MCP.
+///
+/// The effective row cap and statement timeout are the stricter of this value, the connection's
+/// `timeouts.statement_secs` (timeout only), and the per-call option. `None` means no limit from
+/// that source; a `Some` always beats a `None`, and two `Some` values take the minimum. A caller
+/// cannot raise a stored cap by passing a larger number.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecSettings {
+    /// Stop a result set after this many rows and tell the caller it was truncated.
+    #[serde(default = "default_exec_max_rows")]
+    pub max_rows: Option<u64>,
+    /// Abort a statement after this long, where the driver can enforce it.
+    #[serde(default)]
+    pub statement_timeout_secs: Option<u32>,
+    /// Newest history entries kept per connection. Older ones are tombstoned after each run.
+    #[serde(default = "default_history_keep")]
+    pub history_keep: usize,
+}
+
+impl Default for ExecSettings {
+    fn default() -> Self {
+        Self {
+            max_rows: default_exec_max_rows(),
+            statement_timeout_secs: None,
+            history_keep: default_history_keep(),
+        }
+    }
+}
+
+impl SettingGroup for ExecSettings {
+    const KEY: &'static str = "exec";
+}
+
 /// Command id -> key chord overrides (see `docs/shortcuts.md`).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -256,6 +297,10 @@ mod tests {
     fn empty_json_yields_defaults() {
         let g: GridSettings = serde_json::from_str("{}").unwrap();
         assert_eq!(g, GridSettings::default());
+        let exec: ExecSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(exec, ExecSettings::default());
+        assert_eq!(exec.max_rows, Some(100_000));
+        assert_eq!(exec.history_keep, 2000);
         let w: WorkspaceState = serde_json::from_str("{}").unwrap();
         assert!(w.sidebar_visible);
     }
@@ -277,6 +322,7 @@ mod tests {
             EditorSettings::KEY,
             McpSettings::KEY,
             PrivacySettings::KEY,
+            ExecSettings::KEY,
             KeybindingOverrides::KEY,
         ];
         let mut sorted = keys.to_vec();

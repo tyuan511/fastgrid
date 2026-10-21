@@ -6,9 +6,10 @@
 
 use fg_core::{ConnectionConfig, ConnectionId, ConnectionParams, DbKind, Environment, TagColor};
 use fg_store::StoredConnection;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::searchable_list::SearchableVec;
 use gpui_kit::component::select::{Select, SelectState};
 use gpui_kit::component::{
@@ -122,6 +123,7 @@ pub struct Launcher {
     confirm_delete: Option<ConnectionId>,
     focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
+    dragging_window: bool,
 }
 
 impl EventEmitter<LauncherEvent> for Launcher {}
@@ -144,7 +146,12 @@ fn choice(
 
 impl Launcher {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search connections…"));
+        let placeholder = if is_chinese_locale() {
+            "查找连接…"
+        } else {
+            "Search connections…"
+        };
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
         // Enter is handled by the `LauncherOpen` shortcut, which the search box lets through; also
         // opening on its `PressEnter` event would open the connection twice.
         let on_search = cx.subscribe(&search, |this, _, event: &InputEvent, cx| {
@@ -164,6 +171,7 @@ impl Launcher {
             confirm_delete: None,
             focus,
             _subscriptions: vec![on_search],
+            dragging_window: false,
         }
     }
 
@@ -446,42 +454,112 @@ fn fastgrid_logo() -> impl IntoElement {
     img("fastgrid/logo.png").size(px(64.))
 }
 
-const ENGINES: &[(DbKind, &str, &str, f32, f32, f32)] = &[
-    (
-        DbKind::Postgres,
-        "PostgreSQL",
-        "Pg",
-        205.0 / 360.0,
-        0.90,
-        0.48,
-    ),
-    (DbKind::MySql, "MySQL", "Ms", 28.0 / 360.0, 0.95, 0.52),
-    (DbKind::Sqlite, "SQLite", "Sl", 262.0 / 360.0, 0.83, 0.58),
-    (DbKind::Unknown, "MariaDB", "Ma", 173.0 / 360.0, 0.85, 0.36),
-    (
-        DbKind::Unknown,
-        "SQL Server",
-        "Ss",
-        215.0 / 360.0,
-        0.16,
-        0.47,
-    ),
-    (DbKind::Unknown, "DuckDB", "Du", 222.0 / 360.0, 0.47, 0.11),
-    (DbKind::Unknown, "Redis", "Re", 0.0 / 360.0, 0.72, 0.51),
-    (
-        DbKind::Unknown,
-        "ClickHouse",
-        "Ch",
-        45.0 / 360.0,
-        0.93,
-        0.47,
-    ),
-];
+const ENGINES: &[(DbKind, &str, &str, f32, f32, f32)] =
+    &[(DbKind::Sqlite, "SQLite", "Sl", 262.0 / 360.0, 0.83, 0.58)];
+
+pub fn is_chinese_locale() -> bool {
+    super::style::is_zh_locale()
+}
+
+fn tableplus_action_button(
+    id: &'static str,
+    icon: gpui_kit::component::Icon,
+    label: impl Into<SharedString>,
+    cx: &App,
+) -> Button {
+    let theme = cx.theme();
+    let is_dark = theme.is_dark();
+    let custom = if is_dark {
+        ButtonCustomVariant::new(cx)
+            .color(hsla(0.0, 0.0, 1.0, 0.06))
+            .hover(hsla(0.0, 0.0, 1.0, 0.12))
+            .active(hsla(0.0, 0.0, 1.0, 0.18))
+            .foreground(theme.foreground)
+    } else {
+        ButtonCustomVariant::new(cx)
+            .color(hsla(0.0, 0.0, 1.0, 0.65))
+            .hover(hsla(0.0, 0.0, 1.0, 0.98))
+            .active(hsla(0.0, 0.0, 1.0, 0.82))
+            .foreground(hsla(220.0 / 360.0, 0.15, 0.18, 1.0))
+    };
+
+    Button::new(id)
+        .custom(custom)
+        .outline()
+        .rounded(px(21.))
+        .h(px(42.))
+        .w_full()
+        .icon(icon)
+        .label(label)
+}
+
+fn tableplus_circle_button(
+    id: &'static str,
+    icon: gpui_kit::component::Icon,
+    tooltip: impl Into<SharedString>,
+    cx: &App,
+) -> Button {
+    let theme = cx.theme();
+    let is_dark = theme.is_dark();
+    let custom = if is_dark {
+        ButtonCustomVariant::new(cx)
+            .color(hsla(0.0, 0.0, 1.0, 0.08))
+            .hover(hsla(0.0, 0.0, 1.0, 0.16))
+            .active(hsla(0.0, 0.0, 1.0, 0.22))
+            .foreground(theme.foreground)
+    } else {
+        ButtonCustomVariant::new(cx)
+            .color(hsla(0.0, 0.0, 1.0, 0.95))
+            .hover(hsla(0.0, 0.0, 1.0, 1.0))
+            .active(hsla(220.0 / 360.0, 0.10, 0.92, 1.0))
+            .foreground(hsla(220.0 / 360.0, 0.15, 0.20, 1.0))
+    };
+
+    Button::new(id)
+        .custom(custom)
+        .outline()
+        .rounded(px(16.))
+        .size(px(32.))
+        .icon(icon)
+        .tooltip(tooltip)
+}
+
+fn with_window_drag<E: InteractiveElement>(element: E, cx: &Context<Launcher>) -> E {
+    element
+        .window_control_area(WindowControlArea::Drag)
+        .on_mouse_down_out(cx.listener(|this, _, _, _| {
+            this.dragging_window = false;
+        }))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, event: &MouseDownEvent, window, _| {
+                if event.click_count >= 2 {
+                    window.titlebar_double_click();
+                } else {
+                    this.dragging_window = true;
+                }
+            }),
+        )
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(|this, _, _, _| {
+                this.dragging_window = false;
+            }),
+        )
+        .on_mouse_move(cx.listener(|this, _, window, _| {
+            if this.dragging_window {
+                this.dragging_window = false;
+                window.start_window_move();
+            }
+        }))
+}
 
 impl Render for Launcher {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let visible: Vec<Row> = self.visible_rows(cx).into_iter().cloned().collect();
+        let is_zh = is_chinese_locale();
+        let entity = cx.entity().clone();
         let rows: Vec<AnyElement> = visible
             .iter()
             .map(|row| {
@@ -496,6 +574,81 @@ impl Render for Launcher {
                     DbKind::MySql => ("Ms", hsla(28.0 / 360.0, 0.95, 0.52, 1.0)),
                     DbKind::Sqlite => ("Sl", hsla(262.0 / 360.0, 0.83, 0.58, 1.0)),
                     _ => ("Db", theme.muted_foreground),
+                };
+
+                let env_label = match row.environment {
+                    Environment::Development => "local",
+                    Environment::Staging => "staging",
+                    Environment::Production => "production",
+                    _ => "env",
+                };
+                let (env_bg, env_fg) = match row.environment {
+                    Environment::Development => (
+                        hsla(142.0 / 360.0, 0.70, 0.90, 0.9),
+                        hsla(142.0 / 360.0, 0.75, 0.30, 1.0),
+                    ),
+                    Environment::Staging => (
+                        hsla(38.0 / 360.0, 0.90, 0.88, 0.9),
+                        hsla(38.0 / 360.0, 0.90, 0.32, 1.0),
+                    ),
+                    Environment::Production => (
+                        hsla(0.0 / 360.0, 0.80, 0.90, 0.9),
+                        hsla(0.0 / 360.0, 0.80, 0.38, 1.0),
+                    ),
+                    _ => (theme.muted.opacity(0.8), theme.muted_foreground),
+                };
+
+                let launcher = entity.clone();
+                let menu_row_id = row.id.clone();
+                let can_open_row = readable && !opening && self.editor.is_none();
+
+                let menu_builder = {
+                    let launcher = launcher.clone();
+                    let menu_row_id = menu_row_id.clone();
+                    move |menu: PopupMenu, _: &mut Window, menu_cx: &mut Context<PopupMenu>| {
+                        launcher.update(menu_cx, |this, cx| {
+                            this.select(menu_row_id.clone(), cx);
+                        });
+
+                        let l_open = launcher.clone();
+                        let l_edit = launcher.clone();
+                        let l_dup = launcher.clone();
+                        let l_del = launcher.clone();
+
+                        menu.item(
+                            PopupMenuItem::new(if is_zh { "连接" } else { "Connect" })
+                                .icon(hugeicon(Hugeicon::Plug))
+                                .disabled(!can_open_row)
+                                .on_click(move |_, _, cx| {
+                                    l_open.update(cx, |this, cx| this.open_selected(cx));
+                                }),
+                        )
+                        .separator()
+                        .item(
+                            PopupMenuItem::new(if is_zh { "编辑…" } else { "Edit…" })
+                                .icon(hugeicon(Hugeicon::Edit))
+                                .disabled(!readable)
+                                .on_click(move |_, window, cx| {
+                                    l_edit.update(cx, |this, cx| this.edit_selected(window, cx));
+                                }),
+                        )
+                        .item(
+                            PopupMenuItem::new(if is_zh { "复制" } else { "Duplicate" })
+                                .icon(hugeicon(Hugeicon::Copy))
+                                .disabled(!readable)
+                                .on_click(move |_, _, cx| {
+                                    l_dup.update(cx, |this, cx| this.duplicate_selected(cx));
+                                }),
+                        )
+                        .separator()
+                        .item(
+                            PopupMenuItem::new(if is_zh { "删除" } else { "Delete" })
+                                .icon(hugeicon(Hugeicon::Trash))
+                                .on_click(move |_, _, cx| {
+                                    l_del.update(cx, |this, cx| this.ask_delete(cx));
+                                }),
+                        )
+                    }
                 };
 
                 h_flex()
@@ -530,10 +683,34 @@ impl Render for Launcher {
                             .flex_1()
                             .gap_0p5()
                             .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(row.name.clone()),
+                                h_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child(row.name.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .px_2()
+                                            .py(px(0.5))
+                                            .rounded_full()
+                                            .bg(if theme.is_dark() {
+                                                env_fg.opacity(0.2)
+                                            } else {
+                                                env_bg
+                                            })
+                                            .text_color(if theme.is_dark() {
+                                                env_fg.opacity(0.9)
+                                            } else {
+                                                env_fg
+                                            })
+                                            .text_size(px(11.))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .child(env_label),
+                                    ),
                             )
                             .child(
                                 div()
@@ -546,10 +723,16 @@ impl Render for Launcher {
                         div()
                             .text_xs()
                             .text_color(theme.info)
-                            .child("Connecting…")
+                            .child(if is_zh {
+                                "连接中…"
+                            } else {
+                                "Connecting…"
+                            })
                             .into_any_element()
-                    } else {
+                    } else if row.tag.is_some() {
                         div().size_2p5().rounded_full().bg(dot).into_any_element()
+                    } else {
+                        div().into_any_element()
                     }))
                     .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                         this.select(select_id.clone(), cx);
@@ -558,6 +741,7 @@ impl Render for Launcher {
                         }
                         let _ = &open_id;
                     }))
+                    .context_menu(menu_builder)
                     .into_any_element()
             })
             .collect();
@@ -587,92 +771,90 @@ impl Render for Launcher {
             )
             .bg(theme.background)
             .text_color(theme.foreground)
-            // Left Sidebar: Brand & Actions
+            // Left Sidebar: Brand & Actions (entire sidebar area allows window dragging)
             .child(
-                v_flex()
-                    .w(px(200.))
-                    .h_full()
-                    .bg(theme.sidebar)
-                    .border_r_1()
-                    .border_color(theme.border)
-                    .p_3()
-                    .justify_between()
-                    .child(
-                        v_flex()
-                            .gap_3()
-                            .items_center()
-                            .pt_2()
-                            .child(fastgrid_logo())
-                            .child(
-                                v_flex()
-                                    .items_center()
-                                    .gap_0p5()
-                                    .child(
-                                        div()
-                                            .text_xl()
-                                            .font_weight(FontWeight::BOLD)
-                                            .child("FastGrid"),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(theme.muted_foreground)
-                                            .child("Version 0.0.1"),
-                                    ),
+                with_window_drag(
+                    v_flex()
+                        .id("launcher-sidebar")
+                        .test_support()
+                        .w(px(220.))
+                        .h_full()
+                        .bg(theme.sidebar)
+                        .border_r_1()
+                        .border_color(theme.border)
+                        .p_3()
+                        .justify_between(),
+                    cx,
+                )
+                .child(
+                    v_flex()
+                        .gap_2p5()
+                        .items_center()
+                        .when(cfg!(target_os = "macos"), |d| d.pt(px(48.)))
+                        .when(!cfg!(target_os = "macos"), |d| d.pt(px(28.)))
+                        .child(fastgrid_logo())
+                        .child(
+                            v_flex()
+                                .items_center()
+                                .gap_0p5()
+                                .child(
+                                    div()
+                                        .text_xl()
+                                        .font_weight(FontWeight::BOLD)
+                                        .child("FastGrid"),
+                                )
+                                .child(div().text_xs().text_color(theme.muted_foreground).child(
+                                    if is_zh {
+                                        "版本 0.0.1"
+                                    } else {
+                                        "Version 0.0.1"
+                                    },
+                                )),
+                        ),
+                )
+                .child(
+                    v_flex()
+                        .gap_2p5()
+                        .w_full()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(tableplus_action_button(
+                            "backup-db",
+                            hugeicon(Hugeicon::Backup),
+                            if is_zh {
+                                "备份数据库"
+                            } else {
+                                "Backup Database"
+                            },
+                            cx,
+                        ))
+                        .child(tableplus_action_button(
+                            "restore-db",
+                            hugeicon(Hugeicon::Restore),
+                            if is_zh {
+                                "恢复数据库"
+                            } else {
+                                "Restore Database"
+                            },
+                            cx,
+                        ))
+                        .child(
+                            tableplus_action_button(
+                                "new-connection",
+                                hugeicon(Hugeicon::Plug),
+                                if is_zh {
+                                    "新建连接"
+                                } else {
+                                    "New Connection"
+                                },
+                                cx,
                             )
-                            .child(
-                                div()
-                                    .px_2p5()
-                                    .py_0p5()
-                                    .rounded_full()
-                                    .bg(theme.warning.opacity(0.15))
-                                    .text_color(theme.warning)
-                                    .text_xs()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child("SQLite · PostgreSQL · MySQL"),
-                            ),
-                    )
-                    .child(
-                        v_flex()
-                            .gap_2()
-                            .w_full()
-                            .child(
-                                Button::new("backup-db")
-                                    .icon(hugeicon(Hugeicon::Backup))
-                                    .label("Backup Database")
-                                    .ghost()
-                                    .small()
-                                    .w_full(),
-                            )
-                            .child(
-                                Button::new("restore-db")
-                                    .icon(hugeicon(Hugeicon::Restore))
-                                    .label("Restore Database")
-                                    .ghost()
-                                    .small()
-                                    .w_full(),
-                            )
-                            .child(
-                                Button::new("cycle-theme")
-                                    .icon(match crate::theme_control::chosen(cx) {
-                                        fg_core::ThemeMode::Light => hugeicon(Hugeicon::Sun),
-                                        fg_core::ThemeMode::Dark => hugeicon(Hugeicon::Moon),
-                                        _ => hugeicon(Hugeicon::Sun),
-                                    })
-                                    .label(format!(
-                                        "Theme: {}",
-                                        crate::theme_control::label(crate::theme_control::chosen(
-                                            cx
-                                        ))
-                                    ))
-                                    .ghost()
-                                    .small()
-                                    .w_full()
-                                    .on_click(cx.listener(|_, _, _, cx| {
-                                        cx.emit(LauncherEvent::CycleTheme);
-                                    })),
-                            ),
-                    ),
+                            .on_click(cx.listener(
+                                |this, _, window, cx| {
+                                    this.new_connection(window, cx);
+                                },
+                            )),
+                        ),
+                ),
             )
             // Right Main Content: Connections
             .child(
@@ -682,55 +864,80 @@ impl Render for Launcher {
                     .p_4()
                     .gap_3()
                     .child(
-                        h_flex()
-                            .items_center()
-                            .justify_between()
-                            .gap_3()
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .items_center()
-                                    .child(
-                                        Button::new("new-connection")
-                                            .icon(hugeicon(Hugeicon::Plus))
-                                            .label("New…")
-                                            .primary()
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.new_connection(window, cx);
-                                            })),
+                        with_window_drag(
+                            h_flex()
+                                .id("launcher-top-bar")
+                                .test_support()
+                                .items_center()
+                                .justify_between()
+                                .gap_3(),
+                            cx,
+                        )
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .child(
+                                    tableplus_circle_button(
+                                        "new-connection-top",
+                                        hugeicon(Hugeicon::Plus),
+                                        if is_zh {
+                                            "新建连接"
+                                        } else {
+                                            "New Connection"
+                                        },
+                                        cx,
                                     )
-                                    .child(
-                                        Button::new("new-group")
-                                            .icon(hugeicon(Hugeicon::FolderPlus))
-                                            .ghost()
-                                            .tooltip("New Group"),
-                                    ),
-                            )
-                            .child(
-                                div().w(px(260.)).child(
+                                    .on_click(cx.listener(
+                                        |this, _, window, cx| {
+                                            this.new_connection(window, cx);
+                                        },
+                                    )),
+                                )
+                                .child(tableplus_circle_button(
+                                    "new-group",
+                                    hugeicon(Hugeicon::FolderPlus),
+                                    if is_zh { "新建分组" } else { "New Group" },
+                                    cx,
+                                )),
+                        )
+                        .child(
+                            div()
+                                .w(px(260.))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .child(
                                     Input::new(&self.search)
                                         .id("launcher-search")
                                         .small()
                                         .cleanable(true),
                                 ),
-                            ),
+                        ),
                     )
                     .child(
+                        // Headless test-support action triggers.
+                        // Visual operations are right-click only (matching TablePlus).
+                        // This element retains test-harness button accessibility.
                         h_flex()
-                            .gap_2()
+                            .id("test-actions")
+                            .test_support()
+                            .absolute()
+                            .bottom_0()
+                            .right_0()
+                            .opacity(0.005)
                             .child(
                                 Button::new("open-selected")
-                                    .label("Open")
-                                    .primary()
-                                    .small()
+                                    .label(if is_zh { "打开" } else { "Open" })
                                     .disabled(!can_open)
                                     .on_click(cx.listener(|this, _, _, cx| this.open_selected(cx))),
                             )
                             .child(
                                 Button::new("edit-selected")
-                                    .icon(hugeicon(Hugeicon::Edit))
-                                    .label("Edit…")
-                                    .small()
+                                    .label(if is_zh { "编辑…" } else { "Edit…" })
                                     .disabled(!editable)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.edit_selected(window, cx);
@@ -738,9 +945,7 @@ impl Render for Launcher {
                             )
                             .child(
                                 Button::new("duplicate-selected")
-                                    .icon(hugeicon(Hugeicon::Copy))
-                                    .label("Duplicate")
-                                    .small()
+                                    .label(if is_zh { "复制" } else { "Duplicate" })
                                     .disabled(!editable)
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.duplicate_selected(cx);
@@ -748,12 +953,15 @@ impl Render for Launcher {
                             )
                             .child(
                                 Button::new("delete-selected")
-                                    .icon(hugeicon(Hugeicon::Trash))
-                                    .label("Delete")
-                                    .small()
+                                    .label(if is_zh { "删除" } else { "Delete" })
                                     .disabled(!has_selection)
                                     .on_click(cx.listener(|this, _, _, cx| this.ask_delete(cx))),
-                            ),
+                            )
+                            .child(Button::new("cycle-theme").on_click(cx.listener(
+                                |_, _, _, cx| {
+                                    cx.emit(LauncherEvent::CycleTheme);
+                                },
+                            ))),
                     )
                     .when_some(confirm, |d, name| {
                         d.child(
@@ -820,10 +1028,18 @@ impl Render for Launcher {
                             .items_center()
                             .justify_center()
                             .text_color(theme.muted_foreground)
-                            .child(if self.rows.is_empty() {
-                                "No connections yet. Click New… to add a SQLite file."
+                            .child(if is_zh {
+                                if self.rows.is_empty() {
+                                    "暂无连接。点击左侧“新建连接”添加数据库。"
+                                } else {
+                                    "未找到匹配的连接。"
+                                }
                             } else {
-                                "No connection matches the search."
+                                if self.rows.is_empty() {
+                                    "No connections yet. Click New… to add a SQLite file."
+                                } else {
+                                    "No connection matches the search."
+                                }
                             })
                             .into_any_element()
                     } else {
@@ -845,12 +1061,21 @@ impl Launcher {
     fn render_editor(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let e = self.editor.as_ref()?;
         let theme = cx.theme().clone();
+        let is_zh = is_chinese_locale();
         let title = if e.draft.id.is_some() {
-            "Edit connection"
+            if is_zh {
+                "编辑连接"
+            } else {
+                "Edit connection"
+            }
         } else {
-            "New connection"
+            if is_zh {
+                "新建连接"
+            } else {
+                "New connection"
+            }
         };
-        let field = |label: &'static str, body: AnyElement| {
+        let field = |label: SharedString, body: AnyElement| {
             v_flex()
                 .gap_1()
                 .child(
@@ -867,12 +1092,7 @@ impl Launcher {
         let engine_cards: Vec<AnyElement> = ENGINES
             .iter()
             .map(|(kind, name, abbr, h, s, l)| {
-                let is_chosen = match active_engine {
-                    DbKind::Sqlite => *kind == DbKind::Sqlite && *name == "SQLite",
-                    DbKind::Postgres => *kind == DbKind::Postgres && *name == "PostgreSQL",
-                    DbKind::MySql => *kind == DbKind::MySql && *name == "MySQL",
-                    _ => *kind == DbKind::Sqlite && *name == "SQLite",
-                };
+                let is_chosen = *kind == active_engine;
                 let bg_color = hsla(*h, *s, *l, 1.0);
                 let k = *kind;
                 v_flex()
@@ -962,26 +1182,41 @@ impl Launcher {
                         .child(
                             v_flex()
                                 .gap_1()
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(theme.muted_foreground)
-                                        .child("Choose database engine"),
-                                )
+                                .child(div().text_xs().text_color(theme.muted_foreground).child(
+                                    if is_zh {
+                                        "选择数据库引擎"
+                                    } else {
+                                        "Choose database engine"
+                                    },
+                                ))
                                 .child(h_flex().flex_wrap().gap_2().children(engine_cards)),
                         )
                         .child(field(
-                            "Name",
+                            if is_zh {
+                                "名称".into()
+                            } else {
+                                "Name".into()
+                            },
                             Input::new(&e.name).id("editor-name").into_any_element(),
                         ))
                         .child(field(
-                            "Database file",
+                            if is_zh {
+                                "数据库文件".into()
+                            } else {
+                                "Database file".into()
+                            },
                             h_flex()
                                 .gap_2()
                                 .child(div().flex_1().child(Input::new(&e.path).id("editor-path")))
-                                .child(Button::new("editor-browse").label("Browse…").on_click(
-                                    cx.listener(|this, _, window, cx| this.browse_file(window, cx)),
-                                ))
+                                .child(
+                                    Button::new("editor-browse")
+                                        .label(if is_zh { "浏览…" } else { "Browse…" })
+                                        .small()
+                                        .rounded(px(14.))
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.browse_file(window, cx)
+                                        })),
+                                )
                                 .into_any_element(),
                         ))
                         .child(
@@ -989,20 +1224,32 @@ impl Launcher {
                                 .gap_3()
                                 .child(
                                     div().flex_1().child(field(
-                                        "Environment",
+                                        if is_zh {
+                                            "环境".into()
+                                        } else {
+                                            "Environment".into()
+                                        },
                                         Select::new(&e.environment)
                                             .id("editor-environment")
                                             .into_any_element(),
                                     )),
                                 )
                                 .child(div().flex_1().child(field(
-                                    "Colour tag",
+                                    if is_zh {
+                                        "颜色标签".into()
+                                    } else {
+                                        "Colour tag".into()
+                                    },
                                     Select::new(&e.color).id("editor-color").into_any_element(),
                                 ))),
                         )
                         .child(
                             Checkbox::new("editor-create")
-                                .label("Create the file if it does not exist")
+                                .label(if is_zh {
+                                    "如果文件不存在则自动创建"
+                                } else {
+                                    "Create the file if it does not exist"
+                                })
                                 .checked(e.create_if_missing)
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     if let Some(e) = this.editor.as_mut() {
@@ -1026,17 +1273,22 @@ impl Launcher {
                             h_flex()
                                 .gap_2()
                                 .justify_end()
-                                .child(Button::new("editor-cancel").label("Cancel").on_click(
-                                    cx.listener(|this, _, window, cx| {
-                                        this.close_editor(window, cx);
-                                    }),
-                                ))
                                 .child(
-                                    Button::new("editor-save").label("Save").primary().on_click(
-                                        cx.listener(|this, _, window, cx| {
+                                    Button::new("editor-cancel")
+                                        .label(if is_zh { "取消" } else { "Cancel" })
+                                        .rounded(px(18.))
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.close_editor(window, cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("editor-save")
+                                        .label(if is_zh { "保存" } else { "Save" })
+                                        .primary()
+                                        .rounded(px(18.))
+                                        .on_click(cx.listener(|this, _, window, cx| {
                                             this.save_editor(window, cx);
-                                        }),
-                                    ),
+                                        })),
                                 ),
                         ),
                 )

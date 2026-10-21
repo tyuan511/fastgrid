@@ -13,6 +13,68 @@ pub fn chosen(cx: &App) -> ThemeMode {
     cx.try_global::<Chosen>().map_or(ThemeMode::System, |c| c.0)
 }
 
+/// fastgrid's own look: a calm cool-grey surface, one indigo accent, 14px type, 8px radii.
+/// Applied on top of the kit theme (light or dark) every time the theme changes.
+pub fn compact_type(cx: &mut App) {
+    use gpui_kit::{hsla, px};
+    let theme = Theme::global_mut(cx);
+    theme.font_size = px(14.);
+    theme.mono_font_size = px(13.);
+    theme.radius = px(8.);
+    theme.radius_lg = px(12.);
+
+    let dark = theme.is_dark();
+    // (hue 0-360, saturation, lightness) shorthand.
+    let c = |h: f32, s: f32, l: f32| hsla(h / 360., s, l, 1.);
+    let accent = if dark {
+        c(239., 0.90, 0.72)
+    } else {
+        c(239., 0.80, 0.58)
+    };
+    theme.primary = accent;
+    theme.primary_hover = accent.opacity(0.88);
+    theme.primary_active = accent.opacity(0.76);
+    theme.primary_foreground = hsla(0., 0., 1., 1.);
+    theme.ring = accent.opacity(0.5);
+    theme.selection = accent.opacity(0.25);
+    theme.list_active = accent.opacity(if dark { 0.20 } else { 0.11 });
+    theme.list_active_border = accent.opacity(0.0);
+    theme.tokens.table_active = hsla(0., 0., 0., 0.).into();
+    theme.tokens.table_even = hsla(0., 0., 0., 0.).into();
+    theme.table_even = hsla(0., 0., 0., 0.);
+
+    if dark {
+        theme.background = c(222., 0.16, 0.085);
+        theme.foreground = c(220., 0.14, 0.92);
+        theme.sidebar = c(222., 0.16, 0.105);
+        theme.tab_bar = c(222., 0.16, 0.085);
+        theme.border = c(222., 0.12, 0.17);
+        theme.muted = c(222., 0.13, 0.15);
+        theme.muted_foreground = c(220., 0.09, 0.62);
+        theme.table_head = c(222., 0.16, 0.105);
+        theme.tokens.table_head = c(222., 0.16, 0.105).into();
+        theme.table_row_border = c(222., 0.12, 0.14);
+        theme.list_hover = c(222., 0.13, 0.14);
+    } else {
+        theme.background = c(0., 0., 1.);
+        theme.foreground = c(222., 0.25, 0.12);
+        theme.sidebar = c(220., 0.20, 0.975);
+        theme.tab_bar = c(0., 0., 1.);
+        theme.border = c(220., 0.16, 0.91);
+        theme.muted = c(220., 0.18, 0.95);
+        theme.muted_foreground = c(220., 0.10, 0.44);
+        theme.table_head = c(220., 0.20, 0.98);
+        theme.tokens.table_head = c(220., 0.20, 0.98).into();
+        theme.table_row_border = c(220., 0.16, 0.94);
+        theme.list_hover = c(220., 0.18, 0.95);
+    }
+    theme.title_bar = theme.background;
+    theme.title_bar_border = theme.border;
+    theme.tab_active = theme.background;
+    theme.tab_active_foreground = theme.foreground;
+    theme.tab_foreground = theme.muted_foreground;
+}
+
 /// Remember `mode` and apply it everywhere.
 pub fn set_and_apply(mode: ThemeMode, cx: &mut App) {
     cx.set_global(Chosen(mode));
@@ -26,6 +88,7 @@ pub fn follow_system(window: &mut Window) {
         .observe_window_appearance(|window, cx| {
             if chosen(cx) == ThemeMode::System {
                 Theme::sync_system_appearance(Some(window), cx);
+                compact_type(cx);
             }
         })
         .detach();
@@ -39,6 +102,7 @@ pub fn apply(mode: ThemeMode, cx: &mut App) {
         ThemeMode::Dark => Theme::change(KitMode::Dark, None, cx),
         _ => Theme::sync_system_appearance(None, cx),
     }
+    compact_type(cx);
 }
 
 /// The next choice when the toggle is clicked: system, light, dark, then back to system.

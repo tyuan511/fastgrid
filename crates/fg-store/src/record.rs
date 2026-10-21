@@ -26,6 +26,24 @@ pub(crate) struct Row {
 pub(crate) const COLUMNS: &str =
     "kind, id, parent_id, sort_ts, rev, device_id, updated_at, deleted_at, key_id, enc";
 
+pub(crate) struct SealedRow<'a> {
+    pub kind: &'a str,
+    pub id: &'a str,
+    pub parent_id: Option<&'a str>,
+    pub sort_ts: Option<i64>,
+    pub device_id: &'a str,
+    pub key_id: u32,
+    pub enc: &'a [u8],
+}
+
+fn is_constraint(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(f, _)
+            if f.code == rusqlite::ErrorCode::ConstraintViolation
+    )
+}
+
 fn row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
     Ok(Row {
         kind: r.get(0)?,
@@ -153,14 +171,144 @@ impl Store {
         sort_ts: Option<i64>,
         value: &T,
     ) -> Result<()> {
+        let enc = self.seal_value(kind, id, value)?;
+        self.with_write_tx(|tx| {
+            Self::replace_row(
+                tx,
+                &SealedRow {
+                    kind,
+                    id,
+                    parent_id,
+                    sort_ts,
+                    device_id: &self.device_id,
+                    key_id: self.key_id,
+                    enc: &enc,
+                },
+            )
+        })
+    }
+
+    /// Insert a new id. A live row or a tombstone with the same id is a constraint error, so a
+    /// replay cannot replace history the way `INSERT OR REPLACE` would.
+    pub(crate) fn insert_json<T: Serialize>(
+        &self,
+        kind: &str,
+        id: &str,
+        parent_id: Option<&str>,
+        sort_ts: Option<i64>,
+        value: &T,
+    ) -> Result<()> {
+        let enc = self.seal_value(kind, id, value)?;
+        self.with_write_tx(|tx| {
+            Self::insert_row(
+                tx,
+                &SealedRow {
+                    kind,
+                    id,
+                    parent_id,
+                    sort_ts,
+                    device_id: &self.device_id,
+                    key_id: self.key_id,
+                    enc: &enc,
+                },
+            )
+        })
+    }
+
+    /// Replace a row only when this version can still read it. The check and the write share one
+    /// transaction, so a payload that decrypts but does not deserialize cannot be overwritten by
+    /// a stale read that happened before the transaction.
+    pub(crate) fn put_json_if_readable<T: Serialize + DeserializeOwned>(
+        &self,
+        kind: &str,
+        id: &str,
+        parent_id: Option<&str>,
+        sort_ts: Option<i64>,
+        value: &T,
+        refuse: impl FnOnce(&str) -> String,
+    ) -> Result<()> {
+        let enc = self.seal_value(kind, id, value)?;
+        self.with_write_tx(|tx| {
+            if let Some(row) = Self::fetch_any_tx(tx, kind, id)?
+                && row.deleted_at.is_none()
+                && let Loaded::Unreadable { reason, .. } = self.decode::<T>(&row)
+            {
+                return Err(Error::Storage(refuse(&reason)));
+            }
+            Self::replace_row(
+                tx,
+                &SealedRow {
+                    kind,
+                    id,
+                    parent_id,
+                    sort_ts,
+                    device_id: &self.device_id,
+                    key_id: self.key_id,
+                    enc: &enc,
+                },
+            )
+        })
+    }
+
+    /// Plant ciphertext that decrypts to the given JSON text. Tests use it to prove a settings
+    /// read fails closed. Not part of the production API.
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn write_raw_record(&self, kind: &str, id: &str, json: &str) -> Result<()> {
+        let enc = self.seal_payload(kind, id, json.as_bytes())?;
+        let device_id = self.device_id.clone();
+        let key_id = self.key_id;
+        self.with_write_tx(|tx| {
+            Self::replace_row(
+                tx,
+                &SealedRow {
+                    kind,
+                    id,
+                    parent_id: None,
+                    sort_ts: None,
+                    device_id: &device_id,
+                    key_id,
+                    enc: &enc,
+                },
+            )
+        })
+    }
+
+    pub(crate) fn seal_value<T: Serialize>(
+        &self,
+        kind: &str,
+        id: &str,
+        value: &T,
+    ) -> Result<Vec<u8>> {
         let json = serde_json::to_vec(value)
             .map_err(|e| Error::Storage(format!("cannot serialize {kind}: {e}")))?;
-        let enc = self.seal_payload(kind, id, &json)?;
+        self.seal_payload(kind, id, &json)
+    }
+
+    pub(crate) fn with_write_tx<T>(
+        &self,
+        f: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
         let tx = self.conn.unchecked_transaction().map_err(storage)?;
+        let out = f(&tx)?;
+        tx.commit().map_err(storage)?;
+        Ok(out)
+    }
+
+    fn fetch_any_tx(tx: &rusqlite::Transaction<'_>, kind: &str, id: &str) -> Result<Option<Row>> {
+        tx.query_row(
+            &format!("SELECT {COLUMNS} FROM record WHERE kind = ?1 AND id = ?2"),
+            [kind, id],
+            row_from,
+        )
+        .optional()
+        .map_err(storage)
+    }
+
+    pub(crate) fn replace_row(tx: &rusqlite::Transaction<'_>, row: &SealedRow<'_>) -> Result<()> {
         let old: Option<i64> = tx
             .query_row(
                 "SELECT rev FROM record WHERE kind = ?1 AND id = ?2",
-                [kind, id],
+                [row.kind, row.id],
                 |r| r.get(0),
             )
             .optional()
@@ -170,19 +318,62 @@ impl Store {
                (kind, id, parent_id, sort_ts, rev, device_id, updated_at, deleted_at, dirty, key_id, enc)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, 1, ?8, ?9)",
             params![
-                kind,
-                id,
-                parent_id,
-                sort_ts,
+                row.kind,
+                row.id,
+                row.parent_id,
+                row.sort_ts,
                 old.map_or(1, |r| r + 1),
-                self.device_id,
-                self.now(),
-                self.key_id,
-                enc
+                row.device_id,
+                UnixMillis::now().0,
+                row.key_id,
+                row.enc
             ],
         )
         .map_err(storage)?;
-        tx.commit().map_err(storage)
+        Ok(())
+    }
+
+    pub(crate) fn tombstone_tx(
+        tx: &rusqlite::Transaction<'_>,
+        kind: &str,
+        id: &str,
+        device_id: &str,
+        key_id: u32,
+    ) -> Result<()> {
+        tx.execute(
+            "UPDATE record SET rev = rev + 1, device_id = ?3, updated_at = ?4, deleted_at = ?4,
+                    dirty = 1, key_id = ?5, enc = x''
+             WHERE kind = ?1 AND id = ?2 AND deleted_at IS NULL",
+            params![kind, id, device_id, UnixMillis::now().0, key_id],
+        )
+        .map_err(storage)?;
+        Ok(())
+    }
+
+    fn insert_row(tx: &rusqlite::Transaction<'_>, row: &SealedRow<'_>) -> Result<()> {
+        tx.execute(
+            "INSERT INTO record
+               (kind, id, parent_id, sort_ts, rev, device_id, updated_at, deleted_at, dirty, key_id, enc)
+             VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, NULL, 1, ?7, ?8)",
+            params![
+                row.kind,
+                row.id,
+                row.parent_id,
+                row.sort_ts,
+                row.device_id,
+                UnixMillis::now().0,
+                row.key_id,
+                row.enc
+            ],
+        )
+        .map_err(|err| {
+            if is_constraint(&err) {
+                Error::Storage(format!("{} {} already exists", row.kind, row.id))
+            } else {
+                storage(err)
+            }
+        })?;
+        Ok(())
     }
 
     pub(crate) fn get_json<T: DeserializeOwned>(

@@ -8,6 +8,10 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Hooks used by this crate's tests. Off unless a test build asks for them.
+test-seams = ["fg-store/test-seams"]
+
 [dependencies]
 fg-core.workspace = true
 fg-driver.workspace = true
@@ -17,3 +21,8 @@ keyring.workspace = true
 fg-sql.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "macros"] }
 tracing.workspace = true
+
+[dev-dependencies]
+# Integration tests are separate crates and do not set cfg(test) on this library. Depending on
+# ourselves with the feature on is how `cargo test` compiles the seams they call.
+fg-service = { path = ".", features = ["test-seams"] }

@@ -4,19 +4,27 @@
 //! answer goes back into a view.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
-use fg_core::{AppearanceSettings, ConnectionConfig, GridSettings, ObjectInfo, ObjectPath, Result};
+use fg_core::{
+    AppearanceSettings, ConnectionConfig, DbKind, GridSettings, ObjectInfo, ObjectPath,
+    QueryDocument, Result, SafeMode, TabKind, UnixMillis, WorkspaceState,
+};
 use fg_driver::Event;
-use fg_service::{BrowseOptions, OpenConnection, PasswordUpdate, Service};
+use fg_service::{
+    BrowseOptions, OpenConnection, PasswordUpdate, PolicyRefusal, RunOptions, Service,
+    TaskCanceller, plan,
+};
 use gpui_kit::*;
 
+use crate::model::{QueryDocumentState, RunMode};
 use crate::views::{
-    Launcher, LauncherEvent, TableTab, TableTabEvent, WorkspaceEvent, WorkspaceView,
-    open_workspace_window, restore_query, rows_from,
+    Launcher, LauncherEvent, QueryTab, TabContent, TableTab, TableTabEvent, WorkspaceEvent,
+    WorkspaceView, open_workspace_window, restore_query, rows_from,
 };
 
 /// Apply the saved light / dark / system choice (call once at startup).
@@ -162,9 +170,52 @@ fn wire_workspace(
     load_schema(&view, &conn, Some((window, service.clone())), cx);
 
     let save_timer: Rc<RefCell<Option<Task<()>>>> = Rc::new(RefCell::new(None));
+    // One draft-save timer per tab: typing in two tabs must not cancel each other's save.
+    let draft_timers: Rc<RefCell<HashMap<EntityId, Task<()>>>> = Rc::default();
+    // One running statement per tab, plus its canceller so `⌘.` can reach it from the UI thread.
+    let runs: Rc<RefCell<HashMap<EntityId, QueryRun>>> = Rc::default();
     cx.subscribe(&view, move |view, event: &WorkspaceEvent, cx| match event {
         WorkspaceEvent::TableOpened { path, tab } => {
             attach_table(&service, &conn, path.clone(), tab.clone(), cx);
+        }
+        WorkspaceEvent::QueryOpened { tab } => {
+            load_draft(&service, &conn, tab.clone(), window, cx);
+            feed_completion(&conn, &view, cx);
+        }
+        WorkspaceEvent::NewQueryRequested => {
+            new_query(&service, &conn, &view, window, cx);
+        }
+        WorkspaceEvent::QueryRun { tab, mode } => {
+            run_from_editor(&conn, &runs, tab, RunSubject::Mode(*mode), cx);
+        }
+        WorkspaceEvent::QueryConfirmed { tab, script } => {
+            // `script` is the buffer text the prompt was built from; the tab hands the same string
+            // back through `confirmation_target`, so the digest and the SQL cannot disagree.
+            let _ = script;
+            run_from_editor(&conn, &runs, tab, RunSubject::Confirmed, cx);
+        }
+        WorkspaceEvent::QueryCancel { tab } => cancel_run(&runs, tab, cx),
+        WorkspaceEvent::QueryDraftChanged { tab } => {
+            save_draft_debounced(&service, &draft_timers, tab, cx);
+        }
+        WorkspaceEvent::SnippetsRequested => load_snippets(&service, &conn, &view, cx),
+        WorkspaceEvent::SnippetSave { title, sql } => {
+            save_snippet(&service, &conn, &view, title.clone(), sql.clone(), cx);
+        }
+        WorkspaceEvent::SnippetDelete { id } => {
+            delete_snippet(&service, &conn, &view, id.clone(), cx);
+        }
+        WorkspaceEvent::QueryExplain { tab } => {
+            explain(&conn, &runs, tab, cx);
+        }
+        WorkspaceEvent::HistoryRequested { search } => {
+            load_history(&service, &conn, &view, search.clone(), cx);
+        }
+        WorkspaceEvent::HistoryPicked { sql } => {
+            insert_into_active_query(&view, sql, window, cx);
+        }
+        WorkspaceEvent::SafeModeChanged { mode } => {
+            set_safe_mode(&service, &conn, &view, *mode, cx);
         }
         WorkspaceEvent::RefreshSchema => load_schema(&view, &conn, None, cx),
         WorkspaceEvent::CycleTheme => cycle_theme(&service, cx),
@@ -210,13 +261,40 @@ fn load_schema(
         conn.refresh(&fg_service::Refresh::Everything);
         match list_all(&conn).await {
             Ok((namespaces, objects)) => {
+                let for_completion = objects.clone();
                 let _ = view.update(cx, |v, cx| v.set_schema(namespaces, objects, cx));
+                // The schema just landed: hand it to completion now, so the first keystroke in a
+                // query tab already knows the tables (and, as `describe` answers, the columns).
+                let paths: Vec<ObjectPath> = for_completion
+                    .values()
+                    .flatten()
+                    .filter(|o| {
+                        matches!(
+                            o.kind,
+                            fg_core::ObjectKind::Table | fg_core::ObjectKind::View
+                        )
+                    })
+                    .map(|o| o.path.clone())
+                    .collect();
+                let catalog = crate::views::CompletionCatalog::with_objects(paths.clone());
+                let _ = view.update(cx, |v, cx| v.set_catalog_everywhere(catalog, cx));
+                // Inlined rather than calling the helper: this task's context is an `AsyncApp`,
+                // which can spawn but not take `&mut App`.
+                let describe_view = view.clone();
+                let describe_conn = Arc::clone(&conn);
+                cx.spawn(async move |cx| {
+                    describe_loop(describe_conn, describe_view, paths, cx).await;
+                })
+                .detach();
                 if let Some((window, service)) = restore
                     && let Ok(Some(saved)) = service.load_workspace(conn.id()).await
                 {
                     let _ = window.update(cx, |_, window, cx| {
                         let _ = view.update(cx, |v, cx| v.restore(&saved, window, cx));
                     });
+                    // Query tabs hold a document id, not a path, so they come back through the
+                    // draft store rather than the schema (the schema check would drop them).
+                    restore_query_tabs(&view, &conn, &saved, window, cx);
                 }
             }
             Err(e) => {
@@ -227,6 +305,50 @@ fn load_schema(
         }
     })
     .detach();
+}
+
+/// Give every query tab the schema it completes against: the object list first, then the columns of
+/// each table as `describe` answers. Runs in the background; a slow schema does not block the tab.
+fn feed_completion(conn: &Arc<OpenConnection>, view: &Entity<WorkspaceView>, cx: &mut App) {
+    let paths = view.read(cx).visible_tables();
+    let catalog = crate::views::CompletionCatalog::with_objects(paths.clone());
+    view.update(cx, |v, cx| v.set_catalog_everywhere(catalog, cx));
+    describe_into_completion(conn, view, paths, cx);
+}
+
+/// Describe each object and hand its columns to the tabs. Async so both a `spawn` body and a plain
+/// `App` caller can use it without duplicating the loop.
+async fn describe_loop(
+    conn: Arc<OpenConnection>,
+    view: WeakEntity<WorkspaceView>,
+    paths: Vec<ObjectPath>,
+    cx: &mut AsyncApp,
+) {
+    for path in paths {
+        let Ok(detail) = conn.describe(&path).await else {
+            continue;
+        };
+        let columns: Vec<fg_core::ColumnMeta> = detail
+            .columns
+            .iter()
+            .map(|c| fg_core::ColumnMeta::new(c.name.clone(), c.data_type.clone()))
+            .collect();
+        let _ = view.update(cx, |v, cx| {
+            v.set_columns_everywhere(path.clone(), columns.clone(), cx)
+        });
+    }
+}
+
+/// The `&mut App` entry point: spawn the same loop from a synchronous caller.
+fn describe_into_completion(
+    conn: &Arc<OpenConnection>,
+    view: &Entity<WorkspaceView>,
+    paths: Vec<ObjectPath>,
+    cx: &mut App,
+) {
+    let (conn, view) = (Arc::clone(conn), view.downgrade());
+    cx.spawn(async move |cx| describe_loop(conn, view, paths, cx).await)
+        .detach();
 }
 
 /// Everything a table tab keeps running; replacing a task cancels it (and its database query).
@@ -403,6 +525,604 @@ fn save_view(service: &Service, conn: &Arc<OpenConnection>, tab: &Entity<TableTa
     let (service, id) = (service.clone(), conn.id().clone());
     cx.spawn(async move |_| {
         let _ = service.save_table_view(&id, &path, state).await;
+    })
+    .detach();
+}
+
+// ---- query tabs -------------------------------------------------------------------------------
+//
+// The editor view emits intent; everything below turns it into a checked `fg-service` run and
+// paints the answer back. The policy itself lives in the service (`plan` + `OpenConnection::run`):
+// the UI only reads the plan to decide whether a human has to confirm first.
+
+/// What a query tab keeps running. Replacing or dropping the task cancels the statement, which is
+/// how a closed tab stops its query; `⌘.` uses the canceller instead so the outcome is recorded as
+/// cancelled by the user.
+struct QueryRun {
+    /// Kept only so the run lives as long as the tab's current request.
+    _task: Task<()>,
+    /// The tab, so a closed tab's run can be pruned (and cancelled) on the next run.
+    tab: WeakEntity<QueryTab>,
+    /// Filled in once the stream exists; the UI thread needs it while the task is running.
+    canceller: Arc<Mutex<Option<TaskCanceller>>>,
+    generation: u64,
+}
+
+/// Why a run was asked for: a run mode, or the statement the user just confirmed.
+enum RunSubject {
+    Mode(RunMode),
+    Confirmed,
+}
+
+/// `⌘T` / the SQL badge: a new draft, opened and persisted at once so a crash cannot lose the tab
+/// the user just made.
+fn new_query(
+    service: &Service,
+    conn: &Arc<OpenConnection>,
+    view: &Entity<WorkspaceView>,
+    window: AnyWindowHandle,
+    cx: &mut App,
+) {
+    let title = next_query_title(view, cx);
+    let document = QueryDocumentState::new(conn.id().clone(), title, UnixMillis::now());
+    let opened = window.update(cx, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.open_query(document, String::new(), window, cx)
+        })
+    });
+    let Ok(tab) = opened else {
+        return;
+    };
+    let (service, document) = (service.clone(), tab.read(cx).document().clone());
+    cx.spawn(async move |_| {
+        let now = UnixMillis::now();
+        let _ = service.save_document(document.to_document("", now)).await;
+    })
+    .detach();
+}
+
+/// `Query`, `Query 2`, … without reusing the title of a tab that is still open.
+fn next_query_title(view: &Entity<WorkspaceView>, cx: &App) -> String {
+    let used: Vec<String> = view
+        .read(cx)
+        .tabs()
+        .tabs()
+        .iter()
+        .filter_map(|tab| match &tab.kind {
+            TabKind::Query { .. } => Some(
+                view.read(cx)
+                    .query_view(&tab.id)
+                    .map(|t| t.read(cx).title())
+                    .unwrap_or_else(|| "Query".to_owned()),
+            ),
+            TabKind::Table { .. } => None,
+        })
+        .collect();
+    let mut n = 1;
+    loop {
+        let candidate = if n == 1 {
+            "Query".to_owned()
+        } else {
+            format!("Query {n}")
+        };
+        if !used.contains(&candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// Reopen the query tabs of a saved session. Their content comes later from the draft store, so a
+/// draft deleted in the meantime still leaves the tab (empty) rather than silently dropping it.
+fn restore_query_tabs(
+    view: &WeakEntity<WorkspaceView>,
+    conn: &Arc<OpenConnection>,
+    saved: &WorkspaceState,
+    window: AnyWindowHandle,
+    cx: &mut AsyncApp,
+) {
+    for tab in &saved.tabs {
+        let TabKind::Query { document_id } = &tab.kind else {
+            continue;
+        };
+        // A stand-in for the real record; `load_draft` replaces title and content when it finds it.
+        let placeholder = QueryDocument {
+            id: document_id.clone(),
+            connection_id: conn.id().clone(),
+            title: "Query".to_owned(),
+            content: String::new(),
+            saved_path: None,
+            dirty: false,
+            cursor_offset: None,
+            created_at: UnixMillis(0),
+            updated_at: UnixMillis(0),
+        };
+        let document = QueryDocumentState::from_document(&placeholder);
+        let _ = window.update(cx, |_, window, cx| {
+            view.update(cx, |v, cx| {
+                v.open_query(document, String::new(), window, cx)
+            })
+        });
+    }
+    if let Some(active) = &saved.active_tab {
+        let _ = view.update(cx, |v, cx| v.activate_tab(active, cx));
+    }
+}
+
+/// Read the draft a tab stands for: its title, its text, or the reason it cannot be read.
+fn load_draft(
+    service: &Service,
+    conn: &Arc<OpenConnection>,
+    tab: Entity<QueryTab>,
+    window: AnyWindowHandle,
+    cx: &mut App,
+) {
+    let (tab, service, id, document_id) = (
+        tab.downgrade(),
+        service.clone(),
+        conn.id().clone(),
+        tab.read(cx).document_id().clone(),
+    );
+    cx.spawn(async move |cx| {
+        let Ok(documents) = service.documents(&id).await else {
+            return;
+        };
+        let Some(found) = documents.into_iter().find(|d| d.id() == &document_id) else {
+            return;
+        };
+        let title = match &found {
+            fg_store::StoredDocument::Ok(doc) => doc.title.clone(),
+            // Shown and left alone: writing back would destroy a record we cannot parse.
+            fg_store::StoredDocument::Unreadable { reason, .. } => {
+                let _ = tab.update(cx, |t, cx| t.set_unavailable(reason.clone(), cx));
+                return;
+            }
+        };
+        let _ = tab.update(cx, |t, cx| t.set_title(title, cx));
+        let fg_store::StoredDocument::Ok(doc) = found else {
+            return;
+        };
+        if doc.content.is_empty() {
+            return;
+        }
+        let _ = window.update(cx, |_, window, cx| {
+            tab.update(cx, |t, cx| t.set_content(&doc.content, window, cx))
+        });
+    })
+    .detach();
+}
+
+/// Run what the editor asks for. The script is read from the buffer here, so what reaches the
+/// service is what is on screen at this instant - and, for a confirmed run, the byte-identical
+/// string the confirmation digest was taken over.
+fn run_from_editor(
+    conn: &Arc<OpenConnection>,
+    runs: &Rc<RefCell<HashMap<EntityId, QueryRun>>>,
+    tab: &Entity<QueryTab>,
+    subject: RunSubject,
+    cx: &mut App,
+) {
+    let script = tab.read(cx).script(cx);
+    let confirmed = matches!(subject, RunSubject::Confirmed);
+    let Some((target, sql)) = (match &subject {
+        RunSubject::Mode(mode) => tab.read(cx).target(*mode, cx).map(|target| {
+            let sql = target.sql().to_owned();
+            (target, sql)
+        }),
+        RunSubject::Confirmed => tab.read(cx).confirmation_target(),
+    }) else {
+        return;
+    };
+    if sql.trim().is_empty() {
+        return;
+    }
+
+    let (kind, safe_mode) = (conn.kind(), conn.safe_mode());
+    let plan = plan(&sql, kind, safe_mode);
+
+    // Level 1 / 2: stop and ask a human before the service sees the script at all, so a declined
+    // prompt never reaches the database. A read-only refusal still goes through `run` below, so the
+    // attempt is recorded as `NotRun` by the service.
+    if !confirmed
+        && let Some(PolicyRefusal::NeedsConfirmation {
+            statement, danger, ..
+        }) = plan.refusal
+    {
+        let statement_text = plan
+            .statements
+            .get(statement)
+            .map(|s| s.sql.clone())
+            .unwrap_or_else(|| sql.clone());
+        let production = conn.config().environment.is_production_like();
+        tab.update(cx, |t, cx| {
+            t.begin_run(target.clone(), script.clone(), cx);
+            t.ask_confirmation(
+                crate::views::PendingConfirmation {
+                    script: sql,
+                    statement: statement_text,
+                    target,
+                    reason: danger,
+                    production,
+                },
+                cx,
+            );
+        });
+        return;
+    }
+
+    let options = if confirmed {
+        RunOptions::gui_confirmed(&sql, kind)
+    } else {
+        RunOptions::gui()
+    };
+    let generation = tab.update(cx, |t, cx| t.begin_run(target, script, cx));
+    tab.update(cx, |t, cx| t.apply_plan(generation, &plan, cx));
+
+    let canceller: Arc<Mutex<Option<TaskCanceller>>> = Arc::default();
+    let (weak, conn, id) = (tab.downgrade(), Arc::clone(conn), tab.entity_id());
+    let (task_tab, task_canceller, task_sql, task_plan) = (
+        weak.clone(),
+        Arc::clone(&canceller),
+        sql.clone(),
+        plan.clone(),
+    );
+    let task = cx.spawn(async move |cx| {
+        let mut stream = match conn.run(&task_sql, &[], options).await {
+            Ok(stream) => stream,
+            Err(err) => {
+                let _ = task_tab.update(cx, |t, cx| match (&err, task_plan.refusal) {
+                    (fg_core::Error::PolicyDenied(_), Some(refusal)) => {
+                        t.refuse(generation, &task_plan, refusal, cx);
+                    }
+                    _ => t.fail_run(generation, &err, cx),
+                });
+                return;
+            }
+        };
+        if let Ok(mut slot) = task_canceller.lock() {
+            *slot = Some(stream.canceller());
+        }
+        let mut failure = None;
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(event) => {
+                    if task_tab
+                        .update(cx, |t, cx| t.apply_event(generation, event, cx))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    failure = Some(err);
+                    break;
+                }
+            }
+        }
+        // Truncation and record failures are per-run facts the service reports once the stream ends.
+        let record_error = stream.record_error().map(str::to_owned);
+        let _ = task_tab.update(cx, |t, cx| {
+            match failure {
+                Some(err) => t.fail_run(generation, &err, cx),
+                None => t.finish_run(generation, cx),
+            }
+            t.set_record_error(generation, record_error, cx);
+        });
+    });
+
+    runs.borrow_mut()
+        .retain(|_, run| run.tab.upgrade().is_some());
+    runs.borrow_mut().insert(
+        id,
+        QueryRun {
+            _task: task,
+            tab: weak,
+            canceller,
+            generation,
+        },
+    );
+}
+
+/// `⌘.`: ask the engine to stop and show it as cancelled. The service records the outcome.
+fn cancel_run(
+    runs: &Rc<RefCell<HashMap<EntityId, QueryRun>>>,
+    tab: &Entity<QueryTab>,
+    cx: &mut App,
+) {
+    let id = tab.entity_id();
+    let generation = {
+        let all = runs.borrow();
+        let Some(run) = all.get(&id) else {
+            return;
+        };
+        if let Ok(slot) = run.canceller.lock()
+            && let Some(canceller) = slot.as_ref()
+        {
+            canceller.cancel();
+        }
+        run.generation
+    };
+    tab.update(cx, |t, cx| t.mark_cancelled(generation, cx));
+}
+
+/// Persist the draft shortly after the last keystroke, not on every character.
+fn save_draft_debounced(
+    service: &Service,
+    timers: &Rc<RefCell<HashMap<EntityId, Task<()>>>>,
+    tab: &Entity<QueryTab>,
+    cx: &mut App,
+) {
+    // An unreadable draft must never be written back over the newer record.
+    if tab.read(cx).is_unavailable() {
+        return;
+    }
+    let id = tab.entity_id();
+    let (tab, service) = (tab.downgrade(), service.clone());
+    let task = cx.spawn(async move |cx| {
+        cx.background_executor()
+            .timer(Duration::from_millis(600))
+            .await;
+        let Some((document, content)) = tab
+            .read_with(cx, |t, cx| (t.document().clone(), t.script(cx)))
+            .ok()
+        else {
+            return;
+        };
+        if !document.dirty() {
+            return;
+        }
+        let now = UnixMillis::now();
+        if service
+            .save_document(document.to_document(&content, now))
+            .await
+            .is_ok()
+        {
+            let _ = tab.update(cx, |t, cx| t.mark_saved(cx));
+        }
+    });
+    timers.borrow_mut().insert(id, task);
+}
+
+// ---- history and safe mode ---------------------------------------------------------------------
+
+/// Load the recent statements of this connection into the `⌘Y` panel.
+fn load_history(
+    service: &Service,
+    conn: &Arc<OpenConnection>,
+    view: &Entity<WorkspaceView>,
+    search: String,
+    cx: &mut App,
+) {
+    let (service, id, view) = (service.clone(), conn.id().clone(), view.downgrade());
+    let search = search.trim().to_owned();
+    cx.spawn(async move |cx| {
+        let search = (!search.is_empty()).then_some(search);
+        let entries = service
+            .history(&id, search.as_deref(), HISTORY_LIMIT)
+            .await
+            .unwrap_or_default();
+        let _ = view.update(cx, |v, cx| v.set_history(entries, cx));
+    })
+    .detach();
+}
+
+/// How many history entries the panel lists. Enough to scroll, small enough to decrypt quickly.
+const HISTORY_LIMIT: usize = 200;
+
+/// Put a statement the user picked into the active query tab, replacing what was there.
+fn insert_into_active_query(
+    view: &Entity<WorkspaceView>,
+    sql: &str,
+    window: AnyWindowHandle,
+    cx: &mut App,
+) {
+    let target = view.read(cx).active_tab_view();
+    let Some(TabContent::Query(tab)) = target else {
+        return;
+    };
+    let sql = sql.to_owned();
+    let _ = window.update(cx, |_, window, cx| {
+        tab.update(cx, |t, cx| {
+            t.set_content(&sql, window, cx);
+            t.focus(window, cx);
+        })
+    });
+}
+
+/// Switch the guard level and persist it, so the next session starts with the same one.
+fn set_safe_mode(
+    service: &Service,
+    conn: &Arc<OpenConnection>,
+    view: &Entity<WorkspaceView>,
+    mode: SafeMode,
+    cx: &mut App,
+) {
+    view.update(cx, |v, cx| v.set_safe_mode(mode, cx));
+    // The service applies a safe mode when it opens a session, so an open connection keeps the old
+    // one until it is reopened. Saving the config closes it, which is exactly what we want: the
+    // next statement runs under the new level instead of the old one.
+    let (service, id) = (service.clone(), conn.id().clone());
+    cx.spawn(async move |_| {
+        if let Ok(all) = service.connections().await
+            && let Some(fg_store::StoredConnection::Ok(mut config)) =
+                all.into_iter().find(|c| c.id() == &id)
+        {
+            config.safe_mode = Some(mode);
+            let _ = service.save_connection(config, PasswordUpdate::Keep).await;
+        }
+    })
+    .detach();
+}
+
+// ---- explain -----------------------------------------------------------------------------------
+
+/// Show the plan for the statement under the caret instead of running it.
+///
+/// The plan comes from the same checked path as a query (`OpenConnection::run`): `EXPLAIN QUERY
+/// PLAN` is classified as a read, so a read-only connection can still explain, and the attempt is
+/// recorded in history like any other statement. Nothing here re-implements the engine's own plan
+/// output - it is displayed as the rows the engine returned.
+fn explain(
+    conn: &Arc<OpenConnection>,
+    runs: &Rc<RefCell<HashMap<EntityId, QueryRun>>>,
+    tab: &Entity<QueryTab>,
+    cx: &mut App,
+) {
+    let Some(target) = tab.read(cx).target(RunMode::CurrentStatement, cx) else {
+        return;
+    };
+    let sql = target.sql().to_owned();
+    if sql.trim().is_empty() {
+        return;
+    }
+    // `EXPLAIN QUERY PLAN` on SQLite; the other engines take a bare `EXPLAIN`. The prefix is added
+    // here rather than by the service because it is a presentation choice, not a policy one.
+    let prefixed = explain_prefix(conn.kind(), &sql);
+    // The plan query is what gets planned and run, so the service judges `EXPLAIN ...` (a read)
+    // rather than the statement inside it. That is what makes explaining a write possible on a
+    // read-only connection.
+    let plan = fg_service::plan(&prefixed, conn.kind(), conn.safe_mode());
+    // The generation the tab minted is the one every event of this run must carry.
+    tab.update(cx, |t, cx| {
+        let generation = t.begin_run(target.clone(), prefixed.clone(), cx);
+        t.apply_plan(generation, &plan, cx);
+    });
+    let canceller: Arc<Mutex<Option<TaskCanceller>>> = Arc::default();
+    let (weak, conn) = (tab.downgrade(), Arc::clone(conn));
+    let task_tab = weak.clone();
+    let (task_canceller, task_sql) = (Arc::clone(&canceller), prefixed);
+    let id = tab.entity_id();
+    let generation = tab.read(cx).results().generation();
+    let task = cx.spawn(async move |cx| {
+        let mut stream = match conn.run(&task_sql, &[], RunOptions::gui()).await {
+            Ok(stream) => stream,
+            Err(err) => {
+                let _ = task_tab.update(cx, |t, cx| t.fail_run(generation, &err, cx));
+                return;
+            }
+        };
+        if let Ok(mut slot) = task_canceller.lock() {
+            *slot = Some(stream.canceller());
+        }
+        let mut failure = None;
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(event) => {
+                    if task_tab
+                        .update(cx, |t, cx| t.apply_event(generation, event, cx))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    failure = Some(err);
+                    break;
+                }
+            }
+        }
+        let record_error = stream.record_error().map(str::to_owned);
+        let _ = task_tab.update(cx, |t, cx| {
+            match failure {
+                Some(err) => t.fail_run(generation, &err, cx),
+                None => t.finish_run(generation, cx),
+            }
+            t.set_record_error(generation, record_error, cx);
+        });
+    });
+    runs.borrow_mut()
+        .retain(|_, run| run.tab.upgrade().is_some());
+    runs.borrow_mut().insert(
+        id,
+        QueryRun {
+            _task: task,
+            tab: weak,
+            canceller,
+            generation,
+        },
+    );
+}
+
+/// The plan query for this engine. SQLite spells it `EXPLAIN QUERY PLAN`; PostgreSQL and MySQL take
+/// a bare `EXPLAIN`, and MySQL needs `FORMAT=JSON` avoided so the output stays rows.
+fn explain_prefix(kind: DbKind, sql: &str) -> String {
+    match kind {
+        DbKind::Sqlite => format!("EXPLAIN QUERY PLAN {sql}"),
+        _ => format!("EXPLAIN {sql}"),
+    }
+}
+
+// ---- snippets ----------------------------------------------------------------------------------
+
+/// Load the snippets visible for this connection (its own plus the global ones).
+fn load_snippets(
+    service: &Service,
+    conn: &Arc<OpenConnection>,
+    view: &Entity<WorkspaceView>,
+    cx: &mut App,
+) {
+    let (service, id, view) = (service.clone(), conn.id().clone(), view.downgrade());
+    cx.spawn(async move |cx| {
+        let stored = service.snippets(Some(&id)).await.unwrap_or_default();
+        let mut readable = Vec::new();
+        let mut unreadable = Vec::new();
+        for entry in stored {
+            match entry {
+                fg_store::StoredSnippet::Ok(snippet) => readable.push(snippet),
+                fg_store::StoredSnippet::Unreadable { id, .. } => unreadable.push(id),
+            }
+        }
+        let _ = view.update(cx, |v, cx| v.set_snippets(readable, unreadable, cx));
+    })
+    .detach();
+}
+
+/// Save a snippet, then refresh the panel so the list shows it.
+fn save_snippet(
+    service: &Service,
+    conn: &Arc<OpenConnection>,
+    view: &Entity<WorkspaceView>,
+    title: String,
+    sql: String,
+    cx: &mut App,
+) {
+    let now = UnixMillis::now();
+    let snippet = fg_core::Snippet {
+        id: fg_core::SnippetId::new(),
+        connection_id: Some(conn.id().clone()),
+        title,
+        sql,
+        tags: Vec::new(),
+        sort_order: 0,
+        created_at: now,
+        updated_at: now,
+    };
+    let (service, view) = (service.clone(), view.downgrade());
+    let conn = Arc::clone(conn);
+    cx.spawn(async move |cx| {
+        let _ = service.save_snippet(snippet).await;
+        // The panel's list comes from the store, so reload instead of patching it locally.
+        let _ = view.update(cx, |v, cx| {
+            v.request_snippets(cx);
+        });
+        let _ = conn;
+    })
+    .detach();
+}
+
+fn delete_snippet(
+    service: &Service,
+    conn: &Arc<OpenConnection>,
+    view: &Entity<WorkspaceView>,
+    id: fg_core::SnippetId,
+    cx: &mut App,
+) {
+    let (service, view) = (service.clone(), view.downgrade());
+    let conn = Arc::clone(conn);
+    cx.spawn(async move |cx| {
+        let _ = service.delete_snippet(&id).await;
+        let _ = view.update(cx, |v, cx| v.request_snippets(cx));
+        let _ = conn;
     })
     .detach();
 }

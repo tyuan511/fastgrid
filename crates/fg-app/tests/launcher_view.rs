@@ -511,3 +511,80 @@ fn selecting_another_row_cancels_a_pending_delete(cx: &mut TestAppContext) {
         "the question was about a different row"
     );
 }
+
+#[gpui_kit::test]
+fn right_clicking_a_row_opens_context_menu_and_allows_connecting(cx: &mut TestAppContext) {
+    let (a, b) = (row("alpha", true), row("beta", true));
+    let f = open(cx, vec![a.clone(), b.clone()]);
+    assert_eq!(selected(cx, &f), Some(a.id.clone()));
+
+    // Right-clicking b selects b and opens popup-menu
+    cx.update_window(f.window, |_, window, cx| {
+        window.right_click(row_id(&b), cx);
+    })
+    .unwrap();
+    assert_eq!(selected(cx, &f), Some(b.id.clone()));
+    assert!(exists(cx, &f, "popup-menu"));
+
+    // Item 0 is "Connect" / "Open"
+    cx.update_window(f.window, |_, window, cx| {
+        window.within("popup-menu").click(0usize, cx);
+    })
+    .unwrap();
+    assert_eq!(*f.events.borrow(), vec![LauncherEvent::Open(b.id.clone())]);
+}
+
+#[gpui_kit::test]
+fn right_clicking_a_row_allows_deleting_via_context_menu(cx: &mut TestAppContext) {
+    let (a, b) = (row("alpha", true), row("beta", true));
+    let f = open(cx, vec![a.clone(), b.clone()]);
+
+    // Right-clicking b selects b and opens context menu
+    cx.update_window(f.window, |_, window, cx| {
+        window.right_click(row_id(&b), cx);
+    })
+    .unwrap();
+    assert!(exists(cx, &f, "popup-menu"));
+
+    // Selecting Delete (item 5: Open, Sep, Edit, Duplicate, Sep, Delete)
+    cx.update_window(f.window, |_, window, cx| {
+        window.within("popup-menu").click(5usize, cx);
+    })
+    .unwrap();
+    assert!(exists(cx, &f, "confirm-delete"));
+    click(cx, &f, "confirm-delete-yes");
+    assert_eq!(
+        *f.events.borrow(),
+        vec![LauncherEvent::Delete(b.id.clone())]
+    );
+}
+
+#[gpui_kit::test]
+fn right_clicking_a_row_allows_duplicating_via_context_menu(cx: &mut TestAppContext) {
+    let r = row("shop", true);
+    let f = open(cx, vec![r.clone()]);
+
+    cx.update_window(f.window, |_, window, cx| {
+        window.right_click(row_id(&r), cx);
+    })
+    .unwrap();
+    assert!(exists(cx, &f, "popup-menu"));
+
+    // Item 3 is Duplicate (item 0: Open, 1: Sep, 2: Edit, 3: Duplicate, 4: Sep, 5: Delete)
+    cx.update_window(f.window, |_, window, cx| {
+        window.within("popup-menu").click(3usize, cx);
+    })
+    .unwrap();
+
+    let configs = saved(&f);
+    assert_eq!(configs.len(), 1);
+    assert_ne!(configs[0].id, r.id);
+    assert_eq!(configs[0].name, "shop copy");
+}
+
+#[gpui_kit::test]
+fn window_drag_regions_exist_on_sidebar_and_top_bar(cx: &mut TestAppContext) {
+    let f = open(cx, vec![]);
+    assert!(exists(cx, &f, "launcher-sidebar"));
+    assert!(exists(cx, &f, "launcher-top-bar"));
+}

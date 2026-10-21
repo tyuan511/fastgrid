@@ -8,9 +8,17 @@
 
 mod browse;
 mod classify;
-mod lex;
+mod comments;
+mod format;
+pub mod lex;
 mod split;
 
 pub use browse::{BuildOptions, BuiltQuery, build_count, build_select, validate_raw_where};
 pub use classify::{Analysis, StatementInfo, analyze, classify};
+pub use comments::{CommentEdit, toggle_line_comments};
+pub use format::{format_sql, is_formatted};
 pub use split::{StatementSpan, split_statements, statement_at};
+// The token stream, for `fg-lsp`: scope analysis needs to know where strings, comments and
+// identifiers begin and end, and duplicating a tolerant lexer would be a second source of truth.
+// `Flavor`/`Kind`/`Token` stay `pub(crate)`-ish in spirit: the module is public, the internals are
+// only as public as they have to be.

@@ -123,22 +123,22 @@ fn paging_buttons_follow_what_is_known(cx: &mut TestAppContext) {
     let f = open(cx);
     // 300 of 1000: more pages ahead, none behind.
     load(cx, &f, 300, Some(1000));
-    assert!(disabled(cx, &f, "page-prev"));
-    assert!(!disabled(cx, &f, "page-next"));
-    assert!(disabled(cx, &f, "page-first"));
-    assert!(!disabled(cx, &f, "page-last"));
+    assert!(disabled(cx, &f, "grid-page-prev"));
+    assert!(!disabled(cx, &f, "grid-page-next"));
+    assert!(disabled(cx, &f, "grid-page-first"));
+    assert!(!disabled(cx, &f, "grid-page-last"));
 
     // A short result is the whole table.
     load(cx, &f, 12, Some(12));
-    assert!(disabled(cx, &f, "page-next"));
-    assert!(disabled(cx, &f, "page-last"));
+    assert!(disabled(cx, &f, "grid-page-next"));
+    assert!(disabled(cx, &f, "grid-page-last"));
 }
 
 #[gpui_kit::test]
 fn next_page_moves_the_offset_and_asks_for_a_reload(cx: &mut TestAppContext) {
     let f = open(cx);
     load(cx, &f, 300, Some(1000));
-    cx.update_window(f.window, |_, window, cx| window.click("page-next", cx))
+    cx.update_window(f.window, |_, window, cx| window.click("grid-page-next", cx))
         .unwrap();
     assert_eq!(*f.events.borrow(), vec![TableTabEvent::Reload]);
     cx.update_window(f.window, |_, _, cx| {
@@ -147,7 +147,7 @@ fn next_page_moves_the_offset_and_asks_for_a_reload(cx: &mut TestAppContext) {
     .unwrap();
 
     // Back and forth.
-    cx.update_window(f.window, |_, window, cx| window.click("page-prev", cx))
+    cx.update_window(f.window, |_, window, cx| window.click("grid-page-prev", cx))
         .unwrap();
     assert_eq!(f.events.borrow().len(), 2);
     cx.update_window(f.window, |_, _, cx| {
@@ -161,8 +161,8 @@ fn disabled_paging_buttons_do_nothing(cx: &mut TestAppContext) {
     let f = open(cx);
     load(cx, &f, 12, Some(12));
     cx.update_window(f.window, |_, window, cx| {
-        window.click("page-next", cx);
-        window.click("page-prev", cx);
+        window.click("grid-page-next", cx);
+        window.click("grid-page-prev", cx);
     })
     .unwrap();
     assert!(f.events.borrow().is_empty());
@@ -191,7 +191,7 @@ fn changing_the_page_size_reloads_and_keeps_the_first_visible_row(cx: &mut TestA
 fn sorting_resets_to_the_first_page_and_reloads(cx: &mut TestAppContext) {
     let f = open(cx);
     load(cx, &f, 300, Some(1000));
-    cx.update_window(f.window, |_, window, cx| window.click("page-next", cx))
+    cx.update_window(f.window, |_, window, cx| window.click("grid-page-next", cx))
         .unwrap();
     cx.update_window(f.window, |_, window, cx| {
         f.view.update(cx, |v, cx| v.toggle_sort("name", cx));
@@ -270,7 +270,7 @@ fn a_failed_load_shows_the_error_and_clears_the_spinner(cx: &mut TestAppContext)
 fn while_loading_the_status_does_not_describe_stale_rows(cx: &mut TestAppContext) {
     let f = open(cx);
     load(cx, &f, 300, Some(1000));
-    cx.update_window(f.window, |_, window, cx| window.click("page-next", cx))
+    cx.update_window(f.window, |_, window, cx| window.click("grid-page-next", cx))
         .unwrap();
     // The query now points at page 2 but its rows have not arrived: the old rows are still shown.
     cx.update_window(f.window, |_, window, cx| {
@@ -360,7 +360,7 @@ fn adding_a_rule_typing_a_value_and_applying_filters_the_grid(cx: &mut TestAppCo
 fn applying_returns_to_the_first_page(cx: &mut TestAppContext) {
     let f = open(cx);
     load(cx, &f, 300, Some(1000));
-    cx.update_window(f.window, |_, window, cx| window.click("page-next", cx))
+    cx.update_window(f.window, |_, window, cx| window.click("grid-page-next", cx))
         .unwrap();
     cx.update_window(f.window, |_, window, cx| {
         window.click("filters-toggle", cx);
