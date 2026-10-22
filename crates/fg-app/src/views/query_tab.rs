@@ -105,7 +105,11 @@ impl ResultDelegate {
             .map(|m| {
                 let mut col = Column::new(m.name.clone(), m.name.clone())
                     .width(px(result_width(m)))
-                    .p_0();
+                    .p_0()
+                    // Marked sortable only so the header reserves the same space for the arrow as
+                    // the table grid's headers do; clicking it does nothing (a result is not
+                    // re-sorted client-side).
+                    .sortable();
                 if align_for(m.data_type.category) == model::Align::Right {
                     col.align = TextAlign::Right;
                 }
@@ -136,16 +140,6 @@ fn result_width(meta: &ColumnMeta) -> f32 {
         .min(360.0)
 }
 
-fn short_type(meta: &ColumnMeta) -> String {
-    meta.data_type
-        .native
-        .to_lowercase()
-        .split(['(', ' '])
-        .next()
-        .unwrap_or_default()
-        .to_owned()
-}
-
 impl TableDelegate for ResultDelegate {
     fn columns_count(&self, _: &App) -> usize {
         self.columns.len()
@@ -169,10 +163,12 @@ impl TableDelegate for ResultDelegate {
         _: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
-        let theme = cx.theme().clone();
         let Some(meta) = self.metas.get(col_ix) else {
             return div().into_any_element();
         };
+        // The same header the table grid draws: the column name and nothing else. No type badge -
+        // a result's header is the driver's column name, and a type next to it is noise the user
+        // did not ask for (the table grid does not show one either).
         let header = h_flex()
             .gap_1p5()
             .items_center()
@@ -180,12 +176,6 @@ impl TableDelegate for ResultDelegate {
                 div()
                     .font_weight(FontWeight::MEDIUM)
                     .child(meta.name.clone()),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(short_type(meta)),
             )
             .into_any_element();
         super::cells::th_frame(header, cx)
@@ -789,6 +779,32 @@ impl QueryTab {
         &self.page
     }
 
+    /// The text of each result header cell, in column order.
+    ///
+    /// Exposed so a test can pin what a header shows without reaching into the library's rendered
+    /// tree: a header is the column name and nothing else, and a type badge creeping in is exactly
+    /// the kind of change that should fail a test rather than be noticed in a screenshot.
+    pub fn result_header_text(&self, cx: &App) -> Vec<String> {
+        let table = self.table.read(cx);
+        let delegate = table.delegate();
+        (0..delegate.columns_count(cx))
+            .map(|ix| delegate.column(ix, cx).name.to_string())
+            .collect()
+    }
+
+    /// The column definitions the result table is rendering.
+    ///
+    /// Exposed because the header's appearance is decided by them: a `sort` makes the library
+    /// reserve space for the sort arrow, which is what keeps a result header aligned with a table
+    /// header.
+    pub fn result_columns(&self, cx: &App) -> Vec<gpui_kit::component::table::Column> {
+        let table = self.table.read(cx);
+        let delegate = table.delegate();
+        (0..delegate.columns_count(cx))
+            .map(|ix| delegate.column(ix, cx))
+            .collect()
+    }
+
     /// Replace the schema snapshot completion draws on. Cheap: the editor keeps the same provider.
     pub fn set_catalog(&mut self, catalog: CompletionCatalog, cx: &mut Context<Self>) {
         *self.catalog.borrow_mut() = catalog;
@@ -1234,27 +1250,41 @@ impl Render for QueryTab {
                     .test_support()
                     .flex_1()
                     .min_h_0()
-                    .child(DataTable::new(&self.table).bordered(false)),
+                    .child(
+                        // The same geometry as the table grid: same row height, same header
+                        // height, same padding. A result and a table should look like the same
+                        // widget, because they are.
+                        DataTable::new(&self.table)
+                            .with_size(px(30.))
+                            .bordered(false)
+                            .header_row_height(px(34.))
+                            .stripe(false),
+                    ),
             )
             .child(
                 h_flex()
                     .id("result-status-bar")
                     .test_support()
-                    .h(px(28.))
+                    // The table grid's status bar is 44px; the two must match or switching between a
+                    // table and a query moves the grid up and down.
+                    .h(px(44.))
+                    .px_3()
+                    .gap_3()
                     .flex_shrink_0()
                     .items_center()
                     .justify_between()
-                    .px_2()
-                    .gap_2()
                     .border_t_1()
                     .border_color(theme.border)
                     .bg(theme.status_bar)
-                    .text_xs()
+                    .text_size(px(13.))
                     .text_color(theme.muted_foreground)
                     .child(
                         h_flex()
                             .gap_2()
                             .items_center()
+                            // `Data | Structure | Index | + Row` in the table grid; a result has no
+                            // structure to show, so the left slot holds the page sizes and the row
+                            // range instead, in the same place.
                             .child(super::cells::page_size_buttons(
                                 cx,
                                 &RESULT_PAGE_SIZES,

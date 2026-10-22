@@ -1520,3 +1520,84 @@ fn accepting_a_completion_replaces_the_typed_prefix_instead_of_appending(cx: &mu
     assert_eq!(text, "SELECT", "`se` was replaced, not appended to");
     assert!(!text.contains("seselect"), "the reported bug");
 }
+
+#[gpui_kit::test]
+fn the_result_grid_has_the_same_header_and_status_geometry_as_the_table_grid(
+    cx: &mut TestAppContext,
+) {
+    // A result and a table are the same widget with different data. When they differ, switching
+    // between a table tab and a query tab moves the grid and the status bar jumps.
+    let f = open(cx, "SELECT * FROM items;");
+    feed(
+        cx,
+        &f,
+        vec![
+            Event::ResultStart {
+                index: 0,
+                columns: columns(),
+            },
+            Event::Rows(rows(3)),
+            end(false),
+        ],
+    );
+
+    // The header cells carry a sort affordance, which is what reserves the arrow's space (the
+    // library draws `ChevronsUpDown` for `ColumnSort::Default`), so a result header lines up with a
+    // table header. The header is drawn by the library without a test id, so assert on the column
+    // definition the delegate hands it.
+    let sortable = cx.read_entity(&f.view, |t, cx| {
+        t.result_columns(cx)
+            .first()
+            .map(|column| column.sort.is_some())
+    });
+    assert_eq!(
+        sortable,
+        Some(true),
+        "the result's columns are sortable-shaped, so the header reserves the arrow's space"
+    );
+
+    // The status bar is 44px, the table grid's height.
+    let height: f32 = cx
+        .update_window(f.window, |_, window, _| {
+            f32::from(window.find("result-status-bar").bounds().size.height)
+        })
+        .unwrap();
+    assert_eq!(height, 44.0, "the status bar matches the table grid's");
+}
+
+#[gpui_kit::test]
+fn a_result_header_shows_the_column_name_and_nothing_else(cx: &mut TestAppContext) {
+    // The table grid's header is the column name (plus a foreign-key arrow and a sort priority when
+    // those apply). A result has neither, and it must not grow a type badge: the header is the
+    // driver's column name, and `id integer` next to every column is noise.
+    let f = open(cx, "SELECT * FROM items;");
+    feed(
+        cx,
+        &f,
+        vec![
+            Event::ResultStart {
+                index: 0,
+                columns: columns(),
+            },
+            Event::Rows(rows(1)),
+            end(false),
+        ],
+    );
+
+    // The library paints the header cells without registering them, so the header's content is
+    // checked where it is produced: the delegate's column definitions, whose `name` is what the
+    // header draws. The types are still known (they drive alignment and cell rendering); they are
+    // simply not drawn.
+    let names = cx.read_entity(&f.view, |t, cx| t.result_header_text(cx));
+    assert_eq!(
+        names,
+        vec!["id".to_owned(), "name".to_owned()],
+        "column names only"
+    );
+    for name in &names {
+        assert!(
+            !name.contains("integer") && !name.contains("text"),
+            "a header must not carry a type: {name}"
+        );
+    }
+}

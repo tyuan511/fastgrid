@@ -991,6 +991,15 @@ fn to_items(
         .collect()
 }
 
+/// Toolbar height. The stock [`TitleBar`] height (34 px) left the toolbar icons cramped;
+/// 44 px gives the icon buttons a comfortable hit area.
+const TOOLBAR_HEIGHT: Pixels = px(44.);
+
+/// Hit box for the toolbar's icon-only buttons: gpui-kit renders the icon at 75% of the
+/// box, so a 24 px box yields the 18 px icons the toolbar settled on (stock `Small` is
+/// 14 px, `Medium` 16 px, `Large` 24 px).
+const TOOLBAR_ICON_BOX: Pixels = px(24.);
+
 impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
@@ -1033,7 +1042,7 @@ impl Render for WorkspaceView {
             move || div().w(px(2.)).h(px(14.)).bg(color.opacity(0.0))
         };
 
-        let title = TitleBar::new().child(
+        let title = TitleBar::new().h(TOOLBAR_HEIGHT).child(
             h_flex()
                 .w_full()
                 .gap_2()
@@ -1044,23 +1053,16 @@ impl Render for WorkspaceView {
                         .gap_2()
                         .items_center()
                         .child(
-                            capsule()
-                                .child(
-                                    Button::new("toggle-sidebar")
-                                        .icon(hugeicon(Hugeicon::SidebarLeft))
-                                        .ghost()
-                                        .small()
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)),
-                                        ),
-                                )
-                                .child(divider())
-                                .child(
-                                    Button::new("connections-btn")
-                                        .icon(hugeicon(Hugeicon::Plug))
-                                        .ghost()
-                                        .small(),
-                                ),
+                            capsule().child(
+                                Button::new("toggle-sidebar")
+                                    .icon(hugeicon(Hugeicon::SidebarLeft))
+                                    .ghost()
+                                    .with_size(TOOLBAR_ICON_BOX)
+                                    .tooltip("Toggle sidebar")
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)),
+                                    ),
+                            ),
                         )
                         .child(
                             capsule()
@@ -1068,7 +1070,7 @@ impl Render for WorkspaceView {
                                     Button::new("stop-btn")
                                         .icon(hugeicon(Hugeicon::CircleX))
                                         .ghost()
-                                        .small()
+                                        .with_size(TOOLBAR_ICON_BOX)
                                         .tooltip("Cancel the running statement")
                                         .when(!self.active_query_running(cx), |b| b.disabled(true))
                                         .on_click(cx.listener(|this, _, _, cx| {
@@ -1080,17 +1082,10 @@ impl Render for WorkspaceView {
                                 )
                                 .child(divider())
                                 .child(
-                                    Button::new("preview-btn")
-                                        .icon(hugeicon(Hugeicon::View))
-                                        .ghost()
-                                        .small(),
-                                )
-                                .child(divider())
-                                .child(
                                     Button::new("history-btn")
                                         .icon(hugeicon(Hugeicon::History))
                                         .ghost()
-                                        .small()
+                                        .with_size(TOOLBAR_ICON_BOX)
                                         .tooltip("Query history")
                                         .when(self.history.is_some(), |b| b.primary())
                                         .on_click(cx.listener(|this, _, window, cx| {
@@ -1108,7 +1103,7 @@ impl Render for WorkspaceView {
                                             Hugeicon::Unlock
                                         }))
                                         .ghost()
-                                        .small()
+                                        .with_size(TOOLBAR_ICON_BOX)
                                         .tooltip(format!(
                                             "Safe mode: {}",
                                             safe_mode_label(self.safe_mode)
@@ -1122,121 +1117,82 @@ impl Render for WorkspaceView {
                                 )
                                 .child(divider())
                                 .child(
-                                    Button::new("database-btn")
-                                        .icon(hugeicon(Hugeicon::Database))
-                                        .ghost()
-                                        .small(),
-                                )
-                                .child(divider())
-                                .child(
                                     Button::new("sql-console")
+                                        .icon(hugeicon(Hugeicon::Terminal))
                                         .ghost()
-                                        .small()
+                                        .with_size(TOOLBAR_ICON_BOX)
+                                        .tooltip("New query")
                                         .on_click(cx.listener(|_, _, _, cx| {
                                             cx.emit(WorkspaceEvent::NewQueryRequested)
-                                        }))
-                                        .child(
-                                            div()
-                                                .text_size(px(14.))
-                                                .font_weight(FontWeight::BOLD)
-                                                .text_color(theme.foreground)
-                                                .child("SQL"),
-                                        ),
+                                        })),
                                 ),
-                        )
-                        .child(
-                            h_flex()
-                                .id("connection-pill")
-                                .test_support()
-                                .aria_label(self.config.name.clone())
-                                .gap_2()
-                                .ml_1()
-                                .px_3()
-                                .py_1()
-                                .items_center()
-                                .rounded_full()
-                                .bg(theme.muted)
-                                .text_size(px(13.))
-                                .text_color(theme.muted_foreground)
-                                .child(div().size_2().rounded_full().bg(env_color))
-                                .child(
-                                    div()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(theme.foreground)
-                                        .child(self.config.name.clone()),
-                                )
-                                .child(div().opacity(0.5).child("/"))
-                                .child(breadcrumb_text),
                         ),
                 )
+                // The connection info owns the remaining width and centers itself,
+                // so it reads as the window's title instead of a left-over pill.
                 .child(
-                    h_flex()
-                        .gap_2()
-                        .items_center()
+                    h_flex().flex_1().min_w_0().justify_center().child(
+                        h_flex()
+                            .id("connection-pill")
+                            .test_support()
+                            .aria_label(self.config.name.clone())
+                            .gap_2()
+                            .px_3()
+                            .py_1()
+                            .items_center()
+                            .rounded_full()
+                            .bg(theme.muted)
+                            .text_size(px(13.))
+                            .text_color(theme.muted_foreground)
+                            .child(div().size_2().rounded_full().bg(env_color))
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme.foreground)
+                                    .child(self.config.name.clone()),
+                            )
+                            .child(div().opacity(0.5).child("/"))
+                            .child(breadcrumb_text),
+                    ),
+                )
+                .child(
+                    capsule()
                         .child(
-                            capsule()
-                                .child(
-                                    Button::new("info-btn")
-                                        .icon(hugeicon(Hugeicon::Alert).text_color(theme.warning))
-                                        .ghost()
-                                        .small(),
-                                )
-                                .child(divider())
-                                .child(
-                                    Button::new("chart-btn")
-                                        .icon(hugeicon(Hugeicon::Chart))
-                                        .ghost()
-                                        .small(),
-                                )
-                                .child(divider())
-                                .child(
-                                    Button::new("refresh-schema")
-                                        .icon(hugeicon(Hugeicon::Refresh))
-                                        .ghost()
-                                        .small()
-                                        .on_click(cx.listener(|_, _, _, cx| {
-                                            cx.emit(WorkspaceEvent::RefreshSchema)
-                                        })),
-                                )
-                                .child(divider())
-                                .child(
-                                    Button::new("cycle-theme")
-                                        .icon(match crate::theme_control::chosen(cx) {
-                                            fg_core::ThemeMode::Light => hugeicon(Hugeicon::Sun),
-                                            fg_core::ThemeMode::Dark => hugeicon(Hugeicon::Moon),
-                                            _ => hugeicon(Hugeicon::Command),
-                                        })
-                                        .ghost()
-                                        .small()
-                                        .tooltip(format!(
-                                            "Theme: {}",
-                                            crate::theme_control::label(
-                                                crate::theme_control::chosen(cx)
-                                            )
-                                        ))
-                                        .on_click(cx.listener(|_, _, _, cx| {
-                                            cx.emit(WorkspaceEvent::CycleTheme)
-                                        })),
+                            Button::new("refresh-schema")
+                                .icon(hugeicon(Hugeicon::Refresh))
+                                .ghost()
+                                .with_size(TOOLBAR_ICON_BOX)
+                                .tooltip("Refresh schema")
+                                .on_click(cx.listener(|_, _, _, cx| {
+                                    cx.emit(WorkspaceEvent::RefreshSchema)
+                                })),
+                        )
+                        .child(divider())
+                        .child(
+                            Button::new("cycle-theme")
+                                .icon(match crate::theme_control::chosen(cx) {
+                                    fg_core::ThemeMode::Light => hugeicon(Hugeicon::Sun),
+                                    fg_core::ThemeMode::Dark => hugeicon(Hugeicon::Moon),
+                                    _ => hugeicon(Hugeicon::Command),
+                                })
+                                .ghost()
+                                .with_size(TOOLBAR_ICON_BOX)
+                                .tooltip(format!(
+                                    "Theme: {}",
+                                    crate::theme_control::label(crate::theme_control::chosen(cx))
+                                ))
+                                .on_click(
+                                    cx.listener(|_, _, _, cx| cx.emit(WorkspaceEvent::CycleTheme)),
                                 ),
                         )
+                        .child(divider())
                         .child(
-                            capsule()
-                                .child(
-                                    Button::new("toggle-bottom")
-                                        .icon(hugeicon(Hugeicon::PanelBottom))
-                                        .ghost()
-                                        .small(),
-                                )
-                                .child(divider())
-                                .child(
-                                    Button::new("toggle-details")
-                                        .icon(hugeicon(Hugeicon::SidebarRight))
-                                        .ghost()
-                                        .small()
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| this.toggle_details(cx)),
-                                        ),
-                                ),
+                            Button::new("toggle-details")
+                                .icon(hugeicon(Hugeicon::SidebarRight))
+                                .ghost()
+                                .with_size(TOOLBAR_ICON_BOX)
+                                .tooltip("Toggle details panel")
+                                .on_click(cx.listener(|this, _, _, cx| this.toggle_details(cx))),
                         ),
                 ),
         );
@@ -1967,25 +1923,24 @@ impl WorkspaceView {
                     .aria_label(title.clone())
                     .group("tab")
                     .relative()
-                    .h_full()
+                    .h_8()
                     .min_w(px(120.))
                     .max_w(px(240.))
                     .flex_shrink_0()
-                    .pl_4()
+                    .pl_3()
                     .pr_8()
                     .gap_2()
                     .items_center()
-                    .border_b_2()
-                    .text_size(px(14.))
+                    .rounded_md()
+                    .text_size(px(13.))
                     .cursor_pointer()
                     .when(is_active, |d| {
-                        d.border_color(theme.primary)
+                        d.bg(theme.background)
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(theme.foreground)
                     })
                     .when(!is_active, |d| {
-                        d.border_color(gpui::transparent_black())
-                            .text_color(theme.muted_foreground)
+                        d.text_color(theme.muted_foreground)
                             .hover(move |s| s.bg(hover_bg).text_color(hover_fg))
                     })
                     .child(hugeicon(tab_icon).size_4().text_color(if is_active {
@@ -2040,31 +1995,17 @@ impl WorkspaceView {
             h_flex()
                 .id("tab-strip")
                 .test_support()
-                .h(px(44.))
+                .h(px(40.))
                 .w_full()
                 .flex_shrink_0()
                 .overflow_hidden()
                 .px_2()
                 .gap_1()
-                .items_end()
+                .items_center()
                 .border_b_1()
                 .border_color(theme.border)
                 .bg(theme.tab_bar)
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .pr_2()
-                        .text_color(theme.muted_foreground)
-                        .child(hugeicon(Hugeicon::ArrowLeft).size_5())
-                        .child(hugeicon(Hugeicon::ArrowRight).size_5()),
-                )
                 .children(tabs)
-                .child(
-                    div()
-                        .pl_2()
-                        .text_color(theme.muted_foreground)
-                        .child(hugeicon(Hugeicon::SidebarRight).size_5()),
-                )
                 .into_any_element(),
         )
     }
@@ -2237,21 +2178,32 @@ impl WorkspaceView {
     }
 }
 
-/// Open a connection's window. Returns the window and its view so the caller can wire a
-/// controller to the view.
-pub fn open_workspace_window(
-    cx: &mut App,
-    config: ConnectionConfig,
-) -> Result<(AnyWindowHandle, Entity<WorkspaceView>), String> {
-    let options = WindowOptions {
+/// Window options for a connection window: the toolbar is taller than the stock title bar
+/// ([`TOOLBAR_HEIGHT`]), so the macOS traffic lights are re-centered to match.
+pub fn workspace_window_options(cx: &mut App) -> WindowOptions {
+    WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
             None,
             size(px(1280.), px(800.)),
             cx,
         ))),
         window_min_size: Some(size(px(800.), px(500.))),
+        titlebar: Some(TitlebarOptions {
+            title: None,
+            appears_transparent: true,
+            traffic_light_position: Some(point(px(9.0), (TOOLBAR_HEIGHT - px(12.)) / 2.0)),
+        }),
         ..TitleBar::window_options()
-    };
+    }
+}
+
+/// Open a connection's window. Returns the window and its view so the caller can wire a
+/// controller to the view.
+pub fn open_workspace_window(
+    cx: &mut App,
+    config: ConnectionConfig,
+) -> Result<(AnyWindowHandle, Entity<WorkspaceView>), String> {
+    let options = workspace_window_options(cx);
     gpui_kit::open_window(options, cx, |window, cx| {
         crate::theme_control::follow_system(window);
         crate::theme_control::compact_type(cx);
