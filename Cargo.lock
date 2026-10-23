@@ -1900,6 +1900,8 @@ dependencies = [
  "fg-store",
  "keyring",
  "rusqlite",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]

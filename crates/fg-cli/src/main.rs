@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use fg_lsp::Server;
 use fg_lsp::protocol::ServerConfig;
 use fg_mcp::McpServer;
-use fg_service::{KeychainKeyProvider, MemoryBackend, Service, ServiceOptions};
+use fg_service::{Service, ServiceOptions, default_key_provider};
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -97,17 +97,11 @@ fn data_dir() -> PathBuf {
 /// are audited. Requests are handled one at a time; a client that wants to cancel a long query
 /// relies on the statement timeout rather than a mid-call cancel.
 fn serve_mcp() -> io::Result<()> {
-    let mut options = ServiceOptions::new(data_dir().join("store.db"));
+    let data_dir = data_dir();
+    let mut options = ServiceOptions::new(data_dir.join("store.db"));
     options.force_read_only = true;
-    // Development and tests only, mirroring the GUI: the key then lives in this process alone.
-    let started = if std::env::var_os("FASTGRID_MEMORY_KEYCHAIN").is_some() {
-        Service::start(
-            options,
-            &KeychainKeyProvider::with_backend(MemoryBackend::default()),
-        )
-    } else {
-        Service::start(options, &KeychainKeyProvider::os())
-    };
+    let keys = default_key_provider(&data_dir);
+    let started = Service::start(options, keys.as_ref());
     let service = started.map_err(|e| io::Error::other(e.to_string()))?;
     let server = McpServer::new(service);
     let runtime = tokio::runtime::Builder::new_current_thread()

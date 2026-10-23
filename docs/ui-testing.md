@@ -42,7 +42,10 @@ fg-app/src/
 ## 手动运行应用
 
 ```bash
-# 真实窗口，数据放进临时目录，设备密钥只放内存（退出后数据不可再读，不碰系统钥匙串）
+# 开发模式默认直接运行（使用本地数据目录与 .dev-keyring.json，无需每次输入钥匙串密码，数据跨重启保留）：
+cargo run -p fg-app
+
+# 若需要临时数据目录且退出后不保留数据：
 FASTGRID_DATA_DIR=$(mktemp -d) FASTGRID_MEMORY_KEYCHAIN=1 cargo run -p fg-app
 ```
 

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use fg_app::app_state::AppState;
 use fg_core::Error;
-use fg_service::{KeychainKeyProvider, MemoryBackend, Service, ServiceOptions};
+use fg_service::{Service, ServiceOptions, default_key_provider};
 use gpui_kit::component::TitleBar;
 use gpui_kit::*;
 
@@ -18,17 +18,10 @@ fn data_dir() -> PathBuf {
 }
 
 fn main() {
-    let options = ServiceOptions::new(data_dir().join("store.db"));
-    // Development only: keep the device key in memory instead of the OS keychain, so a throwaway
-    // data directory leaves nothing behind. The store cannot be reopened afterwards.
-    let started = if std::env::var_os("FASTGRID_MEMORY_KEYCHAIN").is_some() {
-        Service::start(
-            options,
-            &KeychainKeyProvider::with_backend(MemoryBackend::default()),
-        )
-    } else {
-        Service::start(options, &KeychainKeyProvider::os())
-    };
+    let data_dir = data_dir();
+    let options = ServiceOptions::new(data_dir.join("store.db"));
+    let keys = default_key_provider(&data_dir);
+    let started = Service::start(options, keys.as_ref());
 
     gpui_kit::application()
         .with_assets(fg_app::views::FastgridAssets)

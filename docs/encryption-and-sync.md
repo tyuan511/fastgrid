@@ -29,6 +29,11 @@
 ### 设备密钥
 
 - 首次创建存储时随机生成，通过 `DeviceKeyProvider` 交给钥匙串（macOS Keychain / Windows Credential Manager / Secret Service）。应用层实现在 `fg-service`，`fg-store` 只依赖这个 trait。
+- **开发环境优化**：在开发构建（debug 模式或 `FASTGRID_DEV=1`）下，应用默认使用文件后端（`data_dir/.dev-keyring.json`，权限 `0600`）持久化设备密钥，若文件尚无条目则回落到系统钥匙串读取并自动缓存。这样既避免了本地开发重新编译后每次启动都被系统钥匙串弹窗请求密码，又保证了开发数据在多次重启间不丢失。生产构建（release）依然默认强制使用系统钥匙串。可通过环境变量覆盖：
+  - `FASTGRID_KEYCHAIN=memory` 或 `FASTGRID_MEMORY_KEYCHAIN=1`：纯内存模式，退出即丢弃。
+  - `FASTGRID_KEYCHAIN=os` 或 `FASTGRID_USE_OS_KEYCHAIN=1`：强制使用系统钥匙串。
+  - `FASTGRID_KEYCHAIN=file`：强制纯文件后端，不回退系统钥匙串。
+  - `FASTGRID_KEYCHAIN=dev`：文件后端并在未命中时回退系统钥匙串迁移。
 - 钥匙串的条目以 `store_id` 命名，所以把存储文件拷到另一台机器不会误用别的密钥。
 - 存储里有一条用设备密钥加密的**校验值**（`meta.key_check`）。启动时验证密钥是否匹配：
   - 钥匙串里没有 → `Error::KeyUnavailable`（重装系统、钥匙串被重置）。

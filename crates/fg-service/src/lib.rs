@@ -42,7 +42,10 @@ use tokio::sync::broadcast;
 pub use commit::CommitOutcome;
 pub use conn::{BrowseOptions, OpenConnection, Refresh};
 pub use fg_store::AuditFilter;
-pub use keychain::{KeychainKeyProvider, MemoryBackend, OsKeychain, SecretBackend, account_name};
+pub use keychain::{
+    DEV_KEYRING_FILE, FileBackend, KeychainKeyProvider, MemoryBackend, OsKeychain, SecretBackend,
+    account_name, default_key_provider,
+};
 pub use run::{PlannedStatement, PolicyRefusal, RunOptions, RunPlan, RunStream, plan};
 pub use task::{TaskCanceller, TaskStream};
 
