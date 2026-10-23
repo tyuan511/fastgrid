@@ -1065,7 +1065,7 @@ impl Render for QueryTab {
                                         Button::new("run-statement")
                                             .label("Run")
                                             .primary()
-                                            .xsmall()
+                                            .small()
                                             .on_click(cx.listener(|_, _, _, cx| {
                                                 cx.emit(QueryTabEvent::Run {
                                                     mode: RunMode::CurrentStatement,
@@ -1076,7 +1076,7 @@ impl Render for QueryTab {
                                         Button::new("run-all")
                                             .label("Run all")
                                             .ghost()
-                                            .xsmall()
+                                            .small()
                                             .on_click(cx.listener(|_, _, _, cx| {
                                                 cx.emit(QueryTabEvent::Run { mode: RunMode::All });
                                             })),
@@ -1086,7 +1086,7 @@ impl Render for QueryTab {
                                             Button::new("cancel-run")
                                                 .label("Cancel")
                                                 .danger()
-                                                .xsmall()
+                                                .small()
                                                 .on_click(cx.listener(|_, _, _, cx| {
                                                     cx.emit(QueryTabEvent::Cancel);
                                                 })),

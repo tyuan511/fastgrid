@@ -1275,6 +1275,7 @@ impl Launcher {
                                 .justify_end()
                                 .child(
                                     Button::new("editor-cancel")
+                                        .small()
                                         .label(if is_zh { "取消" } else { "Cancel" })
                                         .rounded(px(18.))
                                         .on_click(cx.listener(|this, _, window, cx| {
@@ -1283,6 +1284,7 @@ impl Launcher {
                                 )
                                 .child(
                                     Button::new("editor-save")
+                                        .small()
                                         .label(if is_zh { "保存" } else { "Save" })
                                         .primary()
                                         .rounded(px(18.))

@@ -356,7 +356,7 @@ impl Render for FilterDrawer {
                                             )))
                                             .icon(hugeicon(Hugeicon::Close))
                                             .ghost()
-                                            .xsmall()
+                                            .small()
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 this.remove_row(i, cx);
                                             })),
@@ -397,7 +397,7 @@ impl Render for FilterDrawer {
                         Button::new("filter-add")
                             .label("Add rule")
                             .icon(hugeicon(Hugeicon::Plus))
-                            .xsmall()
+                            .small()
                             .disabled(self.raw_mode || self.columns.is_empty())
                             .on_click(cx.listener(|this, _, window, cx| this.add_row(window, cx))),
                     )
@@ -408,7 +408,7 @@ impl Render for FilterDrawer {
                             } else {
                                 "Raw SQL"
                             })
-                            .xsmall()
+                            .small()
                             .on_click(cx.listener(|this, _, _, cx| {
                                 let raw = !this.raw_mode;
                                 this.set_raw_mode(raw, cx);
@@ -418,14 +418,14 @@ impl Render for FilterDrawer {
                     .child(
                         Button::new("filter-clear")
                             .label("Clear")
-                            .xsmall()
+                            .small()
                             .on_click(cx.listener(|this, _, _, cx| this.clear(cx))),
                     )
                     .child(
                         Button::new("filter-apply")
                             .label("Apply")
                             .primary()
-                            .xsmall()
+                            .small()
                             .on_click(cx.listener(|this, _, _, cx| this.apply(cx))),
                     ),
             )
