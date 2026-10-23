@@ -37,6 +37,9 @@ pub enum RowChange {
 pub struct DmlStatement {
     pub sql: String,
     pub params: Vec<Value>,
+    /// The same statement with the values written in, for showing a person what will run. Never
+    /// executed: the parameterised `sql` is what goes to the engine.
+    pub preview: String,
     /// Rows this statement must affect; `None` when any count is acceptable (inserts).
     pub expect_rows: Option<u64>,
 }
@@ -64,10 +67,27 @@ pub fn compile_changes(
 
 fn compile_one(table: &str, change: &RowChange, dialect: &dyn Dialect) -> Result<DmlStatement> {
     let mut params = Vec::new();
-    let mut bind = |v: &Value| {
+    let (sql, expect_rows) = build(table, change, dialect, &mut |v: &Value| {
         params.push(v.clone());
         dialect.placeholder(params.len())
-    };
+    })?;
+    let (preview, _) = build(table, change, dialect, &mut |v: &Value| literal(v))?;
+    Ok(DmlStatement {
+        sql,
+        params,
+        preview: format!("{preview};"),
+        expect_rows,
+    })
+}
+
+/// The statement text, with `bind` deciding what each value becomes (a placeholder, or for the
+/// preview a literal). One builder keeps the two spellings from drifting apart.
+fn build(
+    table: &str,
+    change: &RowChange,
+    dialect: &dyn Dialect,
+    bind: &mut dyn FnMut(&Value) -> String,
+) -> Result<(String, Option<u64>)> {
     match change {
         RowChange::Insert { cells } => {
             check_unique(cells.iter().map(|(c, _)| c.as_str()))?;
@@ -79,23 +99,18 @@ fn compile_one(table: &str, change: &RowChange, dialect: &dyn Dialect) -> Result
                 })
                 .collect();
             if set.is_empty() {
-                return Ok(DmlStatement {
-                    sql: dialect.insert_defaults(table),
-                    params,
-                    expect_rows: None,
-                });
+                return Ok((dialect.insert_defaults(table), None));
             }
             let names: Vec<_> = set.iter().map(|(c, _)| dialect.quote_ident(c)).collect();
             let marks: Vec<_> = set.iter().map(|(_, v)| bind(v)).collect();
-            Ok(DmlStatement {
-                sql: format!(
+            Ok((
+                format!(
                     "INSERT INTO {table} ({}) VALUES ({})",
                     names.join(", "),
                     marks.join(", ")
                 ),
-                params,
-                expect_rows: None,
-            })
+                None,
+            ))
         }
         RowChange::Update { key, cells } => {
             if cells.is_empty() {
@@ -118,20 +133,15 @@ fn compile_one(table: &str, change: &RowChange, dialect: &dyn Dialect) -> Result
                     }
                 }
             }
-            let filter = key_filter(key, dialect, &mut bind)?;
-            Ok(DmlStatement {
-                sql: format!("UPDATE {table} SET {} WHERE {filter}", sets.join(", ")),
-                params,
-                expect_rows: Some(1),
-            })
+            let filter = key_filter(key, dialect, bind)?;
+            Ok((
+                format!("UPDATE {table} SET {} WHERE {filter}", sets.join(", ")),
+                Some(1),
+            ))
         }
         RowChange::Delete { key } => {
-            let filter = key_filter(key, dialect, &mut bind)?;
-            Ok(DmlStatement {
-                sql: format!("DELETE FROM {table} WHERE {filter}"),
-                params,
-                expect_rows: Some(1),
-            })
+            let filter = key_filter(key, dialect, bind)?;
+            Ok((format!("DELETE FROM {table} WHERE {filter}"), Some(1)))
         }
     }
 }
@@ -141,7 +151,7 @@ fn compile_one(table: &str, change: &RowChange, dialect: &dyn Dialect) -> Result
 fn key_filter(
     key: &[(String, Value)],
     dialect: &dyn Dialect,
-    bind: &mut impl FnMut(&Value) -> String,
+    bind: &mut dyn FnMut(&Value) -> String,
 ) -> Result<String> {
     if key.is_empty() {
         return Err(Error::InvalidInput(
@@ -159,6 +169,47 @@ fn key_filter(
         parts.push(format!("{} = {}", dialect.quote_ident(column), bind(value)));
     }
     Ok(parts.join(" AND "))
+}
+
+/// A value written as SQL text, for the preview only. Long text is cut so a preview of a big cell
+/// stays readable.
+fn literal(v: &Value) -> String {
+    const MAX: usize = 200;
+    let quote = |s: &str| {
+        let shown: String = if s.chars().count() > MAX {
+            s.chars().take(MAX).chain("…".chars()).collect()
+        } else {
+            s.to_owned()
+        };
+        format!("'{}'", shown.replace('\'', "''"))
+    };
+    match v {
+        Value::Null => "NULL".into(),
+        Value::Bool(b) => if *b { "TRUE" } else { "FALSE" }.into(),
+        Value::Int(i) => i.to_string(),
+        Value::UInt(u) => u.to_string(),
+        Value::Float(f) if f.is_finite() => f.to_string(),
+        Value::Decimal(s) if s.parse::<f64>().is_ok() => s.clone(),
+        Value::Bytes(b) => format!(
+            "X'{}'",
+            b.iter()
+                .take(MAX)
+                .map(|x| format!("{x:02X}"))
+                .collect::<String>()
+        ),
+        Value::Float(f) => quote(&f.to_string()),
+        Value::Decimal(s)
+        | Value::Text(s)
+        | Value::Json(s)
+        | Value::Uuid(s)
+        | Value::Date(s)
+        | Value::Time(s)
+        | Value::Timestamp(s)
+        | Value::TimestampTz(s)
+        | Value::Interval(s) => quote(s),
+        Value::Other { text, .. } => quote(text),
+        _ => "'…'".into(),
+    }
 }
 
 fn check_unique<'a>(columns: impl Iterator<Item = &'a str>) -> Result<()> {
@@ -311,6 +362,54 @@ mod tests {
             Error::Unsupported(_)
         ));
         assert!(compile_changes(&users(), &[change], &MySqlDialect).is_ok());
+    }
+
+    #[test]
+    fn the_preview_writes_the_values_in_without_changing_the_statement() {
+        let out = compile_changes(
+            &users(),
+            &[
+                RowChange::Update {
+                    key: id(7),
+                    cells: vec![
+                        set("name", Value::Text("O'Brien ?".into())),
+                        set("n", Value::Null),
+                    ],
+                },
+                RowChange::Insert {
+                    cells: vec![set("data", Value::Bytes(vec![0, 255]))],
+                },
+            ],
+            &PostgresDialect,
+        )
+        .unwrap();
+        assert_eq!(
+            out[0].preview,
+            r#"UPDATE "users" SET "name" = 'O''Brien ?', "n" = NULL WHERE "id" = 7;"#
+        );
+        assert_eq!(
+            out[1].preview,
+            r#"INSERT INTO "users" ("data") VALUES (X'00FF');"#
+        );
+        // What is executed is still the parameterised text.
+        assert_eq!(
+            out[0].sql,
+            r#"UPDATE "users" SET "name" = $1, "n" = $2 WHERE "id" = $3"#
+        );
+        assert_eq!(out[0].params.len(), 3);
+    }
+
+    #[test]
+    fn a_question_mark_in_an_identifier_does_not_confuse_the_preview() {
+        let out = compile_changes(
+            &users(),
+            &[RowChange::Delete {
+                key: vec![("why?".into(), Value::Int(1))],
+            }],
+            &SqliteDialect,
+        )
+        .unwrap();
+        assert_eq!(out[0].preview, r#"DELETE FROM "users" WHERE "why?" = 1;"#);
     }
 
     #[test]
