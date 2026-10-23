@@ -10,8 +10,11 @@ use std::rc::Rc;
 
 use std::collections::{HashMap, HashSet};
 
-use fg_core::{ColumnMeta, Filter, FilterOp, ObjectPath, TableViewState, Value};
-use fg_sql::{CellChange, RowChange};
+use fg_core::{
+    ColumnMeta, DbKind, Filter, FilterOp, ObjectPath, TableViewState, Value, dialect_for,
+};
+use fg_sql::{CellChange, RowChange, compile_changes};
+use gpui_kit::base::actions::{SelectNextColumn, SelectPrevColumn};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -24,7 +27,7 @@ use gpui_kit::*;
 
 use super::actions::{
     BeginEdit, CELL_EDITOR_CONTEXT, CancelCellEdit, CommitChanges, CopySelection, GRID_CONTEXT,
-    InsertRow, RedoEdit, ToggleDeleteRow, UndoEdit,
+    InsertRow, PreviewChanges, RedoEdit, ToggleDeleteRow, UndoEdit,
 };
 use super::cells::{CellMark, CellSelection};
 use super::filter_drawer::{FilterDrawer, FilterDrawerEvent};
@@ -42,6 +45,8 @@ const GUTTER_WIDTH: f32 = 44.;
 type SortRequest = Rc<RefCell<Option<String>>>;
 /// A click on a foreign-key arrow: (row, column) of the cell.
 type JumpRequest = Rc<RefCell<Option<(usize, usize)>>>;
+/// A Tab / Shift+Tab pressed in the cell editor: the (columns, rows) to move after confirming.
+type MoveRequest = Rc<RefCell<Option<(i32, i32)>>>;
 
 /// The cell being edited in place: where it is, and the text box over it.
 struct CellEditor {
@@ -64,6 +69,7 @@ pub struct GridDelegate {
     /// Columns that can be followed to another table, by column name.
     jumps: HashMap<String, JumpTarget>,
     pending_jump: JumpRequest,
+    pending_move: MoveRequest,
     loading: bool,
     /// The selected (row, column) on screen, mirrored from the table so cells can paint it.
     selected: Option<(usize, usize)>,
@@ -75,7 +81,11 @@ pub struct GridDelegate {
 }
 
 impl GridDelegate {
-    fn new(pending_sort: SortRequest, pending_jump: JumpRequest) -> Self {
+    fn new(
+        pending_sort: SortRequest,
+        pending_jump: JumpRequest,
+        pending_move: MoveRequest,
+    ) -> Self {
         Self {
             metas: Vec::new(),
             hidden: HashSet::new(),
@@ -86,6 +96,7 @@ impl GridDelegate {
             pending_sort,
             jumps: HashMap::new(),
             pending_jump,
+            pending_move,
             loading: false,
             selected: None,
             key_columns: Vec::new(),
@@ -370,6 +381,20 @@ impl TableDelegate for GridDelegate {
                 .id("cell-editor")
                 .test_support()
                 .size_full()
+                .rounded_sm()
+                .bg(theme.background)
+                // Tab / Shift+Tab confirm and move sideways. The table binds them to its own
+                // "select next / previous column"; taking those actions here, on the box, keeps the
+                // table from moving the selection out from under a pending edit.
+                .on_action(cx.listener(|this, _: &SelectNextColumn, _, cx| {
+                    eprintln!("DBG next action");
+                    *this.delegate().pending_move.borrow_mut() = Some((1, 0));
+                    cx.notify();
+                }))
+                .on_action(cx.listener(|this, _: &SelectPrevColumn, _, cx| {
+                    *this.delegate().pending_move.borrow_mut() = Some((-1, 0));
+                    cx.notify();
+                }))
                 .child(
                     Input::new(&editor.input)
                         .id("cell-editor-input")
@@ -476,6 +501,9 @@ pub struct TableTab {
     generation: u64,
     /// A commit is running; a second `⌘S` is ignored until it answers.
     committing: bool,
+    /// The engine, to write the changes in its dialect for the SQL preview.
+    engine: Option<DbKind>,
+    preview_open: bool,
     _edit_subscription: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
 }
@@ -490,7 +518,12 @@ impl TableTab {
     pub fn with_query(query: GridQuery, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let pending: SortRequest = Rc::new(RefCell::new(None));
         let pending_jump: JumpRequest = Rc::new(RefCell::new(None));
-        let delegate = GridDelegate::new(Rc::clone(&pending), Rc::clone(&pending_jump));
+        let pending_move: MoveRequest = Rc::new(RefCell::new(None));
+        let delegate = GridDelegate::new(
+            Rc::clone(&pending),
+            Rc::clone(&pending_jump),
+            Rc::clone(&pending_move),
+        );
         let table = cx.new(|cx| {
             TableState::new(delegate, window, cx)
                 .cell_selectable(true)
@@ -504,7 +537,7 @@ impl TableTab {
             cx.emit(TableTabEvent::Reload);
             cx.notify();
         });
-        let observer = cx.observe(&table, move |this, table, cx| {
+        let observer = cx.observe_in(&table, window, move |this, table, window, cx| {
             // A click on a row number selects the whole row.
             if let TableSelection::Cell(row, col) = table.read(cx).selection()
                 && col < GUTTER
@@ -526,6 +559,22 @@ impl TableTab {
             if let Some(column) = clicked {
                 this.toggle_sort(&column, cx);
             }
+            // Selecting another cell (a click, an arrow key) while a box is open keeps what was
+            // typed, the way clicking away from a spreadsheet cell does.
+            let moved_away = this
+                .table
+                .read(cx)
+                .delegate()
+                .editing
+                .as_ref()
+                .is_some_and(|e| selected != Some((e.row_ix, e.screen_col)));
+            if moved_away {
+                this.finish_on_blur(window, cx);
+            }
+            let step = pending_move.borrow_mut().take();
+            if let Some((dx, dy)) = step {
+                this.commit_and_move(dx, dy, window, cx);
+            }
             let jump = pending_jump.borrow_mut().take();
             if let Some((row, col)) = jump {
                 this.follow_foreign_key(row, col, cx);
@@ -536,7 +585,7 @@ impl TableTab {
         let on_table =
             cx.subscribe_in(&table, window, |this, _, event: &TableEvent, window, cx| {
                 if let TableEvent::DoubleClickedCell(row, col) = event {
-                    this.begin_edit_at(*row, *col, window, cx);
+                    this.begin_edit_at(*row, *col, None, window, cx);
                 }
             });
         let initial = FilterDraft::from_applied(&query.filters, query.raw_where.as_deref());
@@ -556,6 +605,8 @@ impl TableTab {
             loaded_rows: 0,
             generation: 0,
             committing: false,
+            engine: None,
+            preview_open: false,
             _edit_subscription: None,
             _subscriptions: vec![observer, on_apply, on_table],
         }
@@ -689,6 +740,20 @@ impl TableTab {
             .and_then(Changeset::read_only_reason)
     }
 
+    /// The selected cell as (row, data column), counted like [`Self::select_cell`]: the
+    /// row-number gutter is not a column.
+    pub fn selected_cell(&self, cx: &App) -> Option<(usize, usize)> {
+        match self.table.read(cx).selection() {
+            TableSelection::Cell(r, c) => c.checked_sub(GUTTER).map(|c| (r, c)),
+            _ => None,
+        }
+    }
+
+    /// Give the grid the keyboard (what clicking a cell does).
+    pub fn focus_grid(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_table(window, cx);
+    }
+
     pub fn is_editing(&self, cx: &App) -> bool {
         self.table.read(cx).delegate().editing.is_some()
     }
@@ -736,14 +801,30 @@ impl TableTab {
     /// Open the selected cell for editing (`Enter`).
     pub fn begin_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let TableSelection::Cell(row, col) = self.table.read(cx).selection() {
-            self.begin_edit_at(row, col, window, cx);
+            self.begin_edit_at(row, col, None, window, cx);
         }
+    }
+
+    /// Typing on a selected cell starts editing it with what was typed, replacing the old value
+    /// (the spreadsheet way). Returns whether the key was taken.
+    fn type_to_edit(&mut self, typed: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        // Only when the grid itself has the keyboard: the filter drawer's text boxes sit inside
+        // this view and must keep their own keystrokes.
+        if !self.table.focus_handle(cx).is_focused(window) || self.is_editing(cx) {
+            return false;
+        }
+        let TableSelection::Cell(row, col) = self.table.read(cx).selection() else {
+            return false;
+        };
+        self.begin_edit_at(row, col, Some(typed.to_owned()), window, cx);
+        self.is_editing(cx)
     }
 
     fn begin_edit_at(
         &mut self,
         row: usize,
         screen_col: usize,
+        initial: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -762,12 +843,16 @@ impl TableTab {
             self.fail_edit("This row is marked for deletion; restore it first.", cx);
             return;
         }
-        let text = match d.shown_value(row, data_col) {
-            Value::Null => "NULL".to_owned(),
-            Value::Other { type_name, text } if type_name.is_empty() && text == "DEFAULT" => {
-                String::new()
-            }
-            other => copy_text(&other),
+        let replacing = initial.is_some();
+        let text = match initial {
+            Some(typed) => typed,
+            None => match d.shown_value(row, data_col) {
+                Value::Null => "NULL".to_owned(),
+                Value::Other { type_name, text } if type_name.is_empty() && text == "DEFAULT" => {
+                    String::new()
+                }
+                other => copy_text(&other),
+            },
         };
         let input = cx.new(|cx| {
             let mut state = InputState::new(window, cx);
@@ -777,14 +862,20 @@ impl TableTab {
         self._edit_subscription =
             Some(
                 cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
-                    if let InputEvent::PressEnter { .. } = event {
-                        this.commit_edit(window, cx);
+                    match event {
+                        // Enter confirms and moves down, like a spreadsheet.
+                        InputEvent::PressEnter { .. } => this.commit_and_move(0, 1, window, cx),
+                        // Clicking away keeps what was typed instead of throwing it away.
+                        InputEvent::Blur => this.finish_on_blur(window, cx),
+                        _ => {}
                     }
                 }),
             );
         input.update(cx, |state, cx| {
             state.focus(window, cx);
-            state.select_all(window, cx);
+            if !replacing {
+                state.select_all(window, cx);
+            }
         });
         self.error = None;
         self.table.update(cx, |t, cx| {
@@ -800,22 +891,22 @@ impl TableTab {
 
     /// Stage what is in the editor (`Enter`). A value that does not fit the column keeps the
     /// editor open with the reason, rather than staging something else.
-    pub fn commit_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn commit_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let d = self.table.read(cx).delegate();
         let Some(editor) = d.editing.as_ref() else {
-            return;
+            return true;
         };
         let (row, screen_col) = (editor.row_ix, editor.screen_col);
         let text = editor.input.read(cx).value().to_string();
         let Some(data_col) = d.data_index(screen_col) else {
-            return;
+            return false;
         };
         let category = d.metas[data_col].data_type.category;
         let value = match parse_cell_text(&text, category) {
             Ok(v) => v,
             Err(message) => {
                 self.fail_edit(message, cx);
-                return;
+                return false;
             }
         };
         let staged = self.table.update(cx, |t, cx| {
@@ -831,10 +922,54 @@ impl TableTab {
         match staged {
             Ok(()) => {
                 self.error = None;
+                self._edit_subscription = None;
                 self.focus_table(window, cx);
                 cx.notify();
+                true
             }
-            Err(message) => self.fail_edit(message, cx),
+            Err(message) => {
+                self.fail_edit(message, cx);
+                false
+            }
+        }
+    }
+
+    /// Stage the open edit, then move the selection: `(1, 0)` right, `(-1, 0)` left (wrapping to
+    /// the next / previous row), `(0, 1)` down. Stays put at the edge of the grid.
+    fn commit_and_move(&mut self, dx: i32, dy: i32, window: &mut Window, cx: &mut Context<Self>) {
+        let d = self.table.read(cx).delegate();
+        let Some((row, col)) = d
+            .editing
+            .as_ref()
+            .map(|e| (e.row_ix as i32, e.screen_col.saturating_sub(GUTTER) as i32))
+        else {
+            return;
+        };
+        let (rows, cols) = (d.total_rows() as i32, d.visible.len() as i32);
+        if !self.commit_edit(window, cx) {
+            return;
+        }
+        let (mut r, mut c) = (row + dy, col + dx);
+        if c >= cols {
+            (r, c) = (r + 1, 0);
+        } else if c < 0 {
+            (r, c) = (r - 1, cols - 1);
+        }
+        if (0..rows).contains(&r) && (0..cols).contains(&c) {
+            self.select_cell(r as usize, c as usize, cx);
+        }
+    }
+
+    /// The editor lost the keyboard (a click elsewhere). Keep a valid value; for an invalid one,
+    /// close the editor and say it was not saved, rather than leaving a stale box on screen.
+    fn finish_on_blur(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.is_editing(cx) || self.commit_edit(window, cx) {
+            return;
+        }
+        let reason = self.error.take();
+        self.cancel_edit(window, cx);
+        if let Some(reason) = reason {
+            self.fail_edit(format!("Not saved: {reason}"), cx);
         }
     }
 
@@ -935,18 +1070,44 @@ impl TableTab {
             }
             cx.notify();
         });
+        self.preview_open = false;
         self.error = None;
         cx.notify();
+    }
+
+    /// Which engine the table is on, so the changes can be shown in its dialect.
+    pub fn set_engine(&mut self, kind: DbKind, cx: &mut Context<Self>) {
+        self.engine = Some(kind);
+        cx.notify();
+    }
+
+    /// The statements a commit would run, with the values written in. For showing only: what is
+    /// executed uses bound parameters.
+    pub fn preview_statements(&self, cx: &App) -> Result<Vec<String>, String> {
+        let kind = self
+            .engine
+            .ok_or("The engine of this table is not known yet.")?;
+        let dialect = dialect_for(kind).ok_or("This engine has no SQL dialect here.")?;
+        let changes = self.changes(cx);
+        compile_changes(self.query.path(), &changes, dialect)
+            .map(|statements| statements.into_iter().map(|s| s.preview).collect())
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn toggle_preview(&mut self, cx: &mut Context<Self>) {
+        self.preview_open = !self.preview_open;
+        cx.notify();
+    }
+
+    pub fn preview_open(&self) -> bool {
+        self.preview_open
     }
 
     /// Ask the owner to commit (`⌘S`). An open editor is staged first, so what is on screen is
     /// what gets committed.
     pub fn request_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.is_editing(cx) {
-            self.commit_edit(window, cx);
-            if self.is_editing(cx) {
-                return; // the value was rejected; the message is showing
-            }
+        if self.is_editing(cx) && !self.commit_edit(window, cx) {
+            return; // the value was rejected; the message is showing
         }
         if self.committing || self.pending(cx).total() == 0 {
             return;
@@ -969,6 +1130,7 @@ impl TableTab {
                     d.rebuild_changeset();
                     cx.notify();
                 });
+                self.preview_open = false;
                 // Rows were added or removed: the count has to be asked for again.
                 self.query.page.set_total(None);
                 cx.emit(TableTabEvent::Reload);
@@ -1340,6 +1502,155 @@ impl TableTab {
     }
 }
 
+/// `⌘S` on macOS, `Ctrl+S` elsewhere.
+fn shortcut(key: &str) -> String {
+    if cfg!(target_os = "macos") {
+        format!("⌘{key}")
+    } else {
+        format!("Ctrl+{key}")
+    }
+}
+
+impl TableTab {
+    /// "3 unsaved changes · 1 edited · 1 new · 1 deleted"
+    fn pending_summary(pending: Counts, is_zh: bool) -> String {
+        let parts = [
+            (pending.modified_rows, "已修改", "edited"),
+            (pending.inserted_rows, "新增", "new"),
+            (pending.deleted_rows, "待删除", "deleted"),
+        ];
+        let detail: Vec<String> = parts
+            .iter()
+            .filter(|(n, _, _)| *n > 0)
+            .map(|(n, zh, en)| {
+                if is_zh {
+                    format!("{n} 行{zh}")
+                } else {
+                    format!("{n} {en}")
+                }
+            })
+            .collect();
+        let total = pending.total();
+        let head = if is_zh {
+            format!("{total} 项未保存的更改")
+        } else if total == 1 {
+            "1 unsaved change".to_owned()
+        } else {
+            format!("{total} unsaved changes")
+        };
+        format!("{head} · {}", detail.join(" · "))
+    }
+
+    /// The strip above the status bar that says there is unsaved work, and offers to save it.
+    fn pending_bar(&self, pending: Counts, is_zh: bool, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let summary = Self::pending_summary(pending, is_zh);
+        let saving = self.committing;
+        h_flex()
+            .id("pending-bar")
+            .test_support()
+            .aria_label(summary.clone())
+            .w_full()
+            .flex_shrink_0()
+            .gap_3()
+            .px_3()
+            .py_1p5()
+            .items_center()
+            .border_t_1()
+            .border_color(theme.warning.opacity(0.5))
+            .bg(theme.warning.opacity(0.14))
+            .child(div().text_color(theme.warning).child("●"))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_size(px(13.))
+                    .text_color(theme.foreground)
+                    .child(summary),
+            )
+            .child(
+                Button::new("preview-sql")
+                    .label(format!(
+                        "{} {}",
+                        if is_zh { "预览 SQL" } else { "Preview SQL" },
+                        shortcut("⇧P")
+                    ))
+                    .small()
+                    .when(self.preview_open, |b| b.primary())
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_preview(cx))),
+            )
+            .child(
+                Button::new("discard-changes")
+                    .label(if is_zh { "放弃" } else { "Discard" })
+                    .small()
+                    .disabled(saving)
+                    .on_click(cx.listener(|this, _, _, cx| this.discard_changes(cx))),
+            )
+            .child(
+                Button::new("commit-changes")
+                    .label(if saving {
+                        (if is_zh { "保存中…" } else { "Saving…" }).to_owned()
+                    } else {
+                        format!("{} {}", if is_zh { "保存" } else { "Save" }, shortcut("S"))
+                    })
+                    .primary()
+                    .small()
+                    .disabled(saving)
+                    .on_click(cx.listener(|this, _, window, cx| this.request_commit(window, cx))),
+            )
+            .into_any_element()
+    }
+
+    /// The SQL a save would run, in the order it runs, inside one transaction.
+    fn preview_panel(&self, is_zh: bool, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let (lines, error) = match self.preview_statements(cx) {
+            Ok(lines) => (lines, None),
+            Err(e) => (Vec::new(), Some(e)),
+        };
+        let label = lines.join("\n");
+        v_flex()
+            .id("preview-panel")
+            .test_support()
+            .aria_label(label)
+            .w_full()
+            .flex_shrink_0()
+            .max_h(px(220.))
+            .border_t_1()
+            .border_color(theme.border)
+            .bg(theme.background)
+            .child(
+                div()
+                    .px_3()
+                    .py_1()
+                    .text_size(px(12.))
+                    .text_color(theme.muted_foreground)
+                    .child(if is_zh {
+                        "保存时在同一个事务里按顺序执行:"
+                    } else {
+                        "Runs in one transaction, in this order:"
+                    }),
+            )
+            .child(
+                v_flex()
+                    .id("preview-scroll")
+                    .overflow_y_scroll()
+                    .px_3()
+                    .pb_2()
+                    .gap_1()
+                    .font_family(theme.mono_font_family.clone())
+                    .text_size(px(12.))
+                    .children(lines.into_iter().map(|line| div().child(line)))
+                    .when_some(error, |d, e| {
+                        d.child(div().text_color(theme.danger).child(e))
+                    }),
+            )
+            .into_any_element()
+    }
+}
+
 impl Render for TableTab {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
@@ -1357,6 +1668,10 @@ impl Render for TableTab {
         };
         let page_size = page.size();
         let pending = self.pending(cx);
+        let pending_bar = (pending.total() > 0)
+            .then(|| self.pending_bar(pending, crate::views::style::is_zh_locale(), cx));
+        let preview_panel = (pending.total() > 0 && self.preview_open)
+            .then(|| self.preview_panel(crate::views::style::is_zh_locale(), cx));
         let filter_count = self.query.active_filter_count();
         let (shown, total) = self.column_counts(cx);
         let is_zh = crate::views::style::is_zh_locale();
@@ -1506,6 +1821,24 @@ impl Render for TableTab {
             .on_action(
                 cx.listener(|this, _: &CancelCellEdit, window, cx| this.cancel_edit(window, cx)),
             )
+            .on_action(cx.listener(|this, _: &PreviewChanges, _, cx| this.toggle_preview(cx)))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                let k = &event.keystroke;
+                let plain = !k.modifiers.control && !k.modifiers.platform && !k.modifiers.alt;
+                let typed = k.key_char.as_deref().filter(|c| {
+                    let mut chars = c.chars();
+                    matches!(
+                        (chars.next(), chars.next()),
+                        (Some(ch), None) if !ch.is_control() && ch != ' '
+                    )
+                });
+                if let (true, Some(typed)) = (plain, typed)
+                    && this.type_to_edit(typed, window, cx)
+                {
+                    // The key is spent: the platform must not also insert it into the new box.
+                    cx.stop_propagation();
+                }
+            }))
             .on_action(cx.listener(|this, _: &InsertRow, _, cx| this.insert_row(cx)))
             .on_action(cx.listener(|this, _: &ToggleDeleteRow, _, cx| this.toggle_delete_row(cx)))
             .bg(theme.background)
@@ -1534,6 +1867,8 @@ impl Render for TableTab {
             )
             .when(self.drawer_open, |d| d.child(self.drawer.clone()))
             .children(column_panel)
+            .children(preview_panel)
+            .children(pending_bar)
             .children(paging_panel)
             .child(
                 // Status bar, as TablePlus lays it out:
@@ -1572,32 +1907,7 @@ impl Render for TableTab {
                                     .label(if is_zh { "行" } else { "Row" })
                                     .small()
                                     .on_click(cx.listener(|this, _, _, cx| this.insert_row(cx))),
-                            )
-                            .when(pending.total() > 0, |d| {
-                                d.child(
-                                    Button::new("commit-changes")
-                                        .label(if is_zh {
-                                            format!("提交 ({})", pending.total())
-                                        } else {
-                                            format!("Commit ({})", pending.total())
-                                        })
-                                        .primary()
-                                        .small()
-                                        .disabled(self.committing)
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.request_commit(window, cx)
-                                        })),
-                                )
-                                .child(
-                                    Button::new("discard-changes")
-                                        .label(if is_zh { "放弃" } else { "Discard" })
-                                        .small()
-                                        .disabled(self.committing)
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| this.discard_changes(cx)),
-                                        ),
-                                )
-                            }),
+                            ),
                     )
                     .child(
                         div()

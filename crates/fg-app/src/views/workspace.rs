@@ -1042,18 +1042,8 @@ impl Render for WorkspaceView {
 
         let env_color =
             super::style::environment_color(cx, self.config.environment, self.config.color);
-        // TablePlus groups the toolbar buttons in light rounded boxes.
-        let (capsule_bg, capsule_border) = (theme.secondary, theme.border);
-        let capsule = move || {
-            h_flex()
-                .items_center()
-                .gap_0p5()
-                .p(px(2.))
-                .rounded_md()
-                .border_1()
-                .border_color(capsule_border)
-                .bg(capsule_bg)
-        };
+        // A group of related toolbar buttons: spacing only, no box of its own.
+        let capsule = move || h_flex().items_center().gap_0p5();
         let divider = {
             let color = theme.border;
             move || div().w(px(2.)).h(px(14.)).bg(color.opacity(0.0))
@@ -1067,7 +1057,8 @@ impl Render for WorkspaceView {
                 .justify_between()
                 .child(
                     h_flex()
-                        .gap_2()
+                        .flex_shrink_0()
+                        .gap_3()
                         .items_center()
                         .child(
                             capsule().child(
@@ -1152,8 +1143,8 @@ impl Render for WorkspaceView {
                                 ),
                         ),
                 )
-                // The connection line takes the remaining width, left-aligned in monospace right
-                // after the button groups, as TablePlus prints it.
+                // The connection line fills the space between the button groups on a rounded bar,
+                // its text left-aligned in monospace as TablePlus prints it.
                 .child(
                     h_flex()
                         .id("connection-pill")
@@ -1161,9 +1152,13 @@ impl Render for WorkspaceView {
                         .aria_label(self.config.name.clone())
                         .flex_1()
                         .min_w_0()
-                        .px_2()
+                        .mx_2()
+                        .h(px(28.))
+                        .px_3()
                         .gap_2()
                         .items_center()
+                        .rounded_lg()
+                        .bg(theme.muted)
                         .overflow_hidden()
                         .whitespace_nowrap()
                         .font_family(theme.mono_font_family.clone())
@@ -1179,8 +1174,11 @@ impl Render for WorkspaceView {
                         .child(div().min_w_0().text_ellipsis().child(connection_line)),
                 )
                 .child(
+                    // Kept off the window's right edge, like the traffic lights on the left.
                     h_flex()
-                        .gap_2()
+                        .flex_shrink_0()
+                        .pr_3()
+                        .gap_3()
                         .items_center()
                         .child(
                             capsule()
@@ -1497,7 +1495,7 @@ impl WorkspaceView {
                             Button::new("history-close")
                                 .icon(hugeicon(Hugeicon::Close))
                                 .ghost()
-                                .xsmall()
+                                .small()
                                 .on_click(cx.listener(|this, _, _, cx| this.close_history(cx))),
                         ),
                 )
@@ -1662,7 +1660,7 @@ impl WorkspaceView {
                                 .icon(hugeicon(Hugeicon::Plus))
                                 .label("Save current")
                                 .ghost()
-                                .xsmall()
+                                .small()
                                 .on_click(
                                     cx.listener(|this, _, _, cx| this.save_current_as_snippet(cx)),
                                 ),
@@ -1671,7 +1669,7 @@ impl WorkspaceView {
                             Button::new("snippet-delete")
                                 .icon(hugeicon(Hugeicon::Trash))
                                 .ghost()
-                                .xsmall()
+                                .small()
                                 .on_click(
                                     cx.listener(|this, _, _, cx| this.delete_selected_snippet(cx)),
                                 ),
@@ -1680,7 +1678,7 @@ impl WorkspaceView {
                             Button::new("snippets-close")
                                 .icon(hugeicon(Hugeicon::Close))
                                 .ghost()
-                                .xsmall()
+                                .small()
                                 .on_click(cx.listener(|this, _, _, cx| this.close_snippets(cx))),
                         ),
                 )
@@ -1962,6 +1960,11 @@ impl WorkspaceView {
                         .map(|tab| tab.read(cx).title())
                         .unwrap_or_else(|| "Query".to_owned()),
                 };
+                // A table tab with staged edits shows a dot, so unsaved work is visible from any tab.
+                let dirty = matches!(t.kind, TabKind::Table { .. })
+                    && self
+                        .tab_view(&t.id)
+                        .is_some_and(|tab| tab.read(cx).pending(cx).total() > 0);
                 let is_active = active.as_ref() == Some(&t.id);
                 let (select_id, close_id, drag_id) = (t.id.clone(), t.id.clone(), t.id.clone());
                 let drag_title = title.clone();
@@ -1988,6 +1991,17 @@ impl WorkspaceView {
                     .when(!is_active, |d| {
                         d.text_color(theme.muted_foreground)
                             .hover(move |s| s.bg(hover_bg).text_color(hover_fg))
+                    })
+                    .when(dirty, |d| {
+                        d.child(
+                            div()
+                                .id(SharedString::from(format!("tab-dirty-{}", t.id)))
+                                .test_support()
+                                .aria_label("Unsaved changes")
+                                .mr_1p5()
+                                .text_color(theme.warning)
+                                .child("●"),
+                        )
                     })
                     .child(
                         div()
@@ -2051,7 +2065,7 @@ impl WorkspaceView {
                     Button::new("tab-prev")
                         .icon(hugeicon(Hugeicon::ArrowLeft))
                         .ghost()
-                        .xsmall()
+                        .small()
                         .disabled(!several)
                         .on_click(cx.listener(|this, _, _, cx| this.prev_tab(cx))),
                 )
@@ -2059,7 +2073,7 @@ impl WorkspaceView {
                     Button::new("tab-next")
                         .icon(hugeicon(Hugeicon::ArrowRight))
                         .ghost()
-                        .xsmall()
+                        .small()
                         .disabled(!several)
                         .on_click(cx.listener(|this, _, _, cx| this.next_tab(cx))),
                 )

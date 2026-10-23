@@ -61,6 +61,7 @@ gpui_kit::actions!(
         CancelCellEdit,
         InsertRow,
         ToggleDeleteRow,
+        PreviewChanges,
     ]
 );
 
@@ -85,6 +86,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("enter", BeginEdit, Some(GRID_CONTEXT)),
         KeyBinding::new("secondary-i", InsertRow, Some(GRID_CONTEXT)),
         KeyBinding::new("secondary-backspace", ToggleDeleteRow, Some(GRID_CONTEXT)),
+        KeyBinding::new("secondary-shift-p", PreviewChanges, Some(GRID_CONTEXT)),
         KeyBinding::new("escape", CancelCellEdit, Some(CELL_EDITOR_CONTEXT)),
         KeyBinding::new("down", LauncherNext, Some(LAUNCHER_CONTEXT)),
         KeyBinding::new("up", LauncherPrev, Some(LAUNCHER_CONTEXT)),

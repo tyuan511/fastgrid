@@ -419,6 +419,7 @@ fn attach_table(
             .await
             .map_or(crate::model::DEFAULT_PAGE_SIZE, |g| g.page_size);
         let hidden = saved.hidden_columns.clone();
+        let engine = first_conn.kind();
         let targets = foreign_key_targets(&first_conn, &path).await;
         // A view, or a table without a primary key, comes back empty and stays read-only.
         let primary_key: Vec<String> = first_conn
@@ -434,6 +435,7 @@ fn attach_table(
             tab.update(cx, |t, cx| {
                 t.set_foreign_keys(targets, cx);
                 t.set_primary_key(primary_key, cx);
+                t.set_engine(engine, cx);
                 t.restore_query(query, cx);
                 t.restore_hidden_columns(hidden, cx);
             });

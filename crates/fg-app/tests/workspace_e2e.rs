@@ -663,6 +663,23 @@ fn editing_in_the_grid_and_committing_changes_the_database(cx: &mut TestAppConte
     })
     .unwrap();
     assert_eq!(cx.read_entity(&tab, |t, cx| t.pending(cx).total()), 3);
+    // Unsaved work shows on the tab itself, and the sidebar-level bar offers to save it.
+    let dirty_id = cx.read_entity(&app.view, |v, _| {
+        format!("tab-dirty-{}", v.tabs().active_id().unwrap())
+    });
+    let (dot, bar) = cx
+        .update_window(app.window, |_, window, cx| {
+            window.render_frame(cx);
+            (
+                window
+                    .try_find(gpui_kit::SharedString::from(dirty_id.clone()))
+                    .is_some(),
+                window.try_find("pending-bar").is_some(),
+            )
+        })
+        .unwrap();
+    assert!(dot, "the tab carries an unsaved-changes dot");
+    assert!(bar, "the grid shows the pending-changes bar");
 
     cx.update_window(app.window, |_, window, cx| {
         tab.update(cx, |t, cx| t.request_commit(window, cx));
@@ -711,6 +728,16 @@ fn editing_in_the_grid_and_committing_changes_the_database(cx: &mut TestAppConte
             t.pending(cx).total() == 0 && !t.is_committing() && t.value_at(0, 1, cx).is_some()
         }) && status(cx, &app).contains("of 1,000")
     });
+    let gone = cx
+        .update_window(app.window, |_, window, cx| {
+            window.render_frame(cx);
+            window
+                .try_find(gpui_kit::SharedString::from(dirty_id.clone()))
+                .is_none()
+                && window.try_find("pending-bar").is_none()
+        })
+        .unwrap();
+    assert!(gone, "saved: no dot, no bar");
     cx.read_entity(&tab, |t, cx| {
         assert_eq!(t.value_at(0, 1, cx), Some(Value::Text("edited".into())));
         assert_eq!(

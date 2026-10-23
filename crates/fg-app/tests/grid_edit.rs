@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use fg_app::model::Counts;
 use fg_app::views::{CellMark, TableTab, TableTabEvent};
-use fg_core::{ColumnMeta, DataType, ObjectPath, TypeCategory, Value};
+use fg_core::{ColumnMeta, DataType, DbKind, ObjectPath, TypeCategory, Value};
 use fg_sql::{CellChange, RowChange};
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
@@ -60,7 +60,10 @@ fn open(cx: &mut TestAppContext, primary_key: &[&str]) -> Fixture {
     };
     let keys: Vec<String> = primary_key.iter().map(|k| (*k).to_owned()).collect();
     cx.update_window(f.window, |_, _, cx| {
-        f.view.update(cx, |v, cx| v.set_primary_key(keys, cx));
+        f.view.update(cx, |v, cx| {
+            v.set_primary_key(keys, cx);
+            v.set_engine(DbKind::Sqlite, cx);
+        });
     })
     .unwrap();
     load(cx, &f);
@@ -402,4 +405,213 @@ fn the_commit_and_discard_buttons_follow_the_pending_count(cx: &mut TestAppConte
     .unwrap();
     assert_eq!(pending(cx, &f).total(), 0);
     assert!(!exists(cx, "commit-changes"));
+}
+
+fn label(cx: &mut TestAppContext, f: &Fixture, id: &'static str) -> Option<String> {
+    cx.update_window(f.window, |_, window, _| {
+        window
+            .try_find(id)
+            .and_then(|e| e.label().map(str::to_owned))
+    })
+    .unwrap()
+}
+
+/// Give the grid the keyboard, as a click on a cell does.
+fn focus_grid(cx: &mut TestAppContext, f: &Fixture) {
+    cx.update_window(f.window, |_, window, cx| {
+        f.view.update(cx, |v, cx| v.focus_grid(window, cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+}
+
+fn selected(cx: &mut TestAppContext, f: &Fixture) -> Option<(usize, usize)> {
+    cx.read_entity(&f.view, |v, cx| v.selected_cell(cx))
+}
+
+#[gpui_kit::test]
+fn typing_on_a_selected_cell_starts_editing_with_what_was_typed(cx: &mut TestAppContext) {
+    let f = open(cx, &["id"]);
+    select(cx, &f, 0, 1);
+    focus_grid(cx, &f);
+    press(cx, &f, "z");
+    assert!(editing(cx, &f), "a printable key opens the editor");
+    assert_eq!(
+        cx.read_entity(&f.view, |v, cx| v.editor_text(cx))
+            .as_deref(),
+        Some("z"),
+        "it replaces the old value, and the key is not typed twice"
+    );
+    press(cx, &f, "enter");
+    assert_eq!(shown(cx, &f, 0, 1), Some(Value::Text("z".into())));
+}
+
+#[gpui_kit::test]
+fn shortcuts_and_space_do_not_start_an_edit(cx: &mut TestAppContext) {
+    let f = open(cx, &["id"]);
+    select(cx, &f, 0, 1);
+    focus_grid(cx, &f);
+    press(cx, &f, "space");
+    press(cx, &f, "secondary-c");
+    assert!(!editing(cx, &f));
+}
+
+#[gpui_kit::test]
+fn tab_enter_and_shift_tab_confirm_and_move(cx: &mut TestAppContext) {
+    let f = open(cx, &["id"]);
+    // Tab: confirm, move right.
+    begin_edit(cx, &f, 0, 0);
+    type_in_editor(cx, &f, "11");
+    press(cx, &f, "tab");
+    assert_eq!(shown(cx, &f, 0, 0), Some(Value::Int(11)));
+    assert_eq!(selected(cx, &f), Some((0, 1)));
+    assert!(!editing(cx, &f));
+
+    // Tab at the end of a row wraps to the start of the next.
+    begin_edit(cx, &f, 0, 1);
+    type_in_editor(cx, &f, "n1");
+    press(cx, &f, "tab");
+    assert_eq!(selected(cx, &f), Some((1, 0)));
+
+    // Shift+Tab goes back, wrapping to the end of the previous row.
+    begin_edit(cx, &f, 1, 0);
+    type_in_editor(cx, &f, "22");
+    press(cx, &f, "shift-tab");
+    assert_eq!(selected(cx, &f), Some((0, 1)));
+
+    // Enter: confirm, move down.
+    begin_edit(cx, &f, 0, 1);
+    type_in_editor(cx, &f, "n2");
+    press(cx, &f, "enter");
+    assert_eq!(selected(cx, &f), Some((1, 1)));
+
+    // A rejected value neither stages nor moves.
+    begin_edit(cx, &f, 1, 0);
+    type_in_editor(cx, &f, "x");
+    press(cx, &f, "tab");
+    assert!(editing(cx, &f));
+    assert_eq!(selected(cx, &f), Some((1, 0)));
+}
+
+#[gpui_kit::test]
+fn the_last_cell_stays_put_instead_of_leaving_the_grid(cx: &mut TestAppContext) {
+    let f = open(cx, &["id"]);
+    begin_edit(cx, &f, 2, 1);
+    type_in_editor(cx, &f, "last");
+    press(cx, &f, "tab");
+    assert_eq!(shown(cx, &f, 2, 1), Some(Value::Text("last".into())));
+    assert_eq!(selected(cx, &f), Some((2, 1)));
+}
+
+#[gpui_kit::test]
+fn clicking_away_keeps_what_was_typed(cx: &mut TestAppContext) {
+    let f = open(cx, &["id"]);
+    begin_edit(cx, &f, 0, 1);
+    type_in_editor(cx, &f, "kept on blur");
+    // A click on another cell moves the selection.
+    select(cx, &f, 1, 1);
+    assert!(!editing(cx, &f));
+    assert_eq!(
+        shown(cx, &f, 0, 1),
+        Some(Value::Text("kept on blur".into()))
+    );
+}
+
+#[gpui_kit::test]
+fn clicking_away_from_a_bad_value_says_it_was_not_saved(cx: &mut TestAppContext) {
+    let f = open(cx, &["id"]);
+    begin_edit(cx, &f, 0, 0);
+    type_in_editor(cx, &f, "nope");
+    select(cx, &f, 1, 1);
+    assert!(!editing(cx, &f), "no stale box is left on screen");
+    assert_eq!(shown(cx, &f, 0, 0), Some(Value::Int(1)));
+    assert!(error_text(cx, &f).unwrap().starts_with("Not saved"));
+}
+
+#[gpui_kit::test]
+fn unsaved_changes_are_announced_in_a_bar_with_save_and_discard(cx: &mut TestAppContext) {
+    let f = open(cx, &["id"]);
+    assert!(
+        label(cx, &f, "pending-bar").is_none(),
+        "nothing to announce yet"
+    );
+
+    begin_edit(cx, &f, 0, 1);
+    type_in_editor(cx, &f, "a");
+    press(cx, &f, "enter");
+    cx.update_window(f.window, |_, _, cx| {
+        f.view.update(cx, |v, cx| {
+            v.select_row(1, cx);
+            v.toggle_delete_row(cx);
+            v.insert_row(cx);
+        })
+    })
+    .unwrap();
+    cx.update_window(f.window, |_, window, _| window.refresh())
+        .unwrap();
+    cx.update_window(f.window, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    let bar = label(cx, &f, "pending-bar").expect("the bar appears with the first change");
+    // The wording follows the system language; the numbers are what matters here.
+    let english = bar.contains("3 unsaved changes")
+        && bar.contains("1 edited")
+        && bar.contains("1 new")
+        && bar.contains("1 deleted");
+    let chinese = bar.contains("3 项未保存的更改")
+        && bar.contains("1 行已修改")
+        && bar.contains("1 行新增")
+        && bar.contains("1 行待删除");
+    assert!(english || chinese, "{bar}");
+}
+
+#[gpui_kit::test]
+fn the_bar_offers_a_working_save_button(cx: &mut TestAppContext) {
+    let f = open(cx, &["id"]);
+    begin_edit(cx, &f, 0, 1);
+    type_in_editor(cx, &f, "a");
+    press(cx, &f, "enter");
+    cx.update_window(f.window, |_, window, cx| {
+        window.click("commit-changes", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(drain(cx, &f), [TableTabEvent::CommitRequested]);
+    // While it runs the button says so and cannot be pressed again.
+    assert!(cx.read_entity(&f.view, |v, _| v.is_committing()));
+}
+
+#[gpui_kit::test]
+fn the_sql_preview_shows_the_statements_with_values_written_in(cx: &mut TestAppContext) {
+    let f = open(cx, &["id"]);
+    begin_edit(cx, &f, 0, 1);
+    type_in_editor(cx, &f, "O'Neil");
+    press(cx, &f, "enter");
+    select(cx, &f, 1, 0);
+    cx.update_window(f.window, |_, _, cx| {
+        f.view.update(cx, |v, cx| v.toggle_delete_row(cx))
+    })
+    .unwrap();
+    assert!(
+        label(cx, &f, "preview-panel").is_none(),
+        "closed until asked for"
+    );
+
+    press(cx, &f, "secondary-shift-p");
+    cx.update_window(f.window, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    let panel = label(cx, &f, "preview-panel").expect("the panel opens");
+    assert_eq!(
+        panel,
+        "DELETE FROM \"main\".\"items\" WHERE \"id\" = 2;\n\
+         UPDATE \"main\".\"items\" SET \"name\" = 'O''Neil' WHERE \"id\" = 1;"
+    );
+
+    // The panel goes away with the changes it described.
+    cx.update_window(f.window, |_, window, cx| {
+        window.click("discard-changes", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert!(label(cx, &f, "preview-panel").is_none());
+    assert!(label(cx, &f, "pending-bar").is_none());
 }
