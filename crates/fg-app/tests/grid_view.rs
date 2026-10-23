@@ -118,11 +118,47 @@ fn the_status_bar_reports_rows_total_and_time(cx: &mut TestAppContext) {
     assert_eq!(status(cx, &f), "Showing 1–3 of 1,234 · 7 ms");
 }
 
+/// First / last page and the page sizes sit in the panel behind the ⚙ between the arrows.
+fn open_paging_panel(cx: &mut TestAppContext, f: &Fixture) {
+    cx.update_window(f.window, |_, window, cx| {
+        window.click("page-settings", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("paging-panel").is_some());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn the_paging_panel_opens_and_closes_from_the_status_bar(cx: &mut TestAppContext) {
+    let f = open(cx);
+    load(cx, &f, 300, Some(1000));
+    cx.update_window(f.window, |_, window, _| {
+        assert!(window.try_find("page-settings").is_some());
+        assert!(window.try_find("paging-panel").is_none());
+        assert!(window.try_find("page-size-1000").is_none());
+    })
+    .unwrap();
+    open_paging_panel(cx, &f);
+    cx.update_window(f.window, |_, window, cx| {
+        assert!(window.try_find("page-size-1000").is_some());
+        assert!(window.try_find("grid-page-first").is_some());
+        window.click("page-settings", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("paging-panel").is_none());
+    })
+    .unwrap();
+    assert!(
+        f.events.borrow().is_empty(),
+        "opening the panel is not a reload"
+    );
+}
+
 #[gpui_kit::test]
 fn paging_buttons_follow_what_is_known(cx: &mut TestAppContext) {
     let f = open(cx);
     // 300 of 1000: more pages ahead, none behind.
     load(cx, &f, 300, Some(1000));
+    open_paging_panel(cx, &f);
     assert!(disabled(cx, &f, "grid-page-prev"));
     assert!(!disabled(cx, &f, "grid-page-next"));
     assert!(disabled(cx, &f, "grid-page-first"));
@@ -172,6 +208,7 @@ fn disabled_paging_buttons_do_nothing(cx: &mut TestAppContext) {
 fn changing_the_page_size_reloads_and_keeps_the_first_visible_row(cx: &mut TestAppContext) {
     let f = open(cx);
     load(cx, &f, 300, Some(5000));
+    open_paging_panel(cx, &f);
     cx.update_window(f.window, |_, window, cx| window.click("page-size-1000", cx))
         .unwrap();
     assert_eq!(*f.events.borrow(), vec![TableTabEvent::Reload]);
@@ -210,6 +247,49 @@ fn sorting_resets_to_the_first_page_and_reloads(cx: &mut TestAppContext) {
                 nulls: None
             }]
         );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn clicking_a_header_sorts_by_that_column(cx: &mut TestAppContext) {
+    let f = open(cx);
+    load(cx, &f, 3, Some(3));
+    cx.update_window(f.window, |_, window, cx| {
+        window.click("sort-name", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(*f.events.borrow(), vec![TableTabEvent::Reload]);
+    cx.update_window(f.window, |_, _, cx| {
+        let tab = f.view.read(cx);
+        assert_eq!(
+            tab.query().to_table_query().sort,
+            vec![SortKey {
+                column: "name".into(),
+                descending: false,
+                nulls: None
+            }]
+        );
+        // The click sorts instead of selecting the column.
+        assert_eq!(tab.selection_text(cx), None);
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn clicking_a_row_number_selects_the_whole_row(cx: &mut TestAppContext) {
+    let f = open(cx);
+    load(cx, &f, 3, Some(3));
+    cx.update_window(f.window, |_, window, cx| {
+        window.click("row-number-2", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update_window(f.window, |_, _, cx| {
+        let tab = f.view.read(cx);
+        assert_eq!(tab.selected_row_index(cx), Some(2));
+        assert_eq!(tab.selection_text(cx).as_deref(), Some("3	item 3"));
     })
     .unwrap();
 }

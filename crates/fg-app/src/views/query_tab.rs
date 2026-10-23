@@ -103,13 +103,11 @@ impl ResultDelegate {
         self.columns = metas
             .iter()
             .map(|m| {
+                // Not sortable: a result is not re-sorted client-side, and like the table grid's
+                // unsorted headers (TablePlus style) it shows no arrow.
                 let mut col = Column::new(m.name.clone(), m.name.clone())
                     .width(px(result_width(m)))
-                    .p_0()
-                    // Marked sortable only so the header reserves the same space for the arrow as
-                    // the table grid's headers do; clicking it does nothing (a result is not
-                    // re-sorted client-side).
-                    .sortable();
+                    .p_0();
                 if align_for(m.data_type.category) == model::Align::Right {
                     col.align = TextAlign::Right;
                 }
@@ -1255,19 +1253,19 @@ impl Render for QueryTab {
                         // height, same padding. A result and a table should look like the same
                         // widget, because they are.
                         DataTable::new(&self.table)
-                            .with_size(px(30.))
+                            .with_size(px(22.))
                             .bordered(false)
-                            .header_row_height(px(34.))
-                            .stripe(false),
+                            .header_row_height(px(24.))
+                            .stripe(true),
                     ),
             )
             .child(
                 h_flex()
                     .id("result-status-bar")
                     .test_support()
-                    // The table grid's status bar is 44px; the two must match or switching between a
+                    // The table grid's status bar is 32px; the two must match or switching between a
                     // table and a query moves the grid up and down.
-                    .h(px(44.))
+                    .h(px(32.))
                     .px_3()
                     .gap_3()
                     .flex_shrink_0()

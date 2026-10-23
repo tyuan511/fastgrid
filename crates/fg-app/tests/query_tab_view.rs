@@ -1541,10 +1541,9 @@ fn the_result_grid_has_the_same_header_and_status_geometry_as_the_table_grid(
         ],
     );
 
-    // The header cells carry a sort affordance, which is what reserves the arrow's space (the
-    // library draws `ChevronsUpDown` for `ColumnSort::Default`), so a result header lines up with a
-    // table header. The header is drawn by the library without a test id, so assert on the column
-    // definition the delegate hands it.
+    // Like an unsorted table header (TablePlus style), a result header carries no sort arrow, so
+    // the two line up. The header is drawn by the library without a test id, so assert on the
+    // column definition the delegate hands it.
     let sortable = cx.read_entity(&f.view, |t, cx| {
         t.result_columns(cx)
             .first()
@@ -1552,17 +1551,17 @@ fn the_result_grid_has_the_same_header_and_status_geometry_as_the_table_grid(
     });
     assert_eq!(
         sortable,
-        Some(true),
-        "the result's columns are sortable-shaped, so the header reserves the arrow's space"
+        Some(false),
+        "a result header shows no arrow, like an unsorted table header"
     );
 
-    // The status bar is 44px, the table grid's height.
+    // The status bar is 32px, the table grid's height.
     let height: f32 = cx
         .update_window(f.window, |_, window, _| {
             f32::from(window.find("result-status-bar").bounds().size.height)
         })
         .unwrap();
-    assert_eq!(height, 44.0, "the status bar matches the table grid's");
+    assert_eq!(height, 32.0, "the status bar matches the table grid's");
 }
 
 #[gpui_kit::test]

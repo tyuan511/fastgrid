@@ -13,12 +13,13 @@ pub fn chosen(cx: &App) -> ThemeMode {
     cx.try_global::<Chosen>().map_or(ThemeMode::System, |c| c.0)
 }
 
-/// fastgrid's own look: a calm cool-grey surface, one indigo accent, 14px type, 8px radii.
+/// fastgrid's own look: a calm cool-grey surface, one indigo accent, 13px type (the macOS and
+/// TablePlus size), 8px radii.
 /// Applied on top of the kit theme (light or dark) every time the theme changes.
 pub fn compact_type(cx: &mut App) {
     use gpui_kit::{hsla, px};
     let theme = Theme::global_mut(cx);
-    theme.font_size = px(14.);
+    theme.font_size = px(13.);
     theme.mono_font_size = px(13.);
     theme.radius = px(8.);
     theme.radius_lg = px(12.);
@@ -40,8 +41,6 @@ pub fn compact_type(cx: &mut App) {
     theme.list_active = accent.opacity(if dark { 0.20 } else { 0.11 });
     theme.list_active_border = accent.opacity(0.0);
     theme.tokens.table_active = hsla(0., 0., 0., 0.).into();
-    theme.tokens.table_even = hsla(0., 0., 0., 0.).into();
-    theme.table_even = hsla(0., 0., 0., 0.);
 
     if dark {
         theme.background = c(222., 0.16, 0.085);
@@ -51,9 +50,10 @@ pub fn compact_type(cx: &mut App) {
         theme.border = c(222., 0.12, 0.17);
         theme.muted = c(222., 0.13, 0.15);
         theme.muted_foreground = c(220., 0.09, 0.62);
-        theme.table_head = c(222., 0.16, 0.105);
-        theme.tokens.table_head = c(222., 0.16, 0.105).into();
-        theme.table_row_border = c(222., 0.12, 0.14);
+        // Headers sit on the grid's own surface, as in TablePlus.
+        theme.table_head = theme.background;
+        theme.tokens.table_head = theme.background.into();
+        theme.table_even = c(222., 0.14, 0.105);
         theme.list_hover = c(222., 0.13, 0.14);
     } else {
         theme.background = c(0., 0., 1.);
@@ -63,11 +63,15 @@ pub fn compact_type(cx: &mut App) {
         theme.border = c(220., 0.16, 0.91);
         theme.muted = c(220., 0.18, 0.95);
         theme.muted_foreground = c(220., 0.10, 0.44);
-        theme.table_head = c(220., 0.20, 0.98);
-        theme.tokens.table_head = c(220., 0.20, 0.98).into();
-        theme.table_row_border = c(220., 0.16, 0.94);
+        theme.table_head = theme.background;
+        theme.tokens.table_head = theme.background.into();
+        theme.table_even = c(220., 0.12, 0.97);
         theme.list_hover = c(220., 0.18, 0.95);
     }
+    // TablePlus stripes alternate rows and draws no lines between them; the column lines come
+    // from the cells themselves (see `views::cells`), since this token also draws row borders.
+    theme.tokens.table_even = theme.table_even.into();
+    theme.table_row_border = hsla(0., 0., 0., 0.);
     theme.title_bar = theme.background;
     theme.title_bar_border = theme.border;
     theme.tab_active = theme.background;

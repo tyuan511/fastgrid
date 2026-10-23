@@ -233,7 +233,10 @@ fn changing_the_page_size_shows_that_many_rows(cx: &mut TestAppContext) {
         status(cx, &app).starts_with("Showing 1–300")
     });
 
+    // The page sizes sit in the paging panel behind the ⚙ in the status bar.
     cx.update_window(app.window, |_, window, cx| {
+        window.click("page-settings", cx);
+        window.render_frame(cx);
         window.click("page-size-100", cx)
     })
     .unwrap();
@@ -293,7 +296,10 @@ fn the_session_is_saved_and_restored_with_table_view_state(cx: &mut TestAppConte
         tab.update(cx, |t, cx| t.toggle_sort("name", cx))
     })
     .unwrap();
+    // The page sizes sit in the paging panel behind the ⚙ in the status bar.
     cx.update_window(app.window, |_, window, cx| {
+        window.click("page-settings", cx);
+        window.render_frame(cx);
         window.click("page-size-100", cx)
     })
     .unwrap();

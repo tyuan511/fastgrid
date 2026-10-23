@@ -34,6 +34,10 @@ use crate::model::{
     PAGE_SIZES, RowId, RowState, SortState, align_for, copy_text, parse_cell_text, to_tsv,
 };
 
+/// Screen columns before the data: the row-number gutter.
+const GUTTER: usize = 1;
+const GUTTER_WIDTH: f32 = 44.;
+
 /// A click on a column header, handed from the table delegate to the owning view.
 type SortRequest = Rc<RefCell<Option<String>>>;
 /// A click on a foreign-key arrow: (row, column) of the cell.
@@ -164,34 +168,34 @@ impl GridDelegate {
         }
     }
 
-    /// The data column behind the `ix`-th column on screen.
+    /// The data column behind the `ix`-th column on screen; `None` for the row-number gutter.
     fn data_index(&self, ix: usize) -> Option<usize> {
-        self.visible.get(ix).copied()
+        self.visible.get(ix.checked_sub(GUTTER)?).copied()
     }
 
     fn rebuild_columns(&mut self) {
         self.visible = (0..self.metas.len())
             .filter(|&i| !self.hidden.contains(&self.metas[i].name))
             .collect();
-        self.columns = self
-            .visible
-            .iter()
-            .map(|&i| &self.metas[i])
-            .map(|m| {
-                let mut col = Column::new(m.name.clone(), m.name.clone())
-                    .width(px(default_width(m)))
-                    .p_0()
-                    .sortable();
-                if align_for(m.data_type.category) == Align::Right {
-                    col.align = TextAlign::Right;
-                }
-                match self.sort.indicator(&m.name) {
-                    Some((_, false)) => col.ascending(),
-                    Some((_, true)) => col.descending(),
-                    None => col,
-                }
-            })
-            .collect();
+        // The row numbers stay put while the data scrolls sideways, as in TablePlus.
+        let gutter = Column::new("#", "")
+            .width(px(GUTTER_WIDTH))
+            .p_0()
+            .fixed_left()
+            .resizable(false)
+            .movable(false);
+        let data = self.visible.iter().map(|&i| &self.metas[i]).map(|m| {
+            let mut col = Column::new(m.name.clone(), m.name.clone())
+                .width(px(default_width(m)))
+                .p_0();
+            if align_for(m.data_type.category) == Align::Right {
+                col.align = TextAlign::Right;
+            }
+            // No library sort state: `render_th` draws the arrow itself and sorts on a click, so
+            // the header keeps no space reserved for an arrow the column does not show.
+            col
+        });
+        self.columns = std::iter::once(gutter).chain(data).collect();
     }
 }
 
@@ -265,12 +269,12 @@ impl TableDelegate for GridDelegate {
         let Some(meta) = self.data_index(col_ix).and_then(|i| self.metas.get(i)) else {
             return div().into_any_element();
         };
+        let name = meta.name.clone();
         let multiple_keys = self.sort.keys().len() > 1;
-        let priority = self
-            .sort
-            .indicator(&meta.name)
-            .filter(|_| multiple_keys)
-            .map(|(p, _)| p);
+        let indicator = self.sort.indicator(&meta.name);
+        let priority = indicator.filter(|_| multiple_keys).map(|(p, _)| p);
+        // Only a sorted column shows an arrow, as in TablePlus.
+        let arrow = indicator.map(|(_, descending)| if descending { "▼" } else { "▲" });
         let header = h_flex()
             .gap_1p5()
             .items_center()
@@ -282,6 +286,14 @@ impl TableDelegate for GridDelegate {
             .when(self.jumps.contains_key(&meta.name), |d| {
                 d.child(div().text_size(px(13.)).text_color(theme.info).child("↗"))
             })
+            .when_some(arrow, |d, a| {
+                d.child(
+                    div()
+                        .text_size(px(9.))
+                        .text_color(theme.muted_foreground)
+                        .child(a),
+                )
+            })
             .when_some(priority, |d, p| {
                 d.child(
                     div()
@@ -291,7 +303,22 @@ impl TableDelegate for GridDelegate {
                 )
             })
             .into_any_element();
-        super::cells::th_frame(header, cx)
+        // A click on the header sorts by it, as in TablePlus, instead of selecting the column.
+        div()
+            .id(SharedString::from(format!("sort-{name}")))
+            .test_support()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .cursor_pointer()
+            .child(super::cells::th_frame(header, cx))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                *this.delegate().pending_sort.borrow_mut() = Some(name.clone());
+                cx.notify();
+            }))
+            .into_any_element()
     }
 
     fn render_td(
@@ -302,6 +329,26 @@ impl TableDelegate for GridDelegate {
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         let theme = cx.theme().clone();
+        if col_ix < GUTTER {
+            let selected = self.selected.is_some_and(|(r, _)| r == row_ix);
+            return div()
+                .id(SharedString::from(format!("row-number-{row_ix}")))
+                .test_support()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .font_family(theme.mono_font_family.clone())
+                .text_size(super::cells::GRID_TEXT_SIZE)
+                .when(selected, |d| d.bg(theme.primary.opacity(0.12)))
+                .text_color(if selected {
+                    theme.foreground
+                } else {
+                    theme.muted_foreground.opacity(0.7)
+                })
+                .child((row_ix + 1).to_string())
+                .into_any_element();
+        }
         // `col_ix` counts the columns on screen; the data may have hidden ones in between.
         let screen_col = col_ix;
         let col_ix = self.data_index(col_ix).unwrap_or(usize::MAX);
@@ -415,6 +462,8 @@ pub struct TableTab {
     drawer: Entity<FilterDrawer>,
     drawer_open: bool,
     columns_open: bool,
+    /// The paging panel behind the ⚙ button: first / last page and the page size.
+    paging_open: bool,
     /// Set once the saved view state was applied; before that a jump must wait for it.
     restored: bool,
     /// A foreign-key jump that arrived before the saved filters were restored.
@@ -456,6 +505,13 @@ impl TableTab {
             cx.notify();
         });
         let observer = cx.observe(&table, move |this, table, cx| {
+            // A click on a row number selects the whole row.
+            if let TableSelection::Cell(row, col) = table.read(cx).selection()
+                && col < GUTTER
+            {
+                table.update(cx, |t, cx| t.set_selected_row(row, cx));
+                return;
+            }
             let selected = match table.read(cx).selection() {
                 TableSelection::Cell(r, c) => Some((r, c)),
                 _ => None,
@@ -490,6 +546,7 @@ impl TableTab {
             drawer,
             drawer_open: false,
             columns_open: false,
+            paging_open: false,
             restored: false,
             pending_filter: None,
             query,
@@ -1006,9 +1063,10 @@ impl TableTab {
         }
     }
 
+    /// Select a cell; `col` counts the data columns on screen (the row-number gutter is not one).
     pub fn select_cell(&mut self, row: usize, col: usize, cx: &mut Context<Self>) {
         self.table
-            .update(cx, |t, cx| t.set_selected_cell(row, col, cx));
+            .update(cx, |t, cx| t.set_selected_cell(row, col + GUTTER, cx));
         cx.notify();
     }
 
@@ -1018,7 +1076,8 @@ impl TableTab {
     }
 
     pub fn select_column(&mut self, col: usize, cx: &mut Context<Self>) {
-        self.table.update(cx, |t, cx| t.set_selected_col(col, cx));
+        self.table
+            .update(cx, |t, cx| t.set_selected_col(col + GUTTER, cx));
         cx.notify();
     }
 
@@ -1143,6 +1202,15 @@ impl TableTab {
 
     pub fn columns_panel_open(&self) -> bool {
         self.columns_open
+    }
+
+    pub fn toggle_paging_panel(&mut self, cx: &mut Context<Self>) {
+        self.paging_open = !self.paging_open;
+        cx.notify();
+    }
+
+    pub fn paging_panel_open(&self) -> bool {
+        self.paging_open
     }
 
     /// Everything remembered per table: query state plus hidden columns.
@@ -1305,27 +1373,88 @@ impl Render for TableTab {
         });
         let display_status = selected_info.unwrap_or_else(|| status.clone());
 
-        let filter_label = if is_zh {
-            if filter_count > 0 {
-                format!("过滤器 ({filter_count})")
-            } else {
-                "过滤器".to_owned()
-            }
-        } else if filter_count > 0 {
-            format!("Filters ({filter_count})")
-        } else {
-            "Filter".to_owned()
+        let filter_label = match (is_zh, filter_count) {
+            (true, 0) => "过滤器".to_owned(),
+            (true, n) => format!("过滤器 ({n})"),
+            (false, 0) => "Filter".to_owned(),
+            (false, n) => format!("Filters ({n})"),
         };
-
-        let columns_label = if is_zh {
-            format!("列 ({shown}/{total})")
-        } else {
-            format!("Columns ({shown}/{total})")
+        // Like TablePlus the button just says "Columns"; the count shows only when some are hidden.
+        let columns_label = match (is_zh, shown < total) {
+            (true, false) => "列".to_owned(),
+            (true, true) => format!("列 ({shown}/{total})"),
+            (false, false) => "Columns".to_owned(),
+            (false, true) => format!("Columns ({shown}/{total})"),
         };
+        let pager_state = super::cells::PagerState {
+            has_prev,
+            has_next,
+            has_total: page.total().is_some(),
+        };
+        let on_nav: fn(&mut Self, super::cells::PageNav, &mut Context<Self>) =
+            |this, nav, cx| this.navigate(nav, cx);
 
-        let sizes = super::cells::page_size_buttons(cx, &PAGE_SIZES, page_size, |this, n, cx| {
-            this.set_page_size(n, cx)
+        // First / last page and the page size, behind the ⚙ between the arrows.
+        let paging_panel = self.paging_open.then(|| {
+            let sizes =
+                super::cells::page_size_buttons(cx, &PAGE_SIZES, page_size, |this, n, cx| {
+                    this.set_page_size(n, cx)
+                });
+            h_flex()
+                .id("paging-panel")
+                .test_support()
+                .gap_2()
+                .px_3()
+                .py_1p5()
+                .items_center()
+                .justify_end()
+                .border_t_1()
+                .border_color(theme.border)
+                .bg(theme.background)
+                .text_color(theme.muted_foreground)
+                .child(if is_zh {
+                    "每页行数"
+                } else {
+                    "Rows per page"
+                })
+                .child(sizes)
+                .child(div().w_2())
+                .child(super::cells::page_button(
+                    cx,
+                    "grid",
+                    pager_state,
+                    super::cells::PageNav::First,
+                    on_nav,
+                ))
+                .child(super::cells::page_button(
+                    cx,
+                    "grid",
+                    pager_state,
+                    super::cells::PageNav::Last,
+                    on_nav,
+                ))
         });
+
+        // A segment of the Data | Structure | Index switch.
+        let segment = |label: &'static str, active: bool| {
+            div()
+                .px_2p5()
+                .h(px(20.))
+                .flex()
+                .items_center()
+                .rounded(px(5.))
+                .when(active, |d| {
+                    d.bg(theme.primary)
+                        .text_color(theme.primary_foreground)
+                        .font_weight(FontWeight::MEDIUM)
+                })
+                .when(!active, |d| {
+                    d.text_color(theme.foreground)
+                        .cursor_pointer()
+                        .hover(|d| d.bg(theme.secondary_hover))
+                })
+                .child(label)
+        };
 
         // The column list: one checkbox per column of the result.
         let column_panel = self.columns_open.then(|| {
@@ -1396,20 +1525,23 @@ impl Render for TableTab {
             .child(
                 div().flex_1().min_h_0().child(
                     DataTable::new(&self.table)
-                        .with_size(px(30.))
+                        .with_size(px(22.))
                         .bordered(false)
-                        .header_row_height(px(34.))
-                        .stripe(false),
+                        .fixed_cols_border(false)
+                        .header_row_height(px(24.))
+                        .stripe(true),
                 ),
             )
             .when(self.drawer_open, |d| d.child(self.drawer.clone()))
             .children(column_panel)
+            .children(paging_panel)
             .child(
-                // Status bar, 28px: Filters, Columns, page size, row range | page buttons.
+                // Status bar, as TablePlus lays it out:
+                // Data | Structure | Index, + Row   1-300 of 1,000 rows   Filter, Columns, ‹ ⚙ ›
                 h_flex()
-                    .h(px(44.))
-                    .px_3()
-                    .gap_3()
+                    .h(px(32.))
+                    .px_2()
+                    .gap_2()
                     .items_center()
                     .justify_between()
                     .border_t_1()
@@ -1417,7 +1549,6 @@ impl Render for TableTab {
                     .bg(theme.status_bar)
                     .text_size(px(13.))
                     .text_color(theme.muted_foreground)
-                    // Left: Data | Structure | Index | + Row | page sizes
                     .child(
                         h_flex()
                             .flex_shrink_0()
@@ -1425,46 +1556,20 @@ impl Render for TableTab {
                             .items_center()
                             .child(
                                 h_flex()
-                                    .p_0p5()
-                                    .rounded_md()
-                                    .bg(theme.muted.opacity(0.6))
+                                    .p(px(2.))
                                     .gap_0p5()
-                                    .child(
-                                        div()
-                                            .px_2()
-                                            .py_0p5()
-                                            .rounded_sm()
-                                            .bg(theme.primary)
-                                            .text_color(gpui::white())
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .child("Data"),
-                                    )
-                                    .child(
-                                        div()
-                                            .px_2()
-                                            .py_0p5()
-                                            .rounded_sm()
-                                            .text_color(theme.muted_foreground)
-                                            .cursor_pointer()
-                                            .hover(|d| d.text_color(theme.foreground))
-                                            .child("Structure"),
-                                    )
-                                    .child(
-                                        div()
-                                            .px_2()
-                                            .py_0p5()
-                                            .rounded_sm()
-                                            .text_color(theme.muted_foreground)
-                                            .cursor_pointer()
-                                            .hover(|d| d.text_color(theme.foreground))
-                                            .child("Index"),
-                                    ),
+                                    .items_center()
+                                    .rounded_md()
+                                    .bg(theme.secondary)
+                                    .child(segment("Data", true))
+                                    .child(segment("Structure", false))
+                                    .child(div().w_px().h(px(12.)).bg(theme.border))
+                                    .child(segment("Index", false)),
                             )
                             .child(
                                 Button::new("add-row")
                                     .icon(hugeicon(Hugeicon::Plus))
                                     .label(if is_zh { "行" } else { "Row" })
-                                    .ghost()
                                     .small()
                                     .on_click(cx.listener(|this, _, _, cx| this.insert_row(cx))),
                             )
@@ -1492,10 +1597,8 @@ impl Render for TableTab {
                                             cx.listener(|this, _, _, cx| this.discard_changes(cx)),
                                         ),
                                 )
-                            })
-                            .child(sizes),
+                            }),
                     )
-                    // Center: 1-300 of 1,000,000 rows / X of Y rows selected
                     .child(
                         div()
                             .id("grid-status")
@@ -1506,10 +1609,8 @@ impl Render for TableTab {
                             .overflow_hidden()
                             .whitespace_nowrap()
                             .text_center()
-                            .text_color(theme.foreground)
                             .child(display_status),
                     )
-                    // Right: Filter | Columns | Pagination
                     .child(
                         h_flex()
                             .flex_shrink_0()
@@ -1517,9 +1618,10 @@ impl Render for TableTab {
                             .items_center()
                             .child(
                                 Button::new("filters-toggle")
-                                    .icon(hugeicon(Hugeicon::Filter))
+                                    .icon(hugeicon(Hugeicon::Search))
                                     .label(filter_label)
                                     .small()
+                                    .min_w(px(84.))
                                     .when(filter_count > 0 || self.drawer_open, |b| b.primary())
                                     .on_click(
                                         cx.listener(|this, _, _, cx| this.toggle_filters(cx)),
@@ -1527,29 +1629,50 @@ impl Render for TableTab {
                             )
                             .child(
                                 Button::new("columns-toggle")
-                                    .icon(hugeicon(Hugeicon::Columns))
                                     .label(columns_label)
                                     .small()
+                                    .min_w(px(84.))
                                     .when(shown < total || self.columns_open, |b| b.primary())
                                     .disabled(total == 0)
                                     .on_click(
                                         cx.listener(|this, _, _, cx| this.toggle_columns_panel(cx)),
                                     ),
                             )
-                            .child(super::cells::pager(
-                                cx,
-                                "grid",
-                                super::cells::PagerState {
-                                    has_prev,
-                                    has_next,
-                                    has_total: page.total().is_some(),
-                                },
-                                |this, nav, cx| this.navigate(nav, cx),
-                            ))
                             .child(
-                                hugeicon(Hugeicon::Sliders)
-                                    .size_5()
-                                    .text_color(theme.muted_foreground),
+                                h_flex()
+                                    .gap_0p5()
+                                    .items_center()
+                                    .child(
+                                        super::cells::page_button(
+                                            cx,
+                                            "grid",
+                                            pager_state,
+                                            super::cells::PageNav::Prev,
+                                            on_nav,
+                                        )
+                                        .ghost(),
+                                    )
+                                    .child(
+                                        Button::new("page-settings")
+                                            .icon(hugeicon(Hugeicon::Sliders))
+                                            .ghost()
+                                            .small()
+                                            .tooltip(if is_zh { "分页" } else { "Pagination" })
+                                            .when(self.paging_open, |b| b.primary())
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.toggle_paging_panel(cx)
+                                            })),
+                                    )
+                                    .child(
+                                        super::cells::page_button(
+                                            cx,
+                                            "grid",
+                                            pager_state,
+                                            super::cells::PageNav::Next,
+                                            on_nav,
+                                        )
+                                        .ghost(),
+                                    ),
                             ),
                     ),
             )

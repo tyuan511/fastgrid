@@ -1023,20 +1023,35 @@ impl Render for WorkspaceView {
                 database.clone().unwrap_or_else(|| host.clone())
             }
         };
-        let breadcrumb_text = match &active_table_name {
-            Some(table) => format!("{} / {}", db_name, table),
-            None => db_name.clone(),
+        // TablePlus's connection line: `LOCAL | MySQL 5.7.44 : alpha_new : shop : orders`.
+        let mut connection_line = format!(
+            "{} : {} : {}",
+            self.config.kind.display_name(),
+            self.config.name,
+            db_name
+        );
+        if let Some(table) = &active_table_name {
+            connection_line.push_str(" : ");
+            connection_line.push_str(table);
+        }
+        let environment_label = match self.config.environment {
+            fg_core::Environment::Development => "DEVELOPMENT",
+            fg_core::Environment::Staging => "STAGING",
+            _ => "PRODUCTION",
         };
 
         let env_color =
             super::style::environment_color(cx, self.config.environment, self.config.color);
-        let capsule_bg = gpui::transparent_black();
+        // TablePlus groups the toolbar buttons in light rounded boxes.
+        let (capsule_bg, capsule_border) = (theme.secondary, theme.border);
         let capsule = move || {
             h_flex()
                 .items_center()
                 .gap_0p5()
-                .p_0p5()
-                .rounded_lg()
+                .p(px(2.))
+                .rounded_md()
+                .border_1()
+                .border_color(capsule_border)
                 .bg(capsule_bg)
         };
         let divider = {
@@ -1120,9 +1135,16 @@ impl Render for WorkspaceView {
                                 .child(divider())
                                 .child(
                                     Button::new("sql-console")
-                                        .icon(hugeicon(Hugeicon::Terminal))
+                                        .child(
+                                            div()
+                                                .px_1()
+                                                .font_family(theme.mono_font_family.clone())
+                                                .text_size(px(11.))
+                                                .font_weight(FontWeight::BOLD)
+                                                .child("SQL"),
+                                        )
                                         .ghost()
-                                        .with_size(TOOLBAR_ICON_BOX)
+                                        .h(TOOLBAR_ICON_BOX)
                                         .tooltip("New query")
                                         .on_click(cx.listener(|_, _, _, cx| {
                                             cx.emit(WorkspaceEvent::NewQueryRequested)
@@ -1130,71 +1152,80 @@ impl Render for WorkspaceView {
                                 ),
                         ),
                 )
-                // The connection info owns the remaining width and centers itself,
-                // so it reads as the window's title instead of a left-over pill.
+                // The connection line takes the remaining width, left-aligned in monospace right
+                // after the button groups, as TablePlus prints it.
                 .child(
-                    h_flex().flex_1().min_w_0().justify_center().child(
-                        h_flex()
-                            .id("connection-pill")
-                            .test_support()
-                            .aria_label(self.config.name.clone())
-                            .gap_2()
-                            .px_3()
-                            .py_1()
-                            .items_center()
-                            .rounded_full()
-                            .bg(theme.muted)
-                            .text_size(px(13.))
-                            .text_color(theme.muted_foreground)
-                            .child(div().size_2().rounded_full().bg(env_color))
-                            .child(
-                                div()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme.foreground)
-                                    .child(self.config.name.clone()),
-                            )
-                            .child(div().opacity(0.5).child("/"))
-                            .child(breadcrumb_text),
-                    ),
+                    h_flex()
+                        .id("connection-pill")
+                        .test_support()
+                        .aria_label(self.config.name.clone())
+                        .flex_1()
+                        .min_w_0()
+                        .px_2()
+                        .gap_2()
+                        .items_center()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .font_family(theme.mono_font_family.clone())
+                        .text_size(px(12.))
+                        .text_color(theme.foreground)
+                        .child(
+                            div()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(env_color)
+                                .child(environment_label),
+                        )
+                        .child(div().text_color(theme.muted_foreground).child("|"))
+                        .child(div().min_w_0().text_ellipsis().child(connection_line)),
                 )
                 .child(
-                    capsule()
+                    h_flex()
+                        .gap_2()
+                        .items_center()
                         .child(
-                            Button::new("refresh-schema")
-                                .icon(hugeicon(Hugeicon::Refresh))
-                                .ghost()
-                                .with_size(TOOLBAR_ICON_BOX)
-                                .tooltip("Refresh schema")
-                                .on_click(cx.listener(|_, _, _, cx| {
-                                    cx.emit(WorkspaceEvent::RefreshSchema)
-                                })),
-                        )
-                        .child(divider())
-                        .child(
-                            Button::new("cycle-theme")
-                                .icon(match crate::theme_control::chosen(cx) {
-                                    fg_core::ThemeMode::Light => hugeicon(Hugeicon::Sun),
-                                    fg_core::ThemeMode::Dark => hugeicon(Hugeicon::Moon),
-                                    _ => hugeicon(Hugeicon::Command),
-                                })
-                                .ghost()
-                                .with_size(TOOLBAR_ICON_BOX)
-                                .tooltip(format!(
-                                    "Theme: {}",
-                                    crate::theme_control::label(crate::theme_control::chosen(cx))
-                                ))
-                                .on_click(
-                                    cx.listener(|_, _, _, cx| cx.emit(WorkspaceEvent::CycleTheme)),
+                            capsule()
+                                .child(
+                                    Button::new("refresh-schema")
+                                        .icon(hugeicon(Hugeicon::Refresh))
+                                        .ghost()
+                                        .with_size(TOOLBAR_ICON_BOX)
+                                        .tooltip("Refresh schema")
+                                        .on_click(cx.listener(|_, _, _, cx| {
+                                            cx.emit(WorkspaceEvent::RefreshSchema)
+                                        })),
+                                )
+                                .child(divider())
+                                .child(
+                                    Button::new("cycle-theme")
+                                        .icon(match crate::theme_control::chosen(cx) {
+                                            fg_core::ThemeMode::Light => hugeicon(Hugeicon::Sun),
+                                            fg_core::ThemeMode::Dark => hugeicon(Hugeicon::Moon),
+                                            _ => hugeicon(Hugeicon::Command),
+                                        })
+                                        .ghost()
+                                        .with_size(TOOLBAR_ICON_BOX)
+                                        .tooltip(format!(
+                                            "Theme: {}",
+                                            crate::theme_control::label(
+                                                crate::theme_control::chosen(cx)
+                                            )
+                                        ))
+                                        .on_click(cx.listener(|_, _, _, cx| {
+                                            cx.emit(WorkspaceEvent::CycleTheme)
+                                        })),
                                 ),
                         )
-                        .child(divider())
                         .child(
-                            Button::new("toggle-details")
-                                .icon(hugeicon(Hugeicon::SidebarRight))
-                                .ghost()
-                                .with_size(TOOLBAR_ICON_BOX)
-                                .tooltip("Toggle details panel")
-                                .on_click(cx.listener(|this, _, _, cx| this.toggle_details(cx))),
+                            capsule().child(
+                                Button::new("toggle-details")
+                                    .icon(hugeicon(Hugeicon::SidebarRight))
+                                    .ghost()
+                                    .with_size(TOOLBAR_ICON_BOX)
+                                    .tooltip("Toggle details panel")
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.toggle_details(cx)),
+                                    ),
+                            ),
                         ),
                 ),
         );
@@ -1723,31 +1754,31 @@ impl WorkspaceView {
                     let item = entry.item();
                     let theme = cx.theme().clone();
                     let info = meta.get(&item.id);
-                    // 16px of indent per level, rows 24px tall.
+                    // 16px of indent per level, rows 22px tall, as dense as TablePlus's list.
                     let indent = px(8.0 + 16.0 * entry.depth() as f32);
 
                     if entry.is_folder() {
-                        // Section header: TABLES (18)
+                        // Section header: `⌄ Tables`, in the list's own type like TablePlus.
                         let chevron = if entry.is_expanded() {
                             Hugeicon::ArrowDown
                         } else {
                             Hugeicon::ArrowRight
                         };
-                        return ListItem::new(ix).h(px(28.)).py_0().pl(indent).child(
+                        return ListItem::new(ix).h(px(22.)).py_0().pl(indent).child(
                             h_flex()
                                 .gap_1()
                                 .items_center()
                                 .child(
                                     hugeicon(chevron)
-                                        .size_5()
+                                        .size_4()
                                         .text_color(theme.muted_foreground),
                                 )
                                 .child(
                                     div()
-                                        .text_size(px(12.))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(theme.muted_foreground)
-                                        .child(item.label.to_uppercase()),
+                                        .font_family(theme.mono_font_family.clone())
+                                        .text_size(px(13.))
+                                        .text_color(theme.foreground)
+                                        .child(item.label.clone()),
                                 ),
                         );
                     }
@@ -1765,32 +1796,46 @@ impl WorkspaceView {
                     let estimate = info.and_then(|m| m.row_estimate).map(compact_count);
                     let matched = info.map(|m| m.matched.clone()).unwrap_or_default();
                     let view = view.clone();
+                    // TablePlus marks the selected object with a solid accent bar and white text.
                     ListItem::new(ix)
-                        .h(px(28.))
+                        .h(px(22.))
                         .py_0()
                         .selected(selected)
                         .pl(indent)
+                        .rounded_md()
+                        .when(selected, |d| {
+                            d.bg(theme.primary).text_color(theme.primary_foreground)
+                        })
                         .child(
                             h_flex()
+                                .group("tree-row")
                                 .w_full()
                                 .gap_2()
                                 .items_center()
                                 .justify_between()
                                 .child(
                                     h_flex()
-                                        .gap_2()
+                                        .gap_1p5()
                                         .items_center()
-                                        .text_sm()
-                                        .child(hugeicon(icon).size_5().text_color(icon_color))
+                                        .font_family(theme.mono_font_family.clone())
+                                        .text_size(px(13.))
+                                        .child(hugeicon(icon).size_4().text_color(if selected {
+                                            theme.primary_foreground
+                                        } else {
+                                            icon_color
+                                        }))
                                         .child(highlighted(&item.label, &matched)),
                                 )
+                                // TablePlus shows no counts; the estimate appears on hover only.
                                 .when_some(estimate, |d, e| {
                                     d.child(
                                         div()
                                             .pr_2()
                                             .text_xs()
+                                            .opacity(0.)
+                                            .group_hover("tree-row", |s| s.opacity(1.))
                                             .text_color(if selected {
-                                                gpui::white().opacity(0.8)
+                                                theme.primary_foreground.opacity(0.8)
                                             } else {
                                                 theme.muted_foreground
                                             })
@@ -1817,31 +1862,32 @@ impl WorkspaceView {
             .size_full()
             .bg(theme.sidebar)
             .child(
-                div().p_3().pb_2().child(
-                    h_flex()
-                        .p_1()
-                        .gap_1()
-                        .rounded_lg()
-                        .bg(theme.muted)
-                        .children(["Items", "Queries", "History"].map(|label| {
-                            let active = label == "Items";
-                            div()
-                                .flex_1()
-                                .text_center()
-                                .py_1()
-                                .rounded_md()
-                                .text_size(px(13.))
-                                .cursor_pointer()
-                                .when(active, |d| {
-                                    d.bg(theme.background)
-                                        .shadow_sm()
-                                        .text_color(theme.foreground)
-                                        .font_weight(FontWeight::MEDIUM)
-                                })
-                                .when(!active, |d| d.text_color(theme.muted_foreground))
-                                .child(label)
-                        })),
-                ),
+                // TablePlus's switch: plain labels, the active one on a grey pill.
+                h_flex()
+                    .px_3()
+                    .pt_2()
+                    .pb_1p5()
+                    .gap_1()
+                    .justify_center()
+                    .children(["Items", "Queries", "History"].map(|label| {
+                        let active = label == "Items";
+                        div()
+                            .px_3()
+                            .h(px(22.))
+                            .flex()
+                            .items_center()
+                            .rounded_md()
+                            .text_size(px(13.))
+                            .cursor_pointer()
+                            .when(active, |d| {
+                                d.bg(theme.secondary_active).text_color(theme.foreground)
+                            })
+                            .when(!active, |d| {
+                                d.text_color(theme.muted_foreground)
+                                    .hover(|d| d.text_color(theme.foreground))
+                            })
+                            .child(label)
+                    })),
             )
             .child(
                 h_flex()
@@ -1854,6 +1900,11 @@ impl WorkspaceView {
                             Input::new(&self.filter)
                                 .id("sidebar-filter")
                                 .small()
+                                .prefix(
+                                    hugeicon(Hugeicon::Search)
+                                        .size_4()
+                                        .text_color(theme.muted_foreground),
+                                )
                                 .cleanable(true),
                         ),
                     )
@@ -1889,8 +1940,9 @@ impl WorkspaceView {
             .into_any_element()
     }
 
-    /// The tab strip, 32px high: icon, title and close button per tab, active tab raised, tabs
-    /// draggable to reorder. `None` when nothing is open.
+    /// The tab strip, as TablePlus draws it: back / forward arrows, then the tabs sharing the width,
+    /// each title centered, the active one on a grey pill, the close button on hover. Tabs drag to
+    /// reorder. `None` when nothing is open.
     fn render_tab_strip(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if self.tabs.is_empty() {
             return None;
@@ -1915,53 +1967,40 @@ impl WorkspaceView {
                 let drag_title = title.clone();
                 let hover_bg = theme.list_hover;
                 let hover_fg = theme.foreground;
-                let tab_icon = match &t.kind {
-                    TabKind::Table { .. } => Hugeicon::Table,
-                    TabKind::Query { .. } => Hugeicon::Terminal,
-                };
                 h_flex()
                     .id(SharedString::from(format!("tab-{}", t.id)))
                     .test_support()
                     .aria_label(title.clone())
                     .group("tab")
                     .relative()
-                    .h_8()
-                    .min_w(px(120.))
-                    .max_w(px(240.))
-                    .flex_shrink_0()
-                    .pl_3()
-                    .pr_8()
-                    .gap_2()
+                    .h(px(24.))
+                    .flex_1()
+                    .min_w(px(80.))
+                    .px_7()
                     .items_center()
+                    .justify_center()
                     .rounded_md()
                     .text_size(px(13.))
                     .cursor_pointer()
                     .when(is_active, |d| {
-                        d.bg(theme.background)
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme.foreground)
+                        d.bg(theme.secondary).text_color(theme.foreground)
                     })
                     .when(!is_active, |d| {
                         d.text_color(theme.muted_foreground)
                             .hover(move |s| s.bg(hover_bg).text_color(hover_fg))
                     })
-                    .child(hugeicon(tab_icon).size_4().text_color(if is_active {
-                        theme.primary
-                    } else {
-                        theme.muted_foreground
-                    }))
                     .child(
                         div()
-                            .flex_1()
                             .min_w_0()
                             .overflow_hidden()
                             .text_ellipsis()
+                            .whitespace_nowrap()
                             .child(title),
                     )
                     .child(
                         div()
                             .absolute()
-                            .right_1()
+                            .left_1()
                             .opacity(0.)
                             .group_hover("tab", |s| s.opacity(1.))
                             .child(
@@ -1993,21 +2032,45 @@ impl WorkspaceView {
             })
             .collect();
 
+        let several = self.tabs.tabs().len() > 1;
         Some(
             h_flex()
                 .id("tab-strip")
                 .test_support()
-                .h(px(40.))
+                .h(px(32.))
                 .w_full()
                 .flex_shrink_0()
                 .overflow_hidden()
-                .px_2()
+                .px_1p5()
                 .gap_1()
                 .items_center()
                 .border_b_1()
                 .border_color(theme.border)
                 .bg(theme.tab_bar)
-                .children(tabs)
+                .child(
+                    Button::new("tab-prev")
+                        .icon(hugeicon(Hugeicon::ArrowLeft))
+                        .ghost()
+                        .xsmall()
+                        .disabled(!several)
+                        .on_click(cx.listener(|this, _, _, cx| this.prev_tab(cx))),
+                )
+                .child(
+                    Button::new("tab-next")
+                        .icon(hugeicon(Hugeicon::ArrowRight))
+                        .ghost()
+                        .xsmall()
+                        .disabled(!several)
+                        .on_click(cx.listener(|this, _, _, cx| this.next_tab(cx))),
+                )
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_1()
+                        .items_center()
+                        .children(tabs),
+                )
                 .into_any_element(),
         )
     }
@@ -2070,60 +2133,46 @@ impl WorkspaceView {
                     .into_iter()
                     .filter(|f| query.is_empty() || f.name.to_lowercase().contains(&query))
                     .map(|f| {
+                        // TablePlus's field: a small grey name over a boxed monospace value.
                         v_flex()
-                            .gap_1()
-                            .px_3()
-                            .py_1p5()
+                            .gap_0p5()
+                            .px_2()
+                            .py_1()
                             .child(
                                 h_flex()
                                     .justify_between()
                                     .items_center()
+                                    .text_size(px(12.))
+                                    .text_color(theme.muted_foreground)
+                                    .child(div().child(f.name))
                                     .child(
                                         div()
-                                            .text_size(px(14.))
-                                            .text_color(theme.muted_foreground)
-                                            .child(f.name),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(14.))
-                                            .text_color(theme.muted_foreground.opacity(0.8))
+                                            .text_size(px(11.))
+                                            .opacity(0.8)
                                             .child(f.data_type.to_lowercase()),
                                     ),
                             )
                             .child(
-                                h_flex()
+                                div()
                                     .w_full()
-                                    .gap_1()
-                                    .items_start()
-                                    .justify_between()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_md()
+                                    .min_h(px(24.))
+                                    .px_1p5()
+                                    .py(px(3.))
+                                    .rounded(px(5.))
                                     .border_1()
                                     .border_color(theme.border)
                                     .bg(theme.background)
-                                    .text_size(px(14.))
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .when(f.is_null, |d| {
-                                                d.text_color(theme.muted_foreground.opacity(0.65))
-                                                    .italic()
-                                            })
-                                            .when(!f.is_null, |d| d.text_color(theme.foreground))
-                                            .child(if f.is_null {
-                                                "NULL".to_string()
-                                            } else {
-                                                f.value_text
-                                            }),
-                                    )
-                                    .child(
-                                        hugeicon(Hugeicon::ArrowDown)
-                                            .size_5()
-                                            .text_color(theme.muted_foreground),
-                                    ),
+                                    .font_family(theme.mono_font_family.clone())
+                                    .text_size(px(13.))
+                                    .when(f.is_null, |d| {
+                                        d.text_color(theme.muted_foreground.opacity(0.65))
+                                    })
+                                    .when(!f.is_null, |d| d.text_color(theme.foreground))
+                                    .child(if f.is_null {
+                                        "NULL".to_string()
+                                    } else {
+                                        f.value_text
+                                    }),
                             )
                             .into_any_element()
                     })
@@ -2150,7 +2199,7 @@ impl WorkspaceView {
         v_flex()
             .id("details-panel")
             .test_support()
-            .w(px(300.))
+            .w(px(320.))
             .h_full()
             .border_l_1()
             .border_color(theme.border)
@@ -2166,6 +2215,11 @@ impl WorkspaceView {
                             Input::new(&self.details_filter)
                                 .id("details-filter")
                                 .small()
+                                .prefix(
+                                    hugeicon(Hugeicon::Search)
+                                        .size_4()
+                                        .text_color(theme.muted_foreground),
+                                )
                                 .cleanable(true),
                         ),
                     )
