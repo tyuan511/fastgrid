@@ -1824,6 +1824,7 @@ dependencies = [
 name = "fg-cli"
 version = "0.0.1"
 dependencies = [
+ "dirs 7.0.0",
  "fg-lsp",
  "fg-mcp",
  "fg-service",
@@ -1879,7 +1880,10 @@ name = "fg-mcp"
 version = "0.0.1"
 dependencies = [
  "fg-core",
+ "fg-driver",
  "fg-service",
+ "fg-store",
+ "rusqlite",
  "serde_json",
  "tokio",
 ]

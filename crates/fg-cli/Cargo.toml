@@ -12,6 +12,7 @@ workspace = true
 fg-lsp.workspace = true
 fg-service.workspace = true
 fg-mcp.workspace = true
+dirs.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 
