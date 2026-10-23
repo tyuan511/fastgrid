@@ -208,7 +208,8 @@
 - [ ] 行内编辑：双击 / `Enter` / 直接键入；`Tab` / `⇧Tab` / `Enter` / `Esc` 流转；枚举与外键字段的下拉
 - [ ] 行操作：插入、克隆（自增主键清空）、删除标记 / 恢复；`Set NULL` / `Set Empty` / `Set Default`；单点还原
 - [ ] 撤销 / 重做栈（纯内存）
-- [ ] DML 编译：`fg-sql` 基于 `Dialect` 生成 `INSERT` / `UPDATE` / `DELETE`（带参数）；用 `RETURNING` 或回读获取默认值和自增主键
+- [~] DML 编译：`fg-sql::compile_changes` 基于 `Dialect` 生成 `INSERT` / `UPDATE` / `DELETE`（全部带参数，标识符经方言引用）；`UPDATE` / `DELETE` 只按主键定位并声明 `expect_rows = 1`，空键 / NULL 键 / 重复列被拒绝；`SET c = DEFAULT` 在 SQLite 上返回 `Unsupported`（方言能力 `supports_default_keyword`）。*用 `RETURNING` 或回读获取默认值和自增主键待做；基于属性的测试待做*
+- [~] 提交：`OpenConnection::commit_changes`，单会话单事务；只读连接拒绝；无主键表、键不等于完整主键的更新 / 删除在租会话前拒绝；任一语句出错或影响行数不为 1 → 整体 `ROLLBACK`，错误指出第几条（`fg-service/tests/commit.rs` 5 个，去掉回滚后 2 个必然失败）。*不写历史行；L1 批量确认由界面负责；1000 条混合变更的验收数据待测*
 - [ ] 顶栏暂存胶囊（计数）、预览 SQL 弹窗（`⌘⇧P`）、提交（`⌘S`，单事务）、放弃全部（二次确认）
 - [ ] 提交失败：整体回滚并定位到出错的那一行
 - [ ] 行详情检查器（`Space`）：Text / JSON 模式，JSON 校验与格式化；与网格单元格双向同步
