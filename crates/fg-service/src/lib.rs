@@ -31,7 +31,7 @@ use std::time::Duration;
 use fg_core::{
     AuditEntry, ConnectionConfig, ConnectionGroup, ConnectionId, ConnectionParams, DocumentId,
     Error, ExecSettings, GridSettings, GroupId, ObjectPath, QueryDocument, QueryHistoryEntry,
-    Result, SecretKind, SettingGroup, Snippet, SnippetId, TableViewState, WorkspaceState,
+    Result, SafeMode, SecretKind, SettingGroup, Snippet, SnippetId, TableViewState, WorkspaceState,
 };
 use fg_driver::driver_for;
 use fg_store::{DeviceKeyProvider, Store, StoredConnection, StoredDocument, StoredSnippet};
@@ -140,6 +140,12 @@ pub struct ServiceOptions {
     pub max_sessions_per_connection: usize,
     /// How long schema metadata is trusted before it is read again.
     pub metadata_ttl: Duration,
+    /// Open every connection as [`SafeMode::ReadOnly`], whatever its saved setting says.
+    ///
+    /// For a headless agent process: the override lands on the in-memory config before the pool
+    /// is built, so the engine session is read-only and `run` classifies against read-only too.
+    /// It is never written back to the store.
+    pub force_read_only: bool,
 }
 
 impl ServiceOptions {
@@ -149,6 +155,7 @@ impl ServiceOptions {
             runtime: None,
             max_sessions_per_connection: 4,
             metadata_ttl: Duration::from_secs(60),
+            force_read_only: false,
         }
     }
 }
@@ -186,6 +193,7 @@ struct Inner {
     max_cell_bytes: Arc<AtomicUsize>,
     max_sessions: usize,
     metadata_ttl: Duration,
+    force_read_only: bool,
 }
 
 #[derive(Clone)]
@@ -240,6 +248,7 @@ impl Service {
                 max_cell_bytes: Arc::new(AtomicUsize::new(grid.max_cell_bytes as usize)),
                 max_sessions: options.max_sessions_per_connection,
                 metadata_ttl: options.metadata_ttl,
+                force_read_only: options.force_read_only,
             }),
         })
     }
@@ -488,7 +497,7 @@ impl Service {
                         Ok((stored, password))
                     })
                     .await?;
-                let config = match stored {
+                let mut config = match stored {
                     Some(StoredConnection::Ok(c)) => c,
                     Some(StoredConnection::Unreadable { reason, .. }) => {
                         return Err(Error::Unsupported(format!(
@@ -497,6 +506,9 @@ impl Service {
                     }
                     None => return Err(Error::Other("no such connection".into())),
                 };
+                if self.inner.force_read_only {
+                    config.safe_mode = Some(SafeMode::ReadOnly);
+                }
                 (config, password, epoch)
             };
             self.wait_open_pause().await;
