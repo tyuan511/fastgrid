@@ -16,6 +16,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod cache;
+mod commit;
 mod conn;
 mod keychain;
 mod pool;
@@ -38,6 +39,7 @@ use fg_store::{DeviceKeyProvider, Store, StoredConnection, StoredDocument, Store
 use tokio::runtime::Handle;
 use tokio::sync::broadcast;
 
+pub use commit::CommitOutcome;
 pub use conn::{BrowseOptions, OpenConnection, Refresh};
 pub use fg_store::AuditFilter;
 pub use keychain::{KeychainKeyProvider, MemoryBackend, OsKeychain, SecretBackend, account_name};
