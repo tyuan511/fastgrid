@@ -9,6 +9,7 @@
 mod browse;
 mod classify;
 mod comments;
+mod dml;
 mod format;
 pub mod lex;
 mod split;
@@ -16,6 +17,7 @@ mod split;
 pub use browse::{BuildOptions, BuiltQuery, build_count, build_select, validate_raw_where};
 pub use classify::{Analysis, StatementInfo, analyze, classify};
 pub use comments::{CommentEdit, toggle_line_comments};
+pub use dml::{CellChange, DmlStatement, RowChange, compile_changes};
 pub use format::{format_sql, is_formatted};
 pub use split::{StatementSpan, split_statements, statement_at};
 // The token stream, for `fg-lsp`: scope analysis needs to know where strings, comments and
