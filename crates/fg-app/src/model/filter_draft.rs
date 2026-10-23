@@ -236,6 +236,30 @@ fn parse_value(text: &str, category: TypeCategory) -> Result<Value, String> {
     }
 }
 
+/// Read text typed into a grid cell as a value for a column of this type.
+///
+/// Unlike a filter box, a cell keeps text exactly as typed (so `null` in a name column is the
+/// four letters), and only the exact word `NULL` means SQL NULL. Everything else follows the
+/// column type; text and unknown types accept anything.
+pub fn parse_cell_text(text: &str, category: TypeCategory) -> Result<Value, String> {
+    if text == "NULL" {
+        return Ok(Value::Null);
+    }
+    match category {
+        TypeCategory::Integer
+        | TypeCategory::Float
+        | TypeCategory::Decimal
+        | TypeCategory::Bool => {
+            // An empty numeric cell is a mistake, not NULL.
+            if text.trim().is_empty() {
+                return Err("enter a value, or NULL".into());
+            }
+            parse_value(text, category)
+        }
+        _ => Ok(Value::Text(text.to_owned())),
+    }
+}
+
 /// How a value is shown back in a text box.
 fn value_text(v: &Value) -> String {
     match v {
@@ -249,6 +273,29 @@ mod tests {
     use fg_core::DataType;
 
     use super::*;
+
+    #[test]
+    fn cell_text_keeps_text_verbatim_and_types_numbers() {
+        assert_eq!(
+            parse_cell_text("null", TypeCategory::Text),
+            Ok(Value::Text("null".into()))
+        );
+        assert_eq!(parse_cell_text("NULL", TypeCategory::Text), Ok(Value::Null));
+        assert_eq!(
+            parse_cell_text("  padded ", TypeCategory::Text),
+            Ok(Value::Text("  padded ".into()))
+        );
+        assert_eq!(
+            parse_cell_text("42", TypeCategory::Integer),
+            Ok(Value::Int(42))
+        );
+        assert!(parse_cell_text("4x", TypeCategory::Integer).is_err());
+        assert!(parse_cell_text("", TypeCategory::Integer).is_err());
+        assert_eq!(
+            parse_cell_text("", TypeCategory::Text),
+            Ok(Value::Text(String::new()))
+        );
+    }
 
     fn cols() -> Vec<ColumnMeta> {
         vec![
