@@ -624,3 +624,93 @@ fn hidden_columns_are_remembered_for_the_next_time(cx: &mut TestAppContext) {
         })
     });
 }
+
+#[gpui_kit::test]
+fn editing_in_the_grid_and_committing_changes_the_database(cx: &mut TestAppContext) {
+    let env = Env::new("commit");
+    let (_service, app) = start(cx, &env);
+    let tab = open_items(cx, &app);
+    settle(cx, "the first page and the primary key", |cx| {
+        status(cx, &app).starts_with("Showing 1–300 of 1,000")
+            && cx.read_entity(&tab, |t, cx| t.read_only_reason(cx).is_none())
+    });
+
+    // Rename row 1, delete row 2, add a row: three kinds of change in one commit.
+    cx.update_window(app.window, |_, window, cx| {
+        tab.update(cx, |t, cx| {
+            t.select_cell(0, 1, cx);
+            t.begin_edit(window, cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let input = cx.read_entity(&tab, |t, cx| t.editor_input(cx)).unwrap();
+    cx.update_window(app.window, |_, window, cx| {
+        input.update(cx, |s, cx| s.set_value("edited", window, cx));
+        tab.update(cx, |t, cx| {
+            t.commit_edit(window, cx);
+            t.select_row(1, cx);
+            t.toggle_delete_row(cx);
+            t.insert_row(cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(cx.read_entity(&tab, |t, cx| t.pending(cx).total()), 3);
+
+    cx.update_window(app.window, |_, window, cx| {
+        tab.update(cx, |t, cx| t.request_commit(window, cx));
+    })
+    .unwrap();
+    // The new row has no `name`, which the table requires: the engine refuses, everything rolls
+    // back, and the grid keeps what was typed together with the reason.
+    settle(cx, "the commit to answer", |cx| {
+        !cx.read_entity(&tab, |t, _| t.is_committing())
+    });
+    let message = cx
+        .update_window(app.window, |_, window, cx| {
+            window.render_frame(cx);
+            window
+                .try_find("grid-error")
+                .and_then(|e| e.label().map(str::to_owned))
+        })
+        .unwrap();
+    assert!(
+        message.as_deref().is_some_and(|m| m.contains("change 3")),
+        "{message:?}"
+    );
+    assert_eq!(cx.read_entity(&tab, |t, cx| t.pending(cx).total()), 3);
+
+    // Fill the missing value and commit again.
+    cx.update_window(app.window, |_, window, cx| {
+        tab.update(cx, |t, cx| {
+            t.select_cell(300, 1, cx);
+            t.begin_edit(window, cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let input = cx.read_entity(&tab, |t, cx| t.editor_input(cx)).unwrap();
+    cx.update_window(app.window, |_, window, cx| {
+        input.update(cx, |s, cx| s.set_value("brand new", window, cx));
+        tab.update(cx, |t, cx| {
+            t.commit_edit(window, cx);
+            t.request_commit(window, cx);
+        });
+    })
+    .unwrap();
+    // The controller commits, the grid reloads, and the count is asked for again.
+    settle(cx, "the commit and the reload", |cx| {
+        cx.read_entity(&tab, |t, cx| {
+            t.pending(cx).total() == 0 && !t.is_committing() && t.value_at(0, 1, cx).is_some()
+        }) && status(cx, &app).contains("of 1,000")
+    });
+    cx.read_entity(&tab, |t, cx| {
+        assert_eq!(t.value_at(0, 1, cx), Some(Value::Text("edited".into())));
+        assert_eq!(
+            t.value_at(1, 0, cx),
+            Some(Value::Int(3)),
+            "row 2 is gone from the database"
+        );
+    });
+}

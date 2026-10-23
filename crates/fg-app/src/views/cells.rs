@@ -157,10 +157,30 @@ pub enum CellSelection {
     Cell,
 }
 
+/// A staged change painted on a cell (roadmap M3): edited, added, or marked for deletion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellMark {
+    None,
+    Modified,
+    Inserted,
+    Deleted,
+}
+
 /// Frame for a body cell: its own padding (the columns have none) and a hairline on its left edge,
 /// which is what draws the vertical grid lines. A selected row is filled; the selected cell also
 /// gets a border all the way round.
 pub fn td_frame(child: AnyElement, selection: CellSelection, cx: &App) -> AnyElement {
+    td_frame_marked(child, selection, CellMark::None, cx)
+}
+
+/// [`td_frame`] with a staged-change tint underneath. The selection fill is drawn over it, so a
+/// selected edited cell still shows both.
+pub fn td_frame_marked(
+    child: AnyElement,
+    selection: CellSelection,
+    mark: CellMark,
+    cx: &App,
+) -> AnyElement {
     let theme = cx.theme();
     let frame = div()
         .size_full()
@@ -168,6 +188,16 @@ pub fn td_frame(child: AnyElement, selection: CellSelection, cx: &App) -> AnyEle
         .items_center()
         .px(px(8.))
         .overflow_hidden();
+    let (frame, child) = match mark {
+        CellMark::None => (frame, child),
+        CellMark::Modified => (frame.bg(theme.warning.opacity(0.22)), child),
+        CellMark::Inserted => (frame.bg(theme.success.opacity(0.20)), child),
+        // Struck through and tinted: still readable, clearly on its way out.
+        CellMark::Deleted => (
+            frame.bg(theme.danger.opacity(0.18)),
+            div().line_through().child(child).into_any_element(),
+        ),
+    };
     match selection {
         CellSelection::None => frame.border_l_1().border_color(theme.table_row_border),
         CellSelection::Row => frame

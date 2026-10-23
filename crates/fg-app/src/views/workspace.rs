@@ -759,6 +759,8 @@ impl WorkspaceView {
                     TableTabEvent::Reload => cx.emit(WorkspaceEvent::SessionChanged),
                     // Saved by the controller together with the table's other view state.
                     TableTabEvent::ViewChanged => {}
+                    // Run by the controller, which owns the connection.
+                    TableTabEvent::CommitRequested => {}
                     TableTabEvent::FollowForeignKey { table, filter } => {
                         this.open_table_filtered(table, filter.clone(), window, cx);
                     }

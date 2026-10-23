@@ -11,28 +11,41 @@ use std::rc::Rc;
 use std::collections::{HashMap, HashSet};
 
 use fg_core::{ColumnMeta, Filter, FilterOp, ObjectPath, TableViewState, Value};
+use fg_sql::{CellChange, RowChange};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::table::{
-    Column, ColumnSort, DataTable, TableDelegate, TableSelection, TableState,
+    Column, ColumnSort, DataTable, TableDelegate, TableEvent, TableSelection, TableState,
 };
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::actions::{CopySelection, GRID_CONTEXT};
-use super::cells::CellSelection;
+use super::actions::{
+    BeginEdit, CELL_EDITOR_CONTEXT, CancelCellEdit, CommitChanges, CopySelection, GRID_CONTEXT,
+    InsertRow, RedoEdit, ToggleDeleteRow, UndoEdit,
+};
+use super::cells::{CellMark, CellSelection};
 use super::filter_drawer::{FilterDrawer, FilterDrawerEvent};
 use super::icons::{Hugeicon, hugeicon};
 use crate::model::{
-    Align, DEFAULT_PAGE_SIZE, FilterDraft, GridQuery, JumpTarget, PAGE_SIZES, SortState, align_for,
-    copy_text, to_tsv,
+    Align, CellState, Changeset, Counts, DEFAULT_PAGE_SIZE, FilterDraft, GridQuery, JumpTarget,
+    PAGE_SIZES, RowId, RowState, SortState, align_for, copy_text, parse_cell_text, to_tsv,
 };
 
 /// A click on a column header, handed from the table delegate to the owning view.
 type SortRequest = Rc<RefCell<Option<String>>>;
 /// A click on a foreign-key arrow: (row, column) of the cell.
 type JumpRequest = Rc<RefCell<Option<(usize, usize)>>>;
+
+/// The cell being edited in place: where it is, and the text box over it.
+struct CellEditor {
+    row_ix: usize,
+    /// Column on screen (hidden columns are skipped), as the table reports it.
+    screen_col: usize,
+    input: Entity<InputState>,
+}
 
 pub struct GridDelegate {
     metas: Vec<ColumnMeta>,
@@ -50,6 +63,11 @@ pub struct GridDelegate {
     loading: bool,
     /// The selected (row, column) on screen, mirrored from the table so cells can paint it.
     selected: Option<(usize, usize)>,
+    /// Primary-key column names, in key order. Empty = the table cannot be edited.
+    key_columns: Vec<String>,
+    /// Staged edits; `None` until the columns are known.
+    changeset: Option<Changeset>,
+    editing: Option<CellEditor>,
 }
 
 impl GridDelegate {
@@ -66,6 +84,83 @@ impl GridDelegate {
             pending_jump,
             loading: false,
             selected: None,
+            key_columns: Vec::new(),
+            changeset: None,
+            editing: None,
+        }
+    }
+
+    /// Keep the staged edits while the same table is reloaded (paging, sorting, filtering) and
+    /// start fresh when the columns or the key changed underneath them.
+    fn rebuild_changeset(&mut self) {
+        let names: Vec<String> = self.metas.iter().map(|m| m.name.clone()).collect();
+        if names.is_empty() {
+            return;
+        }
+        let same = self.changeset.as_ref().is_some_and(|c| {
+            c.columns() == names.as_slice()
+                && c.key_column_indices()
+                    .iter()
+                    .map(|&i| names[i].as_str())
+                    .eq(self.key_columns.iter().map(String::as_str))
+        });
+        if !same {
+            let keys: Vec<&str> = self.key_columns.iter().map(String::as_str).collect();
+            self.changeset = Some(Changeset::new(names, &keys));
+        }
+    }
+
+    fn new_row_ids(&self) -> Vec<u64> {
+        self.changeset
+            .as_ref()
+            .map(Changeset::new_row_ids)
+            .unwrap_or_default()
+    }
+
+    /// Loaded rows plus the rows added in the changeset, which show after them.
+    fn total_rows(&self) -> usize {
+        self.rows.len() + self.new_row_ids().len()
+    }
+
+    fn row_id_at(&self, row_ix: usize) -> Option<RowId> {
+        let cs = self.changeset.as_ref()?;
+        match self.rows.get(row_ix) {
+            Some(row) => cs.row_id(row),
+            None => cs
+                .new_row_ids()
+                .get(row_ix - self.rows.len())
+                .map(|&n| RowId::New(n)),
+        }
+    }
+
+    /// What the cell shows: the staged value if there is one, else what was loaded.
+    fn shown_value(&self, row_ix: usize, data_col: usize) -> Value {
+        let staged = self.row_id_at(row_ix).and_then(|id| {
+            match self.changeset.as_ref()?.cell_state(&id, data_col) {
+                CellState::Modified(CellChange::Set(v)) => Some(v),
+                CellState::Modified(CellChange::Default) => Some(default_marker()),
+                CellState::Unchanged => None,
+            }
+        });
+        if let Some(v) = staged {
+            return v;
+        }
+        match self.rows.get(row_ix) {
+            Some(row) => row.get(data_col).cloned().unwrap_or(Value::Null),
+            // A new row's untouched cell takes its column default.
+            None => default_marker(),
+        }
+    }
+
+    fn mark_for(&self, row_ix: usize, data_col: usize) -> CellMark {
+        let (Some(cs), Some(id)) = (self.changeset.as_ref(), self.row_id_at(row_ix)) else {
+            return CellMark::None;
+        };
+        match cs.row_state(&id) {
+            RowState::Deleted => CellMark::Deleted,
+            RowState::Inserted => CellMark::Inserted,
+            _ if cs.cell_state(&id, data_col) != CellState::Unchanged => CellMark::Modified,
+            _ => CellMark::None,
         }
     }
 
@@ -100,6 +195,14 @@ impl GridDelegate {
     }
 }
 
+/// What an unset cell of a new row shows.
+fn default_marker() -> Value {
+    Value::Other {
+        type_name: String::new(),
+        text: "DEFAULT".into(),
+    }
+}
+
 /// A starting width per type; the user can resize.
 fn default_width(m: &ColumnMeta) -> f32 {
     use fg_core::TypeCategory::*;
@@ -126,7 +229,7 @@ impl TableDelegate for GridDelegate {
     }
 
     fn rows_count(&self, _: &App) -> usize {
-        self.rows.len()
+        self.total_rows()
     }
 
     fn column(&self, col_ix: usize, _: &App) -> Column {
@@ -202,24 +305,43 @@ impl TableDelegate for GridDelegate {
         // `col_ix` counts the columns on screen; the data may have hidden ones in between.
         let screen_col = col_ix;
         let col_ix = self.data_index(col_ix).unwrap_or(usize::MAX);
-        let value = self
-            .rows
-            .get(row_ix)
-            .and_then(|r| r.get(col_ix))
-            .unwrap_or(&Value::Null);
-        let followable = !value.is_null()
-            && self
-                .metas
-                .get(col_ix)
-                .is_some_and(|m| self.jumps.contains_key(&m.name));
-        let element = super::cells::cell_element(value, cx);
+        let value = self.shown_value(row_ix, col_ix);
+        let mark = self.mark_for(row_ix, col_ix);
         let selection = match self.selected {
             Some((r, c)) if r == row_ix && c == screen_col => CellSelection::Cell,
             Some((r, _)) if r == row_ix => CellSelection::Row,
             _ => CellSelection::None,
         };
+        if let Some(editor) = self
+            .editing
+            .as_ref()
+            .filter(|e| e.row_ix == row_ix && e.screen_col == screen_col)
+        {
+            // The text box replaces the cell's content; `Esc` is bound on this context.
+            let input = div()
+                .key_context(CELL_EDITOR_CONTEXT)
+                .id("cell-editor")
+                .test_support()
+                .size_full()
+                .child(
+                    Input::new(&editor.input)
+                        .id("cell-editor-input")
+                        .appearance(false)
+                        .bordered(false)
+                        .h_full(),
+                )
+                .into_any_element();
+            return super::cells::td_frame_marked(input, selection, mark, cx);
+        }
+        let followable = !value.is_null()
+            && !matches!(mark, CellMark::Deleted)
+            && self
+                .metas
+                .get(col_ix)
+                .is_some_and(|m| self.jumps.contains_key(&m.name));
+        let element = super::cells::cell_element(&value, cx);
         if !followable {
-            return super::cells::td_frame(element, selection, cx);
+            return super::cells::td_frame_marked(element, selection, mark, cx);
         }
         // A small arrow at the right edge opens the referenced row.
         let linked = h_flex()
@@ -246,16 +368,15 @@ impl TableDelegate for GridDelegate {
                     })),
             )
             .into_any_element();
-        super::cells::td_frame(linked, selection, cx)
+        super::cells::td_frame_marked(linked, selection, mark, cx)
     }
 
     fn cell_text(&self, row_ix: usize, col_ix: usize, _: &App) -> String {
         let col_ix = self.data_index(col_ix).unwrap_or(usize::MAX);
-        self.rows
-            .get(row_ix)
-            .and_then(|r| r.get(col_ix))
-            .map(copy_text)
-            .unwrap_or_default()
+        if row_ix >= self.total_rows() || col_ix >= self.metas.len() {
+            return String::new();
+        }
+        copy_text(&self.shown_value(row_ix, col_ix))
     }
 }
 
@@ -268,6 +389,9 @@ pub enum TableTabEvent {
     FollowForeignKey { table: ObjectPath, filter: Filter },
     /// Something that is remembered per table but needs no new data changed (hidden columns).
     ViewChanged,
+    /// The user asked to commit the staged changes (`⌘S`). The owner runs them and answers with
+    /// [`TableTab::commit_finished`].
+    CommitRequested,
 }
 
 /// A selected row's full field details for the inspector panel.
@@ -301,6 +425,9 @@ pub struct TableTab {
     elapsed_ms: Option<u64>,
     loaded_rows: usize,
     generation: u64,
+    /// A commit is running; a second `⌘S` is ignored until it answers.
+    committing: bool,
+    _edit_subscription: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -349,6 +476,13 @@ impl TableTab {
             }
             cx.notify();
         });
+        // A double click opens the cell for editing, like `Enter` does.
+        let on_table =
+            cx.subscribe_in(&table, window, |this, _, event: &TableEvent, window, cx| {
+                if let TableEvent::DoubleClickedCell(row, col) = event {
+                    this.begin_edit_at(*row, *col, window, cx);
+                }
+            });
         let initial = FilterDraft::from_applied(&query.filters, query.raw_where.as_deref());
         drawer.update(cx, |d, cx| d.load(initial, cx));
         Self {
@@ -364,7 +498,9 @@ impl TableTab {
             elapsed_ms: None,
             loaded_rows: 0,
             generation: 0,
-            _subscriptions: vec![observer, on_apply],
+            committing: false,
+            _edit_subscription: None,
+            _subscriptions: vec![observer, on_apply, on_table],
         }
     }
 
@@ -449,6 +585,344 @@ impl TableTab {
 
     pub fn is_loading(&self) -> bool {
         self.loading
+    }
+
+    // ---- staged edits (roadmap M3) -------------------------------------------------------------
+
+    /// The table's primary-key columns, from its metadata. Without one the grid is read-only.
+    pub fn set_primary_key(&mut self, keys: Vec<String>, cx: &mut Context<Self>) {
+        self.table.update(cx, |t, cx| {
+            let d = t.delegate_mut();
+            d.key_columns = keys;
+            d.rebuild_changeset();
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    /// Rows modified, added and marked for deletion.
+    pub fn pending(&self, cx: &App) -> Counts {
+        self.table
+            .read(cx)
+            .delegate()
+            .changeset
+            .as_ref()
+            .map(Changeset::counts)
+            .unwrap_or_default()
+    }
+
+    /// The staged changes, ready for `fg-sql` to compile.
+    pub fn changes(&self, cx: &App) -> Vec<RowChange> {
+        self.table
+            .read(cx)
+            .delegate()
+            .changeset
+            .as_ref()
+            .map(Changeset::changes)
+            .unwrap_or_default()
+    }
+
+    /// Why rows cannot be edited here, if they cannot.
+    pub fn read_only_reason(&self, cx: &App) -> Option<&'static str> {
+        self.table
+            .read(cx)
+            .delegate()
+            .changeset
+            .as_ref()
+            .and_then(Changeset::read_only_reason)
+    }
+
+    pub fn is_editing(&self, cx: &App) -> bool {
+        self.table.read(cx).delegate().editing.is_some()
+    }
+
+    /// The text in the open cell editor.
+    pub fn editor_text(&self, cx: &App) -> Option<String> {
+        self.table
+            .read(cx)
+            .delegate()
+            .editing
+            .as_ref()
+            .map(|e| e.input.read(cx).value().to_string())
+    }
+
+    /// The editor's text box, so a test (or the owner) can type into it.
+    pub fn editor_input(&self, cx: &App) -> Option<Entity<InputState>> {
+        self.table
+            .read(cx)
+            .delegate()
+            .editing
+            .as_ref()
+            .map(|e| e.input.clone())
+    }
+
+    /// The value on screen at (row, data column), staged edits included.
+    pub fn shown_value_at(&self, row: usize, col: usize, cx: &App) -> Option<Value> {
+        let d = self.table.read(cx).delegate();
+        (row < d.total_rows() && col < d.metas.len()).then(|| d.shown_value(row, col))
+    }
+
+    /// How the cell is marked: edited, added or deleted.
+    pub fn mark_at(&self, row: usize, col: usize, cx: &App) -> CellMark {
+        self.table.read(cx).delegate().mark_for(row, col)
+    }
+
+    pub fn total_rows(&self, cx: &App) -> usize {
+        self.table.read(cx).delegate().total_rows()
+    }
+
+    fn fail_edit(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.error = Some(message.into());
+        cx.notify();
+    }
+
+    /// Open the selected cell for editing (`Enter`).
+    pub fn begin_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let TableSelection::Cell(row, col) = self.table.read(cx).selection() {
+            self.begin_edit_at(row, col, window, cx);
+        }
+    }
+
+    fn begin_edit_at(
+        &mut self,
+        row: usize,
+        screen_col: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let d = self.table.read(cx).delegate();
+        if d.editing.is_some() || row >= d.total_rows() {
+            return;
+        }
+        if let Some(reason) = d.changeset.as_ref().and_then(Changeset::read_only_reason) {
+            self.fail_edit(reason, cx);
+            return;
+        }
+        let Some(data_col) = d.data_index(screen_col) else {
+            return;
+        };
+        if d.mark_for(row, data_col) == CellMark::Deleted {
+            self.fail_edit("This row is marked for deletion; restore it first.", cx);
+            return;
+        }
+        let text = match d.shown_value(row, data_col) {
+            Value::Null => "NULL".to_owned(),
+            Value::Other { type_name, text } if type_name.is_empty() && text == "DEFAULT" => {
+                String::new()
+            }
+            other => copy_text(&other),
+        };
+        let input = cx.new(|cx| {
+            let mut state = InputState::new(window, cx);
+            state.set_value(text, window, cx);
+            state
+        });
+        self._edit_subscription =
+            Some(
+                cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
+                    if let InputEvent::PressEnter { .. } = event {
+                        this.commit_edit(window, cx);
+                    }
+                }),
+            );
+        input.update(cx, |state, cx| {
+            state.focus(window, cx);
+            state.select_all(window, cx);
+        });
+        self.error = None;
+        self.table.update(cx, |t, cx| {
+            t.delegate_mut().editing = Some(CellEditor {
+                row_ix: row,
+                screen_col,
+                input,
+            });
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    /// Stage what is in the editor (`Enter`). A value that does not fit the column keeps the
+    /// editor open with the reason, rather than staging something else.
+    pub fn commit_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let d = self.table.read(cx).delegate();
+        let Some(editor) = d.editing.as_ref() else {
+            return;
+        };
+        let (row, screen_col) = (editor.row_ix, editor.screen_col);
+        let text = editor.input.read(cx).value().to_string();
+        let Some(data_col) = d.data_index(screen_col) else {
+            return;
+        };
+        let category = d.metas[data_col].data_type.category;
+        let value = match parse_cell_text(&text, category) {
+            Ok(v) => v,
+            Err(message) => {
+                self.fail_edit(message, cx);
+                return;
+            }
+        };
+        let staged = self.table.update(cx, |t, cx| {
+            let d = t.delegate_mut();
+            let id = d.row_id_at(row).ok_or("This row is no longer on screen.")?;
+            let baseline = d.rows.get(row).cloned().unwrap_or_default();
+            let cs = d.changeset.as_mut().ok_or("Nothing to edit yet.")?;
+            cs.edit_cell(&id, &baseline, data_col, CellChange::Set(value))?;
+            d.editing = None;
+            cx.notify();
+            Ok::<(), String>(())
+        });
+        match staged {
+            Ok(()) => {
+                self.error = None;
+                self.focus_table(window, cx);
+                cx.notify();
+            }
+            Err(message) => self.fail_edit(message, cx),
+        }
+    }
+
+    /// Close the editor without staging anything (`Esc`).
+    pub fn cancel_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let was_open = self.table.update(cx, |t, cx| {
+            let was_open = t.delegate_mut().editing.take().is_some();
+            cx.notify();
+            was_open
+        });
+        if was_open {
+            self._edit_subscription = None;
+            self.error = None;
+            self.focus_table(window, cx);
+            cx.notify();
+        }
+    }
+
+    fn focus_table(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let handle = self.table.focus_handle(cx);
+        window.focus(&handle, cx);
+    }
+
+    /// Add an empty row after the loaded ones (`⌘I`, the `+ Row` button).
+    pub fn insert_row(&mut self, cx: &mut Context<Self>) {
+        let added = self.table.update(cx, |t, cx| {
+            let result = match t.delegate_mut().changeset.as_mut() {
+                Some(cs) => cs.insert_row().map(|_| ()),
+                None => Err("The table is still loading.".to_owned()),
+            };
+            cx.notify();
+            result
+        });
+        match added {
+            Ok(()) => {
+                self.error = None;
+                let last = self.total_rows(cx).saturating_sub(1);
+                self.select_cell(last, 0, cx);
+            }
+            Err(message) => self.fail_edit(message, cx),
+        }
+    }
+
+    /// Mark the selected row for deletion, or bring it back if it is already marked (`⌘⌫`).
+    pub fn toggle_delete_row(&mut self, cx: &mut Context<Self>) {
+        let Some(row) = self.selected_row_index(cx) else {
+            return;
+        };
+        let outcome = self.table.update(cx, |t, cx| {
+            let d = t.delegate_mut();
+            let id = d.row_id_at(row);
+            let result = match (id, d.changeset.as_mut()) {
+                (Some(id), Some(cs)) => {
+                    if cs.row_state(&id) == RowState::Deleted {
+                        cs.restore_row(&id);
+                        Ok(())
+                    } else {
+                        cs.delete_row(&id)
+                    }
+                }
+                _ => Err("This row cannot be deleted.".to_owned()),
+            };
+            cx.notify();
+            result
+        });
+        if let Err(message) = outcome {
+            self.fail_edit(message, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    pub fn undo_edit(&mut self, cx: &mut Context<Self>) {
+        self.step_history(cx, Changeset::undo);
+    }
+
+    pub fn redo_edit(&mut self, cx: &mut Context<Self>) {
+        self.step_history(cx, Changeset::redo);
+    }
+
+    fn step_history(&mut self, cx: &mut Context<Self>, step: fn(&mut Changeset) -> bool) {
+        self.table.update(cx, |t, cx| {
+            if let Some(cs) = t.delegate_mut().changeset.as_mut() {
+                step(cs);
+            }
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    /// Throw every staged change away (undoable).
+    pub fn discard_changes(&mut self, cx: &mut Context<Self>) {
+        self.table.update(cx, |t, cx| {
+            let d = t.delegate_mut();
+            d.editing = None;
+            if let Some(cs) = d.changeset.as_mut() {
+                cs.discard_all();
+            }
+            cx.notify();
+        });
+        self.error = None;
+        cx.notify();
+    }
+
+    /// Ask the owner to commit (`⌘S`). An open editor is staged first, so what is on screen is
+    /// what gets committed.
+    pub fn request_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_editing(cx) {
+            self.commit_edit(window, cx);
+            if self.is_editing(cx) {
+                return; // the value was rejected; the message is showing
+            }
+        }
+        if self.committing || self.pending(cx).total() == 0 {
+            return;
+        }
+        self.committing = true;
+        self.error = None;
+        cx.emit(TableTabEvent::CommitRequested);
+        cx.notify();
+    }
+
+    /// The owner's answer to [`TableTabEvent::CommitRequested`]. On success the staged changes
+    /// are gone and the page is reloaded; on failure they are kept so nothing typed is lost.
+    pub fn commit_finished(&mut self, result: Result<(), String>, cx: &mut Context<Self>) {
+        self.committing = false;
+        match result {
+            Ok(()) => {
+                self.table.update(cx, |t, cx| {
+                    let d = t.delegate_mut();
+                    d.changeset = None;
+                    d.rebuild_changeset();
+                    cx.notify();
+                });
+                // Rows were added or removed: the count has to be asked for again.
+                self.query.page.set_total(None);
+                cx.emit(TableTabEvent::Reload);
+            }
+            Err(message) => self.error = Some(message.into()),
+        }
+        cx.notify();
+    }
+
+    pub fn is_committing(&self) -> bool {
+        self.committing
     }
 
     // ---- user actions: change the query, ask for a reload ------------------------------------
@@ -739,7 +1213,9 @@ impl TableTab {
             let d = t.delegate_mut();
             d.metas = columns;
             d.rows.clear();
+            d.editing = None;
             d.sort = SortState::from_keys(Vec::new());
+            d.rebuild_changeset();
             d.rebuild_columns();
             t.refresh(cx);
         });
@@ -812,6 +1288,7 @@ impl Render for TableTab {
             }
         };
         let page_size = page.size();
+        let pending = self.pending(cx);
         let filter_count = self.query.active_filter_count();
         let (shown, total) = self.column_counts(cx);
         let is_zh = crate::views::style::is_zh_locale();
@@ -891,6 +1368,17 @@ impl Render for TableTab {
             .size_full()
             .key_context(GRID_CONTEXT)
             .on_action(cx.listener(|this, _: &CopySelection, _, cx| this.copy_selection(cx)))
+            .on_action(
+                cx.listener(|this, _: &CommitChanges, window, cx| this.request_commit(window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &UndoEdit, _, cx| this.undo_edit(cx)))
+            .on_action(cx.listener(|this, _: &RedoEdit, _, cx| this.redo_edit(cx)))
+            .on_action(cx.listener(|this, _: &BeginEdit, window, cx| this.begin_edit(window, cx)))
+            .on_action(
+                cx.listener(|this, _: &CancelCellEdit, window, cx| this.cancel_edit(window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &InsertRow, _, cx| this.insert_row(cx)))
+            .on_action(cx.listener(|this, _: &ToggleDeleteRow, _, cx| this.toggle_delete_row(cx)))
             .bg(theme.background)
             .when_some(self.error.clone(), |d, e| {
                 d.child(
@@ -977,8 +1465,34 @@ impl Render for TableTab {
                                     .icon(hugeicon(Hugeicon::Plus))
                                     .label(if is_zh { "行" } else { "Row" })
                                     .ghost()
-                                    .small(),
+                                    .small()
+                                    .on_click(cx.listener(|this, _, _, cx| this.insert_row(cx))),
                             )
+                            .when(pending.total() > 0, |d| {
+                                d.child(
+                                    Button::new("commit-changes")
+                                        .label(if is_zh {
+                                            format!("提交 ({})", pending.total())
+                                        } else {
+                                            format!("Commit ({})", pending.total())
+                                        })
+                                        .primary()
+                                        .small()
+                                        .disabled(self.committing)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.request_commit(window, cx)
+                                        })),
+                                )
+                                .child(
+                                    Button::new("discard-changes")
+                                        .label(if is_zh { "放弃" } else { "Discard" })
+                                        .small()
+                                        .disabled(self.committing)
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| this.discard_changes(cx)),
+                                        ),
+                                )
+                            })
                             .child(sizes),
                     )
                     // Center: 1-300 of 1,000,000 rows / X of Y rows selected

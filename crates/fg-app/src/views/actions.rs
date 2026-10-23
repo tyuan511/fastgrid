@@ -10,6 +10,8 @@ use gpui_kit::{App, KeyBinding};
 pub const WORKSPACE_CONTEXT: &str = "Workspace";
 /// A table tab (data grid).
 pub const GRID_CONTEXT: &str = "TableTab";
+/// The cell editor that opens on a grid cell; deeper than the grid so `Esc` is its own.
+pub const CELL_EDITOR_CONTEXT: &str = "CellEditor";
 /// The connection list.
 pub const LAUNCHER_CONTEXT: &str = "Launcher";
 /// The query-history panel, which has its own keys while it is open.
@@ -52,6 +54,13 @@ gpui_kit::actions!(
         FormatSql,
         ToggleComment,
         ExplainQuery,
+        CommitChanges,
+        UndoEdit,
+        RedoEdit,
+        BeginEdit,
+        CancelCellEdit,
+        InsertRow,
+        ToggleDeleteRow,
     ]
 );
 
@@ -68,6 +77,15 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-shift-tab", PrevTab, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("secondary-f", ToggleFilters, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("secondary-c", CopySelection, Some(GRID_CONTEXT)),
+        // Staged edits (docs/shortcuts.md, "数据网格"). `⌘Z` inside the cell editor is the input's
+        // own undo: the editor's context is deeper and wins.
+        KeyBinding::new("secondary-s", CommitChanges, Some(GRID_CONTEXT)),
+        KeyBinding::new("secondary-z", UndoEdit, Some(GRID_CONTEXT)),
+        KeyBinding::new("secondary-shift-z", RedoEdit, Some(GRID_CONTEXT)),
+        KeyBinding::new("enter", BeginEdit, Some(GRID_CONTEXT)),
+        KeyBinding::new("secondary-i", InsertRow, Some(GRID_CONTEXT)),
+        KeyBinding::new("secondary-backspace", ToggleDeleteRow, Some(GRID_CONTEXT)),
+        KeyBinding::new("escape", CancelCellEdit, Some(CELL_EDITOR_CONTEXT)),
         KeyBinding::new("down", LauncherNext, Some(LAUNCHER_CONTEXT)),
         KeyBinding::new("up", LauncherPrev, Some(LAUNCHER_CONTEXT)),
         KeyBinding::new("enter", LauncherOpen, Some(LAUNCHER_CONTEXT)),

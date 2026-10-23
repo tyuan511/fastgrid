@@ -388,6 +388,20 @@ fn attach_table(
         // The workspace window opens the referenced table; nothing to load for this tab.
         TableTabEvent::FollowForeignKey { .. } => {}
         TableTabEvent::ViewChanged => save_view(&reload_service, &reload_conn, &reload_tab, cx),
+        TableTabEvent::CommitRequested => {
+            let changes = reload_tab.read(cx).changes(cx);
+            let path = reload_tab.read(cx).query().path().clone();
+            let (conn, tab) = (Arc::clone(&reload_conn), reload_tab.downgrade());
+            cx.spawn(async move |cx| {
+                let result = conn
+                    .commit_changes(&path, &changes)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| e.to_string());
+                let _ = tab.update(cx, |t, cx| t.commit_finished(result, cx));
+            })
+            .detach();
+        }
     })
     .detach();
 
@@ -406,6 +420,12 @@ fn attach_table(
             .map_or(crate::model::DEFAULT_PAGE_SIZE, |g| g.page_size);
         let hidden = saved.hidden_columns.clone();
         let targets = foreign_key_targets(&first_conn, &path).await;
+        // A view, or a table without a primary key, comes back empty and stays read-only.
+        let primary_key: Vec<String> = first_conn
+            .describe(&path)
+            .await
+            .map(|d| d.primary_key().into_iter().map(str::to_owned).collect())
+            .unwrap_or_default();
         let query = restore_query(path, page_size, &saved);
         cx.update(|cx| {
             let Some(tab) = first_tab.upgrade() else {
@@ -413,6 +433,7 @@ fn attach_table(
             };
             tab.update(cx, |t, cx| {
                 t.set_foreign_keys(targets, cx);
+                t.set_primary_key(primary_key, cx);
                 t.restore_query(query, cx);
                 t.restore_hidden_columns(hidden, cx);
             });
