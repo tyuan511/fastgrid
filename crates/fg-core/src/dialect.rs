@@ -37,6 +37,18 @@ pub trait Dialect: Send + Sync {
     fn supports_nulls_ordering(&self) -> bool {
         true
     }
+
+    /// Whether `UPDATE t SET c = DEFAULT` is valid. SQLite has no `DEFAULT` keyword in
+    /// expressions, so "reset to default" is not expressible there without reading the default
+    /// back, which a pure compiler cannot do.
+    fn supports_default_keyword(&self) -> bool {
+        true
+    }
+
+    /// An `INSERT` that sets no column: every column takes its default.
+    fn insert_defaults(&self, table: &str) -> String {
+        format!("INSERT INTO {table} DEFAULT VALUES")
+    }
 }
 
 fn quote_with(ident: &str, q: char) -> String {
@@ -60,6 +72,9 @@ impl Dialect for SqliteDialect {
     }
     fn default_port(&self) -> Option<u16> {
         None
+    }
+    fn supports_default_keyword(&self) -> bool {
+        false
     }
 }
 
@@ -93,6 +108,9 @@ impl Dialect for MySqlDialect {
     }
     fn supports_nulls_ordering(&self) -> bool {
         false
+    }
+    fn insert_defaults(&self, table: &str) -> String {
+        format!("INSERT INTO {table} () VALUES ()")
     }
     fn text_cast(&self, expr: &str) -> String {
         format!("CAST({expr} AS CHAR)")
