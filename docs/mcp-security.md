@@ -9,7 +9,7 @@ External agents can run SQL, so safety is designed in from day one, not bolted o
 
 ## Policy
 
-Target model. The transport does not exist yet. The agent half of items 1, 2, 4, 5 and 6 is **not**
+Target model. The stdio transport exists (see below); HTTP does not. The agent half of items 1, 2, 4, 5 and 6 is **not**
 enforced by the in-process API. What stage 1 does enforce is the next section. The M2.5 gap is a
 gap, not protection.
 
@@ -80,26 +80,33 @@ the intended policy and is **not implemented**. Until it is, Strict is a stronge
 gate than Alert, not a re-auth. Read-only is still stricter, because confirmation cannot
 authorize a write.
 
-## M2.5 gap (not protection)
+## The stdio transport (M2.5)
 
-`RunOptions::agent` only removes the confirmation capability and carries identity. On a
-Development or Normal connection an in-process caller can still write through `run()`. There is
-no in-process API that issues an engine-level read-only lease without changing the saved config.
-The trust boundary is the transport, and the transport does not exist yet.
+`fastgrid-cli mcp --stdio` closes the gap above for the stdio case:
 
-The MCP transport must enforce all of the following. Missing any one of them means stage 1 is
-not agent read-only:
+- **Read-only, both layers.** The process starts its `Service` with `ServiceOptions::force_read_only`.
+  Every connection it opens has its effective safe mode overridden to `ReadOnly` in memory, before
+  the pool is built: the engine session is read-only and `run` classifies against read-only, and
+  confirmation cannot override either. The saved config is not rewritten. The GUI process is
+  unaffected, so the same store can be open in both.
+- **Identity.** `initialize`'s `clientInfo.name`, prefixed `stdio:`, is the audit actor. stdio has
+  no authentication: whoever launched the process already holds the user's OS session and can read
+  the store directly, so the name labels the log; it is not a credential. A call before
+  `initialize` is refused. Authenticated identities arrive with the HTTP transport (M7).
+- **Visibility.** Only readable connections with `mcp_exposed()` are listed or usable. A hidden
+  connection and a missing one return the same error text.
+- **Limits.** Default 200 rows, never above the connection's `mcp.max_rows` or 5000; default 30 s
+  timeout, or the connection's `mcp.statement_timeout_secs`. An agent can lower the row cap, not
+  raise it. Replies are cut at 256 KiB and say so. Truncation is flagged per result set.
+- **No confirmation.** The transport only builds `RunOptions::agent`; there is no write tool.
+- **Audit.** `run_query` is recorded by `run` (including its refusals). Every other call, and a
+  `run_query` stopped before `run` (hidden connection, bad arguments), gets one row from the tool
+  layer, with the SQL when there is one. If that row cannot be written the call fails.
+- **Prompt injection.** `run_query` replies carry a note that the content is data, and the server
+  `instructions` say the same. That is a mitigation, not a guarantee.
 
-- Authenticated client identity. An agent-supplied string is not, by itself, that identity.
-- Per-access checks of `mcp_exposed`, `environment` (production and unknown stay hidden unless
-  explicitly exposed), and `McpAccess::allow_write`.
-- Its own row cap and timeout. `McpAccess::max_rows` and `statement_timeout_secs` are not merged
-  into `run` automatically.
-- No agent-supplied confirmation. Do not call `RunOptions::gui_confirmed`, and do not fill a
-  confirmation digest from the agent request.
-- An audit row for tool-level refusals that never reach `run`.
-- An engine-level read-only session in addition to classification. Classification alone is not
-  enough.
+Still open: PostgreSQL / MySQL engine-level read-only (M4 / M5), the HTTP transport with real
+client authentication, and `allow_write` (no write tool exists; M7 adds a GUI-gated one).
 
 ## Planned surface
 

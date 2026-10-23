@@ -14,7 +14,7 @@
 | M0 | 骨架与技术验证 | ✅ 已完成 | — |
 | M1 | 数据层补全 + 应用外壳（SQLite 端到端浏览） | 5w | 5w |
 | M2 | SQL 编辑器 + 一级安全模式 | 3w | 8w |
-| M2.5 | MCP 只读 MVP | 1w | 9w |
+| M2.5 | MCP 只读 MVP | ✅ 已实现，待联调 | — |
 | M3 | 暂存变更与数据编辑 | 4w | 13w |
 | M4 | PostgreSQL | 3w | 16w |
 | M5 | MySQL / MariaDB | 2.5w | 18.5w |
@@ -177,17 +177,24 @@
 
 ---
 
-## M2.5 MCP 只读 MVP（1w）
+## M2.5 MCP 只读 MVP（1w）— 已完成（待与真实客户端联调）
 
-目的：尽早让 `fg-service` 被第二个调用方（外部 agent）验证，暴露抽象问题。**尚未开始。**
-进程内 `RunOptions::agent` 不是引擎级只读租约：它只去掉确认并携带身份，Development / Normal 连接上仍可通过 `run()` 写入。本里程碑的传输层必须补上 [mcp-security.md](mcp-security.md) 列出的检查（已认证身份、`mcp_exposed` / 环境 / `allow_write`、自己的上限与超时、不接受 agent 确认、工具层拒绝也审计、引擎级只读叠加分类）。在那之前不能把 `run()` 的分类说成 agent 只读。
+目的：尽早让 `fg-service` 被第二个调用方（外部 agent）验证，暴露抽象问题。
+进程内 `RunOptions::agent` 不是引擎级只读租约（它只去掉确认并携带身份），所以传输层自己补上 [mcp-security.md](mcp-security.md) 列出的检查：
+`fastgrid-cli mcp --stdio` 用 `ServiceOptions::force_read_only` 启动 Service，该进程里**每条连接**都以只读打开（引擎会话只读 + 语句分类只读，覆盖仅存在内存、不写回存储）。
 
-- [ ] `fastgrid-cli mcp --stdio`（`rmcp`）：无头运行，与 GUI 共享 `fg-store` 里的连接配置
-- [ ] 工具：`list_connections`、`list_namespaces`、`describe_table`、`run_query`（强制只读 + `max_rows` + 超时）
-- [ ] 标为生产的连接默认不暴露
-- [ ] 与 Claude Desktop / Claude Code 联调并记录配置示例
+- [x] `fastgrid-cli mcp --stdio`：无头运行，与 GUI 共用同一个加密存储（`FASTGRID_DATA_DIR` 可覆盖）。
+      **没有用 `rmcp`**：需要的只有 `initialize` / `ping` / `tools/list` / `tools/call` 四个请求，手写 JSON-RPC 与 `fg-lsp` 同一思路，策略检查集中在一处，也避免为它引入一整棵依赖树
+- [x] 工具：`list_connections`、`list_namespaces`、`list_tables`、`describe_table`、`run_query`（强制只读 + 行数上限 + 超时；单元格里的二进制只给大小；回复超过 256 KiB 截断并说明）
+- [x] 标为生产（含未知环境）的连接默认不暴露；隐藏的连接与不存在的连接回复完全一样，agent 无法探测
+- [x] 行数上限：默认 200，连接的 `mcp.max_rows` 与硬上限 5000 取最小，agent 只能调低不能调高；超时默认 30s，取连接的 `mcp.statement_timeout_secs`
+- [x] 审计：`run_query` 由 `run` 自己记一行（含被拒绝的）；其余工具和在 `run` 之前被拒绝的调用由工具层记一行；审计写不进去时调用失败而不是放行
+- [ ] 与 Claude Desktop / Claude Code 联调并记录配置示例（**还没有真实客户端跑过**，目前验证的是协议层的进程测试和 `fg-mcp` 的集成测试）
 
-**验收**：外部 agent 能完成「列出表 → 查看结构 → 查询」；尝试写入会被拒绝（引擎层与语句分类两层都有测试）。
+**验收**：外部 agent 能完成「列出表 → 查看结构 → 查询」（`fg-mcp/tests/mcp.rs::an_agent_can_list_describe_and_query`）；
+写入被拒绝，8 种写法（含多语句、可写 CTE、`PRAGMA`、`ATTACH`）逐条测试，表内容不变；
+变异验证：把 `force_read_only` 关掉，`writes_are_refused_and_nothing_changes` 必然失败。
+引擎层只读本身沿用 SQLite 驱动已有的只读会话测试；PG / MySQL 的引擎层只读随 M4 / M5。
 
 ---
 
