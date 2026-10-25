@@ -14,9 +14,9 @@ pub use actions::{
     BeginEdit, CancelCellEdit, CancelQuery, CloseTab, CommitChanges, CopySelection, ExplainQuery,
     FormatSql, HistoryDismiss, HistoryNext, HistoryOpen, HistoryPrev, InsertRow, LauncherNext,
     LauncherOpen, LauncherPrev, NewConnection, NewQuery, NextTab, PrevTab, PreviewChanges,
-    QuickOpen, RedoEdit, RefreshSchema, RunAll, RunStatement, SaveSnippet, SnippetDismiss,
-    SnippetOpen, ToggleComment, ToggleDeleteRow, ToggleFilters, ToggleHistory, ToggleSidebar,
-    ToggleSnippets, UndoEdit, bind_keys,
+    QuickOpen, RESULT_CONTEXT, RedoEdit, RefreshSchema, RunAll, RunStatement, SaveSnippet,
+    SnippetDismiss, SnippetOpen, ToggleComment, ToggleDeleteRow, ToggleFilters, ToggleHistory,
+    ToggleSidebar, ToggleSnippets, UndoEdit, bind_keys,
 };
 pub use cells::CellMark;
 pub use filter_drawer::{FilterDrawer, FilterDrawerEvent};

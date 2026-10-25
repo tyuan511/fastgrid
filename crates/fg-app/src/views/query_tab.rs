@@ -21,16 +21,18 @@ use fg_service::{PolicyRefusal, RunPlan};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{
-    Editor, EditorState, InputEvent, TextDecoration, TextDecorationCollection,
+    Editor, EditorState, Input, InputEvent, InputState, TextDecoration, TextDecorationCollection,
 };
-use gpui_kit::component::table::{Column, DataTable, TableDelegate, TableState};
+use gpui_kit::component::table::{
+    Column, DataTable, TableDelegate, TableEvent, TableSelection, TableState,
+};
 use gpui_kit::component::{Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::model::{
-    self, DEFAULT_RESULT_PAGE_SIZE, PageState, QueryDocumentState, QueryResults, RESULT_PAGE_SIZES,
-    RunMode, RunStatus, RunTarget, align_for, run_target,
+    self, Changeset, DEFAULT_RESULT_PAGE_SIZE, PageState, QueryDocumentState, QueryResults,
+    RESULT_PAGE_SIZES, RunMode, RunStatus, RunTarget, align_for, run_target,
 };
 
 /// What the tab asks its owner to do.
@@ -50,6 +52,9 @@ pub enum QueryTabEvent {
     DismissedConfirmation,
     /// Explain what the current statement would do, instead of running it.
     Explain,
+    /// Commit the staged result edits. The controller reads the changes from the tab when it
+    /// handles this, so the event carries no payload that could go stale.
+    CommitResultEdits,
 }
 
 /// A dangerous statement waiting for an explicit click.
@@ -68,9 +73,22 @@ pub struct PendingConfirmation {
     pub production: bool,
 }
 
-/// A read-only result grid. Unlike the browse grid this has no paging, sorting or filtering: it
-/// shows what one run returned. Deliberately separate from `views::grid`, whose delegate carries
-/// sort, hidden-column and foreign-key state that an ad-hoc result must not inherit.
+/// The cell editor open on a result cell, mirroring the browse grid's `CellEditor`.
+struct ResultEditor {
+    row_ix: usize,
+    col_ix: usize,
+    input: Entity<InputState>,
+}
+
+/// A result grid. Unlike the browse grid this has no paging, sorting or filtering: it shows what
+/// one run returned. Deliberately separate from `views::grid`, whose delegate carries sort,
+/// hidden-column and foreign-key state that an ad-hoc result must not inherit.
+///
+/// Read-only by default. A result whose columns all come from one table becomes editable once the
+/// controller has described that table and handed over its primary key: the delegate then stages
+/// cell edits in a [`Changeset`] exactly like the browse grid, and `⌘S` commits them through the
+/// same `commit_changes` path. A result without a single table, or a table without a primary key,
+/// stays read-only, because there is no safe row to write back to.
 pub struct ResultDelegate {
     metas: Vec<ColumnMeta>,
     columns: Vec<Column>,
@@ -79,6 +97,8 @@ pub struct ResultDelegate {
     rows: Vec<Vec<Value>>,
     loading: bool,
     empty_message: Option<String>,
+    changeset: Option<Changeset>,
+    editing: Option<ResultEditor>,
 }
 
 impl Default for ResultDelegate {
@@ -95,10 +115,88 @@ impl ResultDelegate {
             rows: Vec::new(),
             loading: false,
             empty_message: None,
+            changeset: None,
+            editing: None,
         }
     }
 
-    /// New columns for a new result set; the rows belong to the previous one.
+    /// The staged edits for the set on screen, for the view to keep when it switches sets.
+    fn take_changeset(&mut self) -> Option<Changeset> {
+        self.changeset.take()
+    }
+
+    fn restore_changeset(&mut self, changeset: Option<Changeset>) {
+        self.changeset = changeset;
+    }
+
+    /// Name the primary key (in key order) for the set on screen. Until this is called the
+    /// changeset is read-only: `Changeset::new` with no usable key refuses every edit.
+    fn set_primary_key(&mut self, names: &[String]) {
+        let columns: Vec<String> = self
+            .metas
+            .iter()
+            .map(|m| {
+                m.origin
+                    .as_ref()
+                    .map(|o| o.column.clone())
+                    .unwrap_or_else(|| m.name.clone())
+            })
+            .collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        self.changeset = Some(Changeset::new(columns, &refs));
+    }
+
+    /// The value on screen: the staged edit when there is one, else the loaded value.
+    fn shown_value(&self, row_ix: usize, col_ix: usize) -> Value {
+        let Some(row) = self.rows.get(row_ix) else {
+            return Value::Null;
+        };
+        let baseline = row.get(col_ix).cloned().unwrap_or(Value::Null);
+        let Some(changeset) = self.changeset.as_ref() else {
+            return baseline;
+        };
+        let Some(id) = changeset.row_id(row) else {
+            return baseline;
+        };
+        match changeset.cell_state(&id, col_ix) {
+            model::CellState::Modified(fg_sql::CellChange::Set(value)) => value,
+            _ => baseline,
+        }
+    }
+
+    fn mark_for(&self, row_ix: usize, col_ix: usize) -> super::cells::CellMark {
+        let Some(row) = self.rows.get(row_ix) else {
+            return super::cells::CellMark::None;
+        };
+        let Some(changeset) = self.changeset.as_ref() else {
+            return super::cells::CellMark::None;
+        };
+        let Some(id) = changeset.row_id(row) else {
+            return super::cells::CellMark::None;
+        };
+        match changeset.cell_state(&id, col_ix) {
+            model::CellState::Modified(_) => super::cells::CellMark::Modified,
+            model::CellState::Unchanged => super::cells::CellMark::None,
+        }
+    }
+
+    fn pending(&self) -> usize {
+        self.changeset
+            .as_ref()
+            .map(|c| c.counts().total())
+            .unwrap_or(0)
+    }
+
+    fn changes(&self) -> Vec<fg_sql::RowChange> {
+        self.changeset
+            .as_ref()
+            .map(|c| c.changes())
+            .unwrap_or_default()
+    }
+
+    /// New columns for a new result set; the rows belong to the previous one. The changeset is
+    /// rebuilt read-only: the view restores the primary key (and any staged edits) for this set
+    /// right after, if it has them.
     fn replace(&mut self, metas: Vec<ColumnMeta>) {
         self.columns = metas
             .iter()
@@ -116,6 +214,19 @@ impl ResultDelegate {
             .collect();
         self.rows.clear();
         self.metas = metas;
+        self.editing = None;
+        self.changeset = Some(Changeset::new(
+            self.metas
+                .iter()
+                .map(|m| {
+                    m.origin
+                        .as_ref()
+                        .map(|o| o.column.clone())
+                        .unwrap_or_else(|| m.name.clone())
+                })
+                .collect(),
+            &[],
+        ));
     }
 }
 
@@ -186,14 +297,34 @@ impl TableDelegate for ResultDelegate {
         _: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
-        let value = self
-            .rows
-            .get(row_ix)
-            .and_then(|r| r.get(col_ix))
-            .unwrap_or(&Value::Null);
-        super::cells::td_frame(
-            super::cells::cell_element(value, cx),
+        if let Some(editor) = self.editing.as_ref()
+            && editor.row_ix == row_ix
+            && editor.col_ix == col_ix
+        {
+            let input = editor.input.clone();
+            return div()
+                .key_context(crate::views::actions::CELL_EDITOR_CONTEXT)
+                .id("result-cell-editor")
+                .test_support()
+                .size_full()
+                .rounded_sm()
+                .bg(cx.theme().background)
+                .child(
+                    div().w_full().child(
+                        Input::new(&input)
+                            .id("result-cell-input")
+                            .appearance(false)
+                            .bordered(false),
+                    ),
+                )
+                .into_any_element();
+        }
+        let value = self.shown_value(row_ix, col_ix);
+        let mark = self.mark_for(row_ix, col_ix);
+        super::cells::td_frame_marked(
+            super::cells::cell_element(&value, cx),
             super::cells::CellSelection::None,
+            mark,
             cx,
         )
     }
@@ -381,6 +512,16 @@ pub struct QueryTab {
     /// Byte range underlined as the failing position. Kept so a later run can replace it.
     decoration: Option<TextDecorationCollection>,
     active_set: usize,
+    /// Primary keys the controller described, per result-set index. A set keeps its key across
+    /// page turns and set switches, so switching back does not lose editability.
+    result_keys: std::collections::HashMap<usize, Vec<String>>,
+    /// Staged edits per result-set index. Switching sets parks the delegate's changeset here and
+    /// restores the other set's, so an edit is not lost by looking at another result.
+    result_changesets: std::collections::HashMap<usize, Option<Changeset>>,
+    /// Why the last result commit failed, if it did.
+    result_commit_error: Option<String>,
+    /// The cell editor's subscription, while one is open.
+    _result_editor_subscription: Option<Subscription>,
     /// The page shown for the active result set. A run can return far more rows than the table
     /// should be asked to lay out at once, so the delegate only ever holds one page.
     page: PageState,
@@ -430,7 +571,19 @@ impl QueryTab {
             }
         });
         let self_script_baseline = editor.read(cx).value().to_string();
-        let table = cx.new(|cx| TableState::new(ResultDelegate::new(), window, cx));
+        // Cell selection, like the browse grid, so a click picks the cell an edit starts from
+        // and a double-click opens it. No row header: the result has no gutter of its own.
+        let table = cx.new(|cx| {
+            TableState::new(ResultDelegate::new(), window, cx)
+                .cell_selectable(true)
+                .row_header(false)
+        });
+        let on_result =
+            cx.subscribe_in(&table, window, |this, _, event: &TableEvent, window, cx| {
+                if let TableEvent::DoubleClickedCell(row, col) = event {
+                    this.begin_result_edit(*row, *col, None, window, cx);
+                }
+            });
         Self {
             document,
             kind,
@@ -444,9 +597,13 @@ impl QueryTab {
             content_baseline: self_script_baseline,
             decoration: None,
             active_set: 0,
+            result_keys: std::collections::HashMap::new(),
+            result_changesets: std::collections::HashMap::new(),
+            result_commit_error: None,
+            _result_editor_subscription: None,
             page: PageState::new(DEFAULT_RESULT_PAGE_SIZE),
             catalog,
-            _subscriptions: vec![on_edit],
+            _subscriptions: vec![on_edit, on_result],
         }
     }
 
@@ -624,6 +781,11 @@ impl QueryTab {
     pub fn begin_run(&mut self, target: RunTarget, script: String, cx: &mut Context<Self>) -> u64 {
         self.confirmation = None;
         self.record_error = None;
+        self.result_commit_error = None;
+        // A new run's sets are new tables: keys and edits from the old run must not leak into
+        // them by index.
+        self.result_keys.clear();
+        self.result_changesets.clear();
         self.running_target = Some((target, script));
         self.clear_underline(cx);
         let generation = self.results.begin_run();
@@ -665,6 +827,7 @@ impl QueryTab {
                 t.delegate_mut().loading = false;
                 t.refresh(cx);
             });
+            self.restore_result_state(cx);
             // A new set starts at its first page.
             self.page.goto(0, self.active_rows().len() as u64);
             self.refresh_page(cx);
@@ -870,6 +1033,314 @@ impl QueryTab {
         cx.notify();
     }
 
+    // ---- editable results -------------------------------------------------------------------
+
+    /// Every finished result set that reads from one table, with its table, for the controller to
+    /// describe. A set that is not single-table is simply absent: it stays read-only.
+    pub fn editable_result_tables(&self) -> Vec<(usize, fg_core::ObjectPath)> {
+        self.results
+            .sets()
+            .iter()
+            .enumerate()
+            .filter_map(|(ix, set)| set.editable_table().map(|path| (ix, path)))
+            .collect()
+    }
+
+    /// The table and staged changes the controller commits for the active set, if it has any.
+    pub fn result_commit(&self, cx: &App) -> Option<(fg_core::ObjectPath, Vec<fg_sql::RowChange>)> {
+        let set = self.results.sets().get(self.active_set)?;
+        let path = set.editable_table()?;
+        let changes = self.table.read(cx).delegate().changes();
+        if changes.is_empty() {
+            return None;
+        }
+        Some((path, changes))
+    }
+
+    /// How many cells are staged on the active set, for the commit button and tests.
+    pub fn result_pending(&self, cx: &App) -> usize {
+        self.table.read(cx).delegate().pending()
+    }
+
+    /// The input of the result cell editor, while one is open.
+    pub fn result_editor_input(&self, cx: &App) -> Option<Entity<InputState>> {
+        self.table
+            .read(cx)
+            .delegate()
+            .editing
+            .as_ref()
+            .map(|e| e.input.clone())
+    }
+
+    /// The last result-edit or result-commit error, for tests and the error strip.
+    pub fn result_error(&self) -> Option<String> {
+        self.result_commit_error.clone()
+    }
+
+    /// The value on screen for a cell of the active set's page, staged edit included.
+    pub fn result_shown(&self, row: usize, col: usize, cx: &App) -> Option<Value> {
+        let delegate = self.table.read(cx).delegate();
+        if row >= delegate.rows.len() || col >= delegate.metas.len() {
+            return None;
+        }
+        Some(delegate.shown_value(row, col))
+    }
+
+    /// Whether the active set can be edited right now: a single table with a described key.
+    pub fn result_editable(&self, cx: &App) -> bool {
+        self.table
+            .read(cx)
+            .delegate()
+            .changeset
+            .as_ref()
+            .is_some_and(|c| c.read_only_reason().is_none())
+    }
+
+    /// Hand over a described primary key for one result set. The delegate for the set on screen
+    /// gets it immediately; other sets get it when they become active.
+    pub fn set_result_primary_key(
+        &mut self,
+        set_index: usize,
+        names: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.result_keys.insert(set_index, names.clone());
+        if self.active_set == set_index {
+            self.table.update(cx, |t, cx| {
+                t.delegate_mut().set_primary_key(&names);
+                if let Some(saved) = self.result_changesets.get(&set_index).cloned().flatten() {
+                    t.delegate_mut().restore_changeset(Some(saved));
+                }
+                cx.notify();
+            });
+        }
+        cx.notify();
+    }
+
+    /// Re-apply the active set's stored key and staged edits to a freshly replaced delegate.
+    fn restore_result_state(&mut self, cx: &mut Context<Self>) {
+        let keys = self.result_keys.get(&self.active_set).cloned();
+        let saved = self
+            .result_changesets
+            .get(&self.active_set)
+            .cloned()
+            .flatten();
+        self.table.update(cx, |t, cx| {
+            if let Some(keys) = keys {
+                t.delegate_mut().set_primary_key(&keys);
+            }
+            if let Some(saved) = saved {
+                t.delegate_mut().restore_changeset(Some(saved));
+            }
+            cx.notify();
+        });
+    }
+
+    /// Switch the delegate to another result set, parking the staged edits of the old one.
+    pub fn switch_result_set(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if ix == self.active_set || ix >= self.results.sets().len() {
+            return;
+        }
+        let parked = self
+            .table
+            .update(cx, |t, _| t.delegate_mut().take_changeset());
+        self.result_changesets.insert(self.active_set, parked);
+        self.active_set = ix;
+        if let Some(set) = self.results.sets().get(ix) {
+            let metas = set.columns.clone();
+            let keys = self.result_keys.get(&ix).cloned();
+            let saved = self.result_changesets.get(&ix).cloned().flatten();
+            self.table.update(cx, |t, cx| {
+                t.delegate_mut().replace(metas);
+                if let Some(keys) = keys {
+                    t.delegate_mut().set_primary_key(&keys);
+                }
+                if let Some(saved) = saved {
+                    t.delegate_mut().restore_changeset(Some(saved));
+                }
+                t.refresh(cx);
+            });
+            self.page.goto(0, self.active_rows().len() as u64);
+            self.refresh_page(cx);
+        }
+        cx.notify();
+    }
+
+    /// Open the editor on the selected result cell, if there is one.
+    pub fn begin_result_edit_from_selection(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let TableSelection::Cell(row, col) = self.table.read(cx).selection() {
+            self.begin_result_edit(row, col, None, window, cx);
+        }
+    }
+
+    /// Open the cell editor on a result cell. A read-only set refuses with the same reason the
+    /// browse grid shows, instead of opening an editor that can never commit.
+    pub fn begin_result_edit(
+        &mut self,
+        row: usize,
+        col: usize,
+        initial: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let d = self.table.read(cx).delegate();
+        if d.editing.is_some() || row >= d.rows.len() || col >= d.metas.len() {
+            return;
+        }
+        if let Some(reason) = d.changeset.as_ref().and_then(Changeset::read_only_reason) {
+            self.result_commit_error = Some(reason.to_owned());
+            cx.notify();
+            return;
+        }
+        let replacing = initial.is_some();
+        let text = match initial {
+            Some(typed) => typed,
+            None => match d.shown_value(row, col) {
+                Value::Null => "NULL".to_owned(),
+                other => crate::model::copy_text(&other),
+            },
+        };
+        let input = cx.new(|cx| {
+            let mut state = InputState::new(window, cx);
+            state.set_value(text, window, cx);
+            state
+        });
+        self._result_editor_subscription = Some(cx.subscribe_in(
+            &input,
+            window,
+            |this, _, event: &InputEvent, window, cx| match event {
+                InputEvent::PressEnter { .. } => {
+                    this.commit_result_edit(window, cx);
+                }
+                InputEvent::Blur => {
+                    this.commit_result_edit(window, cx);
+                }
+                _ => {}
+            },
+        ));
+        input.update(cx, |state, cx| {
+            state.focus(window, cx);
+            if !replacing {
+                state.select_all(window, cx);
+            }
+        });
+        self.result_commit_error = None;
+        self.table.update(cx, |t, cx| {
+            t.delegate_mut().editing = Some(ResultEditor {
+                row_ix: row,
+                col_ix: col,
+                input,
+            });
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    /// Stage what is in the result editor. A value that does not fit the column keeps the editor
+    /// open with the reason, rather than staging something else.
+    pub fn commit_result_edit(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let (row, col, input) = match self.table.read(cx).delegate().editing.as_ref() {
+            Some(e) => (e.row_ix, e.col_ix, e.input.clone()),
+            None => return true,
+        };
+        let text = input.read(cx).value().to_string();
+        let (category, baseline, id) = {
+            let d = self.table.read(cx).delegate();
+            let category = d
+                .metas
+                .get(col)
+                .map(|m| m.data_type.category)
+                .unwrap_or(fg_core::TypeCategory::Text);
+            let row_values = d.rows.get(row).cloned().unwrap_or_default();
+            let id = d.changeset.as_ref().and_then(|c| c.row_id(&row_values));
+            (category, row_values, id)
+        };
+        let Some(id) = id else {
+            self.cancel_result_edit(cx);
+            return false;
+        };
+        let parsed = match crate::model::parse_cell_text(&text, category) {
+            Ok(value) => value,
+            Err(reason) => {
+                self.result_commit_error = Some(reason);
+                cx.notify();
+                return false;
+            }
+        };
+        let staged = self.table.update(cx, |t, cx| {
+            let d = t.delegate_mut();
+            let result = d
+                .changeset
+                .as_mut()
+                .map(|c| c.edit_cell(&id, &baseline, col, fg_sql::CellChange::Set(parsed)))
+                .unwrap_or(Err("no changeset".into()));
+            d.editing = None;
+            cx.notify();
+            result
+        });
+        self._result_editor_subscription = None;
+        match staged {
+            Ok(()) => {
+                self.result_commit_error = None;
+                cx.notify();
+                true
+            }
+            Err(reason) => {
+                self.result_commit_error = Some(reason);
+                cx.notify();
+                false
+            }
+        }
+    }
+
+    /// Close the result editor without staging.
+    pub fn cancel_result_edit(&mut self, cx: &mut Context<Self>) {
+        self.table.update(cx, |t, cx| {
+            t.delegate_mut().editing = None;
+            cx.notify();
+        });
+        self._result_editor_subscription = None;
+        cx.notify();
+    }
+
+    /// Ask the controller to commit the active set's staged edits.
+    pub fn request_result_commit(&mut self, cx: &mut Context<Self>) {
+        if self.result_pending(cx) == 0 {
+            return;
+        }
+        cx.emit(QueryTabEvent::CommitResultEdits);
+    }
+
+    /// The controller's answer to a result commit. On success the staged values become the model
+    /// rows, so the grid shows the committed state without re-running the query; on failure the
+    /// edits stay staged and the reason is shown.
+    pub fn result_commit_finished(&mut self, result: Result<(), String>, cx: &mut Context<Self>) {
+        match result {
+            Ok(()) => {
+                let changes = self.table.read(cx).delegate().changes();
+                self.results.apply_result_changes(self.active_set, &changes);
+                self.table.update(cx, |t, cx| {
+                    t.delegate_mut().changeset = None;
+                    if let Some(keys) = self.result_keys.get(&self.active_set).cloned() {
+                        t.delegate_mut().set_primary_key(&keys);
+                    }
+                    cx.notify();
+                });
+                self.result_changesets.insert(self.active_set, None);
+                self.result_commit_error = None;
+                self.refresh_page(cx);
+            }
+            Err(reason) => {
+                self.result_commit_error = Some(reason);
+            }
+        }
+        cx.notify();
+    }
+
     pub fn focus(&self, window: &mut Window, cx: &mut App) {
         self.editor
             .update(cx, |editor, cx| editor.focus(window, cx));
@@ -971,17 +1442,7 @@ impl Render for QueryTab {
                         })
                         .child(label)
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.active_set = ix;
-                            if let Some(set) = this.results.sets().get(ix) {
-                                let metas = set.columns.clone();
-                                this.table.update(cx, |t, cx| {
-                                    t.delegate_mut().replace(metas);
-                                    t.refresh(cx);
-                                });
-                                this.page.goto(0, this.active_rows().len() as u64);
-                                this.refresh_page(cx);
-                            }
-                            cx.notify();
+                            this.switch_result_set(ix, cx);
                         }))
                         .into_any_element(),
                 )
@@ -1242,10 +1703,37 @@ impl Render for QueryTab {
                     .px_1()
                     .children(sets),
             )
+            .when_some(self.result_commit_error.clone(), |d, error| {
+                d.child(
+                    div()
+                        .id("result-commit-error")
+                        .test_support()
+                        .px_3()
+                        .py_1()
+                        .text_sm()
+                        .text_color(theme.danger)
+                        .aria_label(error.clone())
+                        .child(error),
+                )
+            })
             .child(
                 div()
                     .id("result-grid")
                     .test_support()
+                    .key_context(crate::views::RESULT_CONTEXT)
+                    .on_action(
+                        cx.listener(|this, _: &crate::views::BeginEdit, window, cx| {
+                            this.begin_result_edit_from_selection(window, cx);
+                        }),
+                    )
+                    .on_action(cx.listener(|this, _: &crate::views::CommitChanges, _, cx| {
+                        this.request_result_commit(cx);
+                    }))
+                    .on_action(
+                        cx.listener(|this, _: &crate::views::CancelCellEdit, _, cx| {
+                            this.cancel_result_edit(cx);
+                        }),
+                    )
                     .flex_1()
                     .min_h_0()
                     .child(
@@ -1302,6 +1790,19 @@ impl Render for QueryTab {
                         h_flex()
                             .gap_3()
                             .items_center()
+                            .when(self.result_pending(cx) > 0, |d| {
+                                let n = self.result_pending(cx);
+                                let label = if crate::views::style::is_zh_locale() {
+                                    format!("保存 {n} 处修改")
+                                } else {
+                                    format!("Save {n} change{}", if n == 1 { "" } else { "s" })
+                                };
+                                d.child(Button::new("result-commit").label(label).small().on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.request_result_commit(cx);
+                                    }),
+                                ))
+                            })
                             .child(
                                 div()
                                     .id("run-status")

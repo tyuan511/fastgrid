@@ -208,6 +208,9 @@ fn wire_workspace(
         WorkspaceEvent::QueryExplain { tab } => {
             explain(&conn, &runs, tab, cx);
         }
+        WorkspaceEvent::QueryResultCommit { tab } => {
+            commit_result(&conn, tab, cx);
+        }
         WorkspaceEvent::HistoryRequested { search } => {
             load_history(&service, &conn, &view, search.clone(), cx);
         }
@@ -824,13 +827,41 @@ fn run_from_editor(
         }
         // Truncation and record failures are per-run facts the service reports once the stream ends.
         let record_error = stream.record_error().map(str::to_owned);
-        let _ = task_tab.update(cx, |t, cx| {
-            match failure {
-                Some(err) => t.fail_run(generation, &err, cx),
-                None => t.finish_run(generation, cx),
-            }
-            t.set_record_error(generation, record_error, cx);
-        });
+        let succeeded = failure.is_none();
+        let tables = task_tab
+            .update(cx, |t, cx| {
+                match failure {
+                    Some(err) => t.fail_run(generation, &err, cx),
+                    None => t.finish_run(generation, cx),
+                }
+                t.set_record_error(generation, record_error, cx);
+                t.editable_result_tables()
+            })
+            .unwrap_or_default();
+        // A finished run's single-table sets become editable once their primary key is known. A
+        // description that fails (a view, a dropped table) just leaves that set read-only.
+        if succeeded && !tables.is_empty() {
+            let (describe_conn, describe_tab) = (Arc::clone(&conn), task_tab.clone());
+            cx.spawn(async move |cx| {
+                for (set_index, path) in tables {
+                    let keys: Vec<String> = describe_conn
+                        .describe(&path)
+                        .await
+                        .map(|d| d.primary_key().into_iter().map(str::to_owned).collect())
+                        .unwrap_or_default();
+                    if keys.is_empty() {
+                        continue;
+                    }
+                    let done = describe_tab.update(cx, |t, cx| {
+                        t.set_result_primary_key(set_index, keys, cx);
+                    });
+                    if done.is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
     });
 
     runs.borrow_mut()
@@ -844,6 +875,25 @@ fn run_from_editor(
             generation,
         },
     );
+}
+
+/// Commit an editable result set's staged edits through the same path a table tab uses, then
+/// hand the outcome back to the tab: it folds committed values into its rows itself, without
+/// re-running the query.
+fn commit_result(conn: &Arc<OpenConnection>, tab: &Entity<QueryTab>, cx: &mut App) {
+    let Some((path, changes)) = tab.read(cx).result_commit(cx) else {
+        return;
+    };
+    let (conn, tab) = (Arc::clone(conn), tab.downgrade());
+    cx.spawn(async move |cx| {
+        let result = conn
+            .commit_changes(&path, &changes)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+        let _ = tab.update(cx, |t, cx| t.result_commit_finished(result, cx));
+    })
+    .detach();
 }
 
 /// `⌘.`: ask the engine to stop and show it as cancelled. The service records the outcome.

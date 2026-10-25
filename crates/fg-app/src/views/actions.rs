@@ -10,6 +10,8 @@ use gpui_kit::{App, KeyBinding};
 pub const WORKSPACE_CONTEXT: &str = "Workspace";
 /// A table tab (data grid).
 pub const GRID_CONTEXT: &str = "TableTab";
+/// A query tab's result grid.
+pub const RESULT_CONTEXT: &str = "QueryResult";
 /// The cell editor that opens on a grid cell; deeper than the grid so `Esc` is its own.
 pub const CELL_EDITOR_CONTEXT: &str = "CellEditor";
 /// The connection list.
@@ -67,6 +69,7 @@ gpui_kit::actions!(
         SetCellDefault,
         RevertCell,
         PreviewChanges,
+        ToggleRowDetail,
     ]
 );
 
@@ -93,6 +96,14 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-d", CloneRow, Some(GRID_CONTEXT)),
         KeyBinding::new("secondary-backspace", ToggleDeleteRow, Some(GRID_CONTEXT)),
         KeyBinding::new("secondary-shift-p", PreviewChanges, Some(GRID_CONTEXT)),
+        // Space is not a type-to-edit key, so the grid can use it for the
+        // row-detail inspector without stealing a typed character.
+        KeyBinding::new("space", ToggleRowDetail, Some(GRID_CONTEXT)),
+        // An editable result grid shares the browse grid's edit keys, under its own context so
+        // they never fire while the SQL editor has focus.
+        KeyBinding::new("enter", BeginEdit, Some(RESULT_CONTEXT)),
+        KeyBinding::new("secondary-s", CommitChanges, Some(RESULT_CONTEXT)),
+        KeyBinding::new("escape", CancelCellEdit, Some(RESULT_CONTEXT)),
         KeyBinding::new("escape", CancelCellEdit, Some(CELL_EDITOR_CONTEXT)),
         KeyBinding::new("down", LauncherNext, Some(LAUNCHER_CONTEXT)),
         KeyBinding::new("up", LauncherPrev, Some(LAUNCHER_CONTEXT)),

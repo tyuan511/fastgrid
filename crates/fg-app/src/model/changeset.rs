@@ -11,7 +11,7 @@
 //! Undo/redo is snapshot based. The state is a handful of small maps, so cloning it per edit is
 //! cheaper than getting an inverse-operation log right, and it cannot drift out of sync.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use fg_core::Value;
 use fg_sql::{CellChange, RowChange};
@@ -55,12 +55,129 @@ struct Inserted {
     cells: BTreeMap<usize, CellChange>,
 }
 
+/// Canonical encoding of a primary-key value list, used as the index key.
+/// `Value` has no `Hash`/`Ord` (it can hold an `f64`), so the overlay keeps
+/// its own string index instead of keying a map on the values directly. The
+/// encoding is injective: every payload is length-prefixed or terminated, and
+/// floats are canonicalised (`-0.0` and `0.0` share an encoding, as do all
+/// NaNs), so equal keys always encode equal and distinct keys differ.
+fn encode_key(key: &[Value]) -> String {
+    fn value(out: &mut String, v: &Value) {
+        match v {
+            Value::Null => out.push_str("null;"),
+            Value::Bool(b) => out.push_str(if *b { "bool1;" } else { "bool0;" }),
+            Value::Int(i) => out.push_str(&format!("int:{i};")),
+            Value::UInt(u) => out.push_str(&format!("uint:{u};")),
+            Value::Float(f) => {
+                if f.is_nan() {
+                    out.push_str("float:nan;");
+                } else if *f == 0.0 {
+                    out.push_str("float:0;");
+                } else {
+                    out.push_str(&format!("float:{:x};", f.to_bits()));
+                }
+            }
+            Value::Decimal(s) => out.push_str(&format!("decimal:{}:{s};", s.len())),
+            Value::Text(s) => out.push_str(&format!("text:{}:{s};", s.len())),
+            Value::Bytes(b) => {
+                out.push_str(&format!("bytes:{}:", b.len()));
+                for byte in b {
+                    out.push_str(&format!("{byte:02x}"));
+                }
+                out.push(';');
+            }
+            Value::Json(s) => out.push_str(&format!("json:{}:{s};", s.len())),
+            Value::Uuid(s) => out.push_str(&format!("uuid:{}:{s};", s.len())),
+            Value::Date(s) => out.push_str(&format!("date:{}:{s};", s.len())),
+            Value::Time(s) => out.push_str(&format!("time:{}:{s};", s.len())),
+            Value::Timestamp(s) => out.push_str(&format!("timestamp:{}:{s};", s.len())),
+            Value::TimestampTz(s) => out.push_str(&format!("timestamptz:{}:{s};", s.len())),
+            Value::Interval(s) => out.push_str(&format!("interval:{}:{s};", s.len())),
+            Value::Array(items) => {
+                out.push_str(&format!("array:{}:", items.len()));
+                for item in items {
+                    value(out, item);
+                }
+                out.push(';');
+            }
+            Value::Truncated(t) => {
+                out.push_str(&format!("truncated:{:?}:{}:", t.kind, t.total_len));
+                for byte in &t.preview {
+                    out.push_str(&format!("{byte:02x}"));
+                }
+                out.push(';');
+            }
+            Value::Other { type_name, text } => out.push_str(&format!(
+                "other:{}:{type_name}:{}:{text};",
+                type_name.len(),
+                text.len()
+            )),
+            // `Value` is non-exhaustive: a future variant falls back to its
+            // serialized form, which still distinguishes it from the arms
+            // above, instead of silently colliding with them.
+            other => match serde_json::to_string(other) {
+                Ok(s) => out.push_str(&format!("future:{}:{s};", s.len())),
+                Err(_) => out.push_str("future-unserializable;"),
+            },
+        }
+    }
+    let mut out = String::new();
+    for v in key {
+        value(&mut out, v);
+    }
+    out
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 struct State {
     modified: Vec<Modified>,
+    /// Position of each modified row's key in `modified`, for O(1) lookup.
+    /// The vectors keep insertion order; the maps are reindexed after a
+    /// removal shifts the rows behind it.
+    modified_index: HashMap<String, usize>,
     inserted: Vec<Inserted>,
+    inserted_index: HashMap<u64, usize>,
     deleted: Vec<Vec<Value>>,
+    deleted_index: HashMap<String, usize>,
     next_id: u64,
+}
+
+impl State {
+    fn modified_pos(&self, key: &[Value]) -> Option<usize> {
+        self.modified_index.get(&encode_key(key)).copied()
+    }
+
+    fn inserted_pos(&self, id: u64) -> Option<usize> {
+        self.inserted_index.get(&id).copied()
+    }
+
+    fn deleted_pos(&self, key: &[Value]) -> Option<usize> {
+        self.deleted_index.get(&encode_key(key)).copied()
+    }
+
+    fn remove_modified_at(&mut self, pos: usize) {
+        let removed = self.modified.remove(pos);
+        self.modified_index.remove(&encode_key(&removed.key));
+        for (i, m) in self.modified.iter().enumerate().skip(pos) {
+            self.modified_index.insert(encode_key(&m.key), i);
+        }
+    }
+
+    fn remove_inserted_at(&mut self, pos: usize) {
+        let removed = self.inserted.remove(pos);
+        self.inserted_index.remove(&removed.id);
+        for (i, r) in self.inserted.iter().enumerate().skip(pos) {
+            self.inserted_index.insert(r.id, i);
+        }
+    }
+
+    fn remove_deleted_at(&mut self, pos: usize) {
+        let removed = self.deleted.remove(pos);
+        self.deleted_index.remove(&encode_key(&removed));
+        for (i, k) in self.deleted.iter().enumerate().skip(pos) {
+            self.deleted_index.insert(encode_key(k), i);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -147,7 +264,7 @@ impl Changeset {
                 .state
                 .modified
                 .iter()
-                .filter(|m| !self.state.deleted.contains(&m.key))
+                .filter(|m| self.state.deleted_pos(&m.key).is_none())
                 .count(),
             inserted_rows: self.state.inserted.len(),
             deleted_rows: self.state.deleted.len(),
@@ -157,16 +274,16 @@ impl Changeset {
     pub fn row_state(&self, id: &RowId) -> RowState {
         match id {
             RowId::New(n) => {
-                if self.state.inserted.iter().any(|r| r.id == *n) {
+                if self.state.inserted_pos(*n).is_some() {
                     RowState::Inserted
                 } else {
                     RowState::Unchanged
                 }
             }
             RowId::Existing(key) => {
-                if self.state.deleted.contains(key) {
+                if self.state.deleted_pos(key).is_some() {
                     RowState::Deleted
-                } else if self.state.modified.iter().any(|m| &m.key == key) {
+                } else if self.state.modified_pos(key).is_some() {
                     RowState::Modified
                 } else {
                     RowState::Unchanged
@@ -179,16 +296,12 @@ impl Changeset {
         let cells = match id {
             RowId::New(n) => self
                 .state
-                .inserted
-                .iter()
-                .find(|r| r.id == *n)
-                .map(|r| &r.cells),
+                .inserted_pos(*n)
+                .map(|p| &self.state.inserted[p].cells),
             RowId::Existing(key) => self
                 .state
-                .modified
-                .iter()
-                .find(|m| &m.key == key)
-                .map(|m| &m.cells),
+                .modified_pos(key)
+                .map(|p| &self.state.modified[p].cells),
         };
         match cells.and_then(|c| c.get(&column)) {
             Some(edit) => CellState::Modified(edit.clone()),
@@ -211,24 +324,22 @@ impl Changeset {
         }
         self.check_editable()?;
         if let RowId::Existing(key) = id
-            && self.state.deleted.contains(key)
+            && self.state.deleted_pos(key).is_some()
         {
             return Err("This row is marked for deletion; restore it first.".into());
         }
         match id {
             RowId::New(n) => {
-                if !self.state.inserted.iter().any(|r| r.id == *n) {
+                let Some(pos) = self.state.inserted_pos(*n) else {
                     return Err("no such new row".into());
-                }
+                };
                 self.checkpoint();
-                if let Some(row) = self.state.inserted.iter_mut().find(|r| r.id == *n) {
-                    row.cells.insert(column, edit);
-                }
+                self.state.inserted[pos].cells.insert(column, edit);
             }
             RowId::Existing(key) => {
                 let same_as_baseline =
                     matches!(&edit, CellChange::Set(v) if baseline.get(column) == Some(v));
-                let pos = self.state.modified.iter().position(|m| &m.key == key);
+                let pos = self.state.modified_pos(key);
                 if pos.is_none() && same_as_baseline {
                     return Ok(());
                 }
@@ -237,17 +348,21 @@ impl Changeset {
                     (Some(p), true) => {
                         self.state.modified[p].cells.remove(&column);
                         if self.state.modified[p].cells.is_empty() {
-                            self.state.modified.remove(p);
+                            self.state.remove_modified_at(p);
                         }
                     }
                     (None, true) => {}
                     (Some(p), false) => {
                         self.state.modified[p].cells.insert(column, edit);
                     }
-                    (None, false) => self.state.modified.push(Modified {
-                        key: key.clone(),
-                        cells: BTreeMap::from([(column, edit)]),
-                    }),
+                    (None, false) => {
+                        self.state.modified.push(Modified {
+                            key: key.clone(),
+                            cells: BTreeMap::from([(column, edit)]),
+                        });
+                        let at = self.state.modified.len() - 1;
+                        self.state.modified_index.insert(encode_key(key), at);
+                    }
                 }
             }
         }
@@ -262,15 +377,15 @@ impl Changeset {
         self.checkpoint();
         match id {
             RowId::New(n) => {
-                if let Some(row) = self.state.inserted.iter_mut().find(|r| r.id == *n) {
-                    row.cells.remove(&column);
+                if let Some(p) = self.state.inserted_pos(*n) {
+                    self.state.inserted[p].cells.remove(&column);
                 }
             }
             RowId::Existing(key) => {
-                if let Some(p) = self.state.modified.iter().position(|m| &m.key == key) {
+                if let Some(p) = self.state.modified_pos(key) {
                     self.state.modified[p].cells.remove(&column);
                     if self.state.modified[p].cells.is_empty() {
-                        self.state.modified.remove(p);
+                        self.state.remove_modified_at(p);
                     }
                 }
             }
@@ -288,6 +403,8 @@ impl Changeset {
         let id = self.state.next_id;
         self.state.next_id += 1;
         self.state.inserted.push(Inserted { id, cells });
+        let at = self.state.inserted.len() - 1;
+        self.state.inserted_index.insert(id, at);
         Ok(RowId::New(id))
     }
 
@@ -310,10 +427,8 @@ impl Changeset {
     pub fn clone_new_row(&mut self, id: u64) -> Result<RowId, String> {
         let mut cells = self
             .state
-            .inserted
-            .iter()
-            .find(|r| r.id == id)
-            .map(|r| r.cells.clone())
+            .inserted_pos(id)
+            .map(|p| self.state.inserted[p].cells.clone())
             .ok_or_else(|| "no such new row".to_owned())?;
         for key in &self.key_columns {
             cells.remove(key);
@@ -326,18 +441,20 @@ impl Changeset {
         self.check_editable()?;
         match id {
             RowId::New(n) => {
-                if !self.state.inserted.iter().any(|r| r.id == *n) {
+                let Some(pos) = self.state.inserted_pos(*n) else {
                     return Err("no such new row".into());
-                }
+                };
                 self.checkpoint();
-                self.state.inserted.retain(|r| r.id != *n);
+                self.state.remove_inserted_at(pos);
             }
             RowId::Existing(key) => {
-                if self.state.deleted.contains(key) {
+                if self.state.deleted_pos(key).is_some() {
                     return Ok(());
                 }
                 self.checkpoint();
                 self.state.deleted.push(key.clone());
+                let at = self.state.deleted.len() - 1;
+                self.state.deleted_index.insert(encode_key(key), at);
             }
         }
         Ok(())
@@ -346,10 +463,10 @@ impl Changeset {
     /// Undo a deletion mark. Edits made before the mark are still there.
     pub fn restore_row(&mut self, id: &RowId) {
         if let RowId::Existing(key) = id
-            && self.state.deleted.contains(key)
+            && let Some(pos) = self.state.deleted_pos(key)
         {
             self.checkpoint();
-            self.state.deleted.retain(|k| k != key);
+            self.state.remove_deleted_at(pos);
         }
     }
 
@@ -416,7 +533,7 @@ impl Changeset {
             out.push(RowChange::Delete { key: keyed(key) });
         }
         for m in &self.state.modified {
-            if !self.state.deleted.contains(&m.key) {
+            if self.state.deleted_pos(&m.key).is_none() {
                 out.push(RowChange::Update {
                     key: keyed(&m.key),
                     cells: named(&m.cells),
@@ -663,6 +780,56 @@ mod tests {
                 key: vec![("b".into(), int(2)), ("a".into(), int(1))]
             }]
         );
+    }
+
+    #[test]
+    fn lookups_stay_correct_after_removals_shift_the_rows() {
+        let mut c = cs();
+        for n in 1..=5 {
+            c.edit_cell(&id(n), &row(n), 1, set(text("x"))).unwrap();
+        }
+        // Removing the middle row must reindex the rows behind it.
+        c.edit_cell(&id(3), &row(3), 1, set(text("r3"))).unwrap();
+        assert_eq!(c.cell_state(&id(4), 1), CellState::Modified(set(text("x"))));
+        assert_eq!(c.cell_state(&id(5), 1), CellState::Modified(set(text("x"))));
+        assert_eq!(c.row_state(&id(3)), RowState::Unchanged);
+
+        let first = c.insert_row().unwrap();
+        let second = c.insert_row().unwrap();
+        let third = c.insert_row().unwrap();
+        c.delete_row(&second).unwrap();
+        assert_eq!(c.row_state(&first), RowState::Inserted);
+        assert_eq!(c.row_state(&third), RowState::Inserted);
+        assert_eq!(c.row_state(&second), RowState::Unchanged);
+
+        c.delete_row(&id(1)).unwrap();
+        c.delete_row(&id(2)).unwrap();
+        c.restore_row(&id(1));
+        assert_eq!(c.row_state(&id(1)), RowState::Modified);
+        assert_eq!(c.row_state(&id(2)), RowState::Deleted);
+        assert_eq!(c.counts().modified_rows, 3);
+        assert_eq!(c.counts().deleted_rows, 1);
+        assert_eq!(c.counts().inserted_rows, 2);
+    }
+
+    #[test]
+    fn key_encoding_does_not_confuse_similar_keys() {
+        // A naive concatenation would blur these into one key.
+        assert_ne!(
+            encode_key(&[text("a;b")]),
+            encode_key(&[text("a"), text("b")])
+        );
+        assert_ne!(encode_key(&[int(12)]), encode_key(&[int(1), int(2)]));
+        assert_ne!(encode_key(&[text("12")]), encode_key(&[int(12)]));
+        assert_eq!(
+            encode_key(&[Value::Float(-0.0)]),
+            encode_key(&[Value::Float(0.0)])
+        );
+        let mut c = Changeset::new(vec!["k".into(), "v".into()], &["k"]);
+        let key = c.row_id(&[text("a;b"), text("z")]).unwrap();
+        c.edit_cell(&key, &[text("a;b"), text("z")], 1, set(text("hit")))
+            .unwrap();
+        assert_eq!(c.cell_state(&key, 1), CellState::Modified(set(text("hit"))));
     }
 
     #[test]

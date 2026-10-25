@@ -403,6 +403,17 @@ fn the_commit_and_discard_buttons_follow_the_pending_count(cx: &mut TestAppConte
         window.render_frame(cx);
     })
     .unwrap();
+    assert_eq!(
+        pending(cx, &f).total(),
+        1,
+        "the first click only asks, it does not discard yet"
+    );
+    assert!(exists(cx, "confirm-discard"));
+    cx.update_window(f.window, |_, window, cx| {
+        window.click("confirm-discard-yes", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
     assert_eq!(pending(cx, &f).total(), 0);
     assert!(!exists(cx, "commit-changes"));
 }
@@ -606,9 +617,18 @@ fn the_sql_preview_shows_the_statements_with_values_written_in(cx: &mut TestAppC
          UPDATE \"main\".\"items\" SET \"name\" = 'O''Neil' WHERE \"id\" = 1;"
     );
 
-    // The panel goes away with the changes it described.
+    // The panel goes away with the changes it described, after confirming.
     cx.update_window(f.window, |_, window, cx| {
         window.click("discard-changes", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert!(
+        label(cx, &f, "preview-panel").is_some(),
+        "still there after one click"
+    );
+    cx.update_window(f.window, |_, window, cx| {
+        window.click("confirm-discard-yes", cx);
         window.render_frame(cx);
     })
     .unwrap();
@@ -678,4 +698,410 @@ fn set_null_empty_default_and_revert_act_on_the_selected_cell(cx: &mut TestAppCo
     act!(set_selected_cell_to_empty);
     assert_eq!(shown(cx, &f, 0, 0), Some(Value::Int(1)));
     assert!(error_text(cx, &f).unwrap().contains("text columns"));
+}
+
+fn has_status_bar(cx: &mut TestAppContext, f: &Fixture, row: usize) -> bool {
+    cx.update_window(f.window, |_, window, _| {
+        window.try_find(format!("row-status-{row}")).is_some()
+    })
+    .unwrap()
+}
+
+#[gpui_kit::test]
+fn the_gutter_shows_a_status_bar_for_staged_rows_only(cx: &mut TestAppContext) {
+    let f = open(cx, &["id"]);
+    assert!(!has_status_bar(cx, &f, 0));
+    assert!(!has_status_bar(cx, &f, 1));
+
+    begin_edit(cx, &f, 0, 1);
+    type_in_editor(cx, &f, "renamed");
+    press(cx, &f, "enter");
+    assert!(has_status_bar(cx, &f, 0), "the edited row gets a bar");
+    assert!(!has_status_bar(cx, &f, 1), "untouched rows do not");
+
+    // An inserted row and a deletion-marked row get one too.
+    focus_grid(cx, &f);
+    press(cx, &f, "secondary-i");
+    assert!(has_status_bar(cx, &f, 3), "the new row gets a bar");
+    select(cx, &f, 1, 0);
+    focus_grid(cx, &f);
+    press(cx, &f, "secondary-backspace");
+    assert!(
+        has_status_bar(cx, &f, 1),
+        "the deletion-marked row gets a bar"
+    );
+}
+
+#[gpui_kit::test]
+fn cancelling_the_discard_confirmation_keeps_the_changes(cx: &mut TestAppContext) {
+    let f = open(cx, &["id"]);
+    begin_edit(cx, &f, 0, 1);
+    type_in_editor(cx, &f, "kept");
+    press(cx, &f, "enter");
+    cx.update_window(f.window, |_, window, cx| {
+        window.click("discard-changes", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(pending(cx, &f).total(), 1);
+    cx.update_window(f.window, |_, window, cx| {
+        window.click("confirm-discard-no", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(pending(cx, &f).total(), 1, "cancel keeps the staged edit");
+    assert_eq!(shown(cx, &f, 0, 1), Some(Value::Text("kept".into())));
+    assert!(
+        cx.update_window(f.window, |_, window, _| window
+            .try_find("confirm-discard")
+            .is_none())
+            .unwrap(),
+        "the confirmation strip closes"
+    );
+}
+
+#[gpui_kit::test]
+fn a_failed_commit_moves_the_selection_to_the_failing_row(cx: &mut TestAppContext) {
+    let f = open(cx, &["id"]);
+    for row in 0..3 {
+        begin_edit(cx, &f, row, 1);
+        type_in_editor(cx, &f, &format!("changed {row}"));
+        press(cx, &f, "enter");
+    }
+    // Changes are updates in row order, so change 2 is the middle row.
+    cx.update_window(f.window, |_, window, cx| {
+        f.view.update(cx, |v, cx| {
+            v.commit_finished(Err("change 2: NOT NULL constraint failed".into()), cx)
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(selected(cx, &f), Some((1, 0)));
+    assert!(error_text(cx, &f).unwrap().contains("change 2"));
+
+    // An insert is the loaded rows plus its position among the inserts.
+    let g = open(cx, &["id"]);
+    begin_edit(cx, &g, 0, 1);
+    type_in_editor(cx, &g, "changed");
+    press(cx, &g, "enter");
+    select(cx, &g, 0, 0);
+    focus_grid(cx, &g);
+    press(cx, &g, "secondary-i");
+    cx.update_window(g.window, |_, window, cx| {
+        g.view.update(cx, |v, cx| {
+            v.commit_finished(Err("change 2: UNIQUE constraint failed".into()), cx)
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(selected(cx, &g), Some((3, 0)));
+
+    // An error that names no change leaves the selection alone.
+    select(cx, &g, 2, 0);
+    cx.update_window(g.window, |_, window, cx| {
+        g.view.update(cx, |v, cx| {
+            v.commit_finished(Err("the connection went away".into()), cx)
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(selected(cx, &g), Some((2, 0)));
+}
+
+#[gpui_kit::test]
+fn alert_mode_asks_before_a_batch_commit(cx: &mut TestAppContext) {
+    let f = open(cx, &["id"]);
+    cx.update_window(f.window, |_, window, cx| {
+        f.view
+            .update(cx, |v, cx| v.set_safe_mode(fg_core::SafeMode::Alert, cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    begin_edit(cx, &f, 0, 1);
+    type_in_editor(cx, &f, "guarded");
+    press(cx, &f, "enter");
+    cx.update_window(f.window, |_, window, cx| {
+        window.click("commit-changes", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert!(drain(cx, &f).is_empty(), "first Save only asks");
+    assert!(
+        cx.update_window(f.window, |_, window, _| window
+            .try_find("confirm-commit")
+            .is_some())
+            .unwrap()
+    );
+    cx.update_window(f.window, |_, window, cx| {
+        window.click("confirm-commit-no", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert!(
+        drain(cx, &f).is_empty(),
+        "cancel keeps the batch uncommitted"
+    );
+    assert_eq!(pending(cx, &f).total(), 1);
+
+    cx.update_window(f.window, |_, window, cx| {
+        window.click("commit-changes", cx);
+        window.render_frame(cx);
+        window.click("confirm-commit-yes", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(drain(cx, &f), [TableTabEvent::CommitRequested]);
+    assert!(cx.read_entity(&f.view, |v, _| v.is_committing()));
+}
+
+#[gpui_kit::test]
+fn the_editor_offers_enum_variants_as_a_list(cx: &mut TestAppContext) {
+    let f = open(cx, &["id"]);
+    cx.update_window(f.window, |_, window, cx| {
+        f.view.update(cx, |v, cx| {
+            let g = v.begin_load(cx);
+            v.set_columns(
+                g,
+                vec![
+                    ColumnMeta::new("id", DataType::new("INTEGER", TypeCategory::Integer)),
+                    ColumnMeta::new(
+                        "status",
+                        DataType::new("TEXT", TypeCategory::Enum).with_variants(vec![
+                            "active".into(),
+                            "archived".into(),
+                            "pending".into(),
+                        ]),
+                    ),
+                ],
+                cx,
+            );
+            v.append_rows(
+                g,
+                vec![vec![Value::Int(1), Value::Text("active".into())]],
+                cx,
+            );
+            v.finish(g, 1, cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    begin_edit(cx, &f, 0, 1);
+    assert!(
+        cx.update_window(f.window, |_, window, _| window
+            .try_find("cell-options")
+            .is_some())
+            .unwrap(),
+        "an enum column shows its variants"
+    );
+    cx.update_window(f.window, |_, window, cx| {
+        window.click("cell-option-1", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert!(!editing(cx, &f), "picking a variant stages it");
+    assert_eq!(shown(cx, &f, 0, 1), Some(Value::Text("archived".into())));
+    assert_eq!(mark(cx, &f, 0, 1), CellMark::Modified);
+}
+
+#[gpui_kit::test]
+fn the_editor_offers_page_values_for_a_foreign_key_column(cx: &mut TestAppContext) {
+    let f = open(cx, &["id"]);
+    cx.update_window(f.window, |_, window, cx| {
+        f.view.update(cx, |v, cx| {
+            v.set_foreign_keys(
+                vec![fg_app::model::JumpTarget {
+                    column: "name".into(),
+                    table: ObjectPath::new(Some("main"), "users"),
+                    referenced_column: "name".into(),
+                }],
+                cx,
+            );
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    begin_edit(cx, &f, 0, 1);
+    assert!(
+        cx.update_window(f.window, |_, window, _| window
+            .try_find("cell-options")
+            .is_some())
+            .unwrap(),
+        "a foreign-key column shows the page's values"
+    );
+    cx.update_window(f.window, |_, window, cx| {
+        window.click("cell-option-1", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(shown(cx, &f, 0, 1), Some(Value::Text("item 2".into())));
+}
+
+#[gpui_kit::test]
+fn space_opens_the_row_detail_and_json_mode_validates_and_formats(cx: &mut TestAppContext) {
+    let f = open(cx, &["id"]);
+    cx.update_window(f.window, |_, window, cx| {
+        f.view.update(cx, |v, cx| {
+            let g = v.begin_load(cx);
+            v.set_columns(
+                g,
+                vec![
+                    ColumnMeta::new("id", DataType::new("INTEGER", TypeCategory::Integer)),
+                    ColumnMeta::new("data", DataType::new("JSON", TypeCategory::Json)),
+                ],
+                cx,
+            );
+            v.append_rows(
+                g,
+                vec![vec![
+                    Value::Int(1),
+                    Value::Json(r#"{"b":1,"a":[1,2]}"#.into()),
+                ]],
+                cx,
+            );
+            v.finish(g, 1, cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    select(cx, &f, 0, 1);
+    focus_grid(cx, &f);
+    press(cx, &f, "space");
+    assert!(
+        cx.update_window(f.window, |_, window, _| window
+            .try_find("row-detail")
+            .is_some())
+            .unwrap(),
+        "Space opens the inspector"
+    );
+    let detail =
+        |cx: &mut TestAppContext| cx.read_entity(&f.view, |v, cx| v.detail_text(cx)).unwrap();
+    assert!(
+        detail(cx).contains("\"a\""),
+        "JSON mode formats the value: {}",
+        detail(cx)
+    );
+
+    // Invalid JSON is reported and nothing is staged.
+    cx.update_window(f.window, |_, window, cx| {
+        f.view
+            .update(cx, |v, cx| v.set_detail_text("not json", window, cx));
+        window.render_frame(cx);
+        window.click("detail-save", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert!(
+        cx.update_window(f.window, |_, window, _| window
+            .try_find("detail-error")
+            .is_some())
+            .unwrap(),
+        "invalid JSON shows an error"
+    );
+    assert_eq!(pending(cx, &f).total(), 0, "nothing staged on invalid JSON");
+
+    // Valid JSON stages the formatted text, and a grid edit flows back.
+    cx.update_window(f.window, |_, window, cx| {
+        f.view
+            .update(cx, |v, cx| v.set_detail_text(r#"{"x": true}"#, window, cx));
+        window.render_frame(cx);
+        window.click("detail-save", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(
+        shown(cx, &f, 0, 1),
+        // Staged values are text, like a hand-typed edit; the driver types
+        // the column again after the commit reloads it.
+        Some(Value::Text("{\n  \"x\": true\n}".into()))
+    );
+    assert_eq!(pending(cx, &f).total(), 1);
+    begin_edit(cx, &f, 0, 1);
+    type_in_editor(cx, &f, r#"{"y": 2}"#);
+    press(cx, &f, "enter");
+    // The inspector's single-line input collapses newlines to spaces, so
+    // compare as JSON, not as formatted text.
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&detail(cx)).unwrap(),
+        serde_json::json!({"y": 2}),
+        "a grid edit resyncs the inspector"
+    );
+}
+
+#[gpui_kit::test]
+fn the_row_detail_edits_a_text_cell_back_into_the_grid(cx: &mut TestAppContext) {
+    let f = open(cx, &["id"]);
+    select(cx, &f, 1, 1);
+    focus_grid(cx, &f);
+    press(cx, &f, "space");
+    assert_eq!(
+        cx.read_entity(&f.view, |v, cx| v.detail_text(cx)),
+        Some("item 2".into())
+    );
+    cx.update_window(f.window, |_, window, cx| {
+        f.view.update(cx, |v, cx| {
+            v.set_detail_text("renamed in detail", window, cx)
+        });
+        window.render_frame(cx);
+        window.click("detail-save", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(
+        shown(cx, &f, 1, 1),
+        Some(Value::Text("renamed in detail".into()))
+    );
+    assert_eq!(pending(cx, &f).total(), 1);
+    // Space again closes the inspector.
+    focus_grid(cx, &f);
+    press(cx, &f, "space");
+    assert!(
+        cx.update_window(f.window, |_, window, _| window
+            .try_find("row-detail")
+            .is_none())
+            .unwrap()
+    );
+}
+
+#[gpui_kit::test]
+fn right_click_menu_sets_a_cell_to_null_and_reverts_it(cx: &mut TestAppContext) {
+    let f = open(cx, &["id"]);
+    select(cx, &f, 0, 1);
+    cx.update_window(f.window, |_, window, cx| {
+        // Screen columns count the row-number gutter: column 2 is the second data column.
+        f.view.update(cx, |v, cx| v.open_cell_menu(0, 2, cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert!(
+        cx.update_window(f.window, |_, window, _| window
+            .try_find("cell-menu")
+            .is_some())
+            .unwrap(),
+        "the menu opens for the right-clicked cell"
+    );
+    cx.update_window(f.window, |_, window, cx| {
+        window.click("cell-menu-null", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(shown(cx, &f, 0, 1), Some(Value::Null));
+    assert_eq!(pending(cx, &f).total(), 1);
+    assert!(
+        cx.update_window(f.window, |_, window, _| window
+            .try_find("cell-menu")
+            .is_none())
+            .unwrap(),
+        "acting closes the menu"
+    );
+
+    // Reopen and revert: the staged edit is gone.
+    cx.update_window(f.window, |_, window, cx| {
+        f.view.update(cx, |v, cx| v.open_cell_menu(0, 2, cx));
+        window.render_frame(cx);
+        window.click("cell-menu-revert", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(shown(cx, &f, 0, 1), Some(Value::Text("item 1".into())));
+    assert_eq!(pending(cx, &f).total(), 0);
 }

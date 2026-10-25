@@ -1607,3 +1607,138 @@ fn a_result_header_shows_the_column_name_and_nothing_else(cx: &mut TestAppContex
         );
     }
 }
+
+fn origin_columns() -> Vec<ColumnMeta> {
+    let mut id = ColumnMeta::new("id", DataType::new("INTEGER", TypeCategory::Integer));
+    id.origin = Some(fg_core::ColumnOrigin {
+        namespace: None,
+        table: "items".to_owned(),
+        column: "id".to_owned(),
+    });
+    let mut name = ColumnMeta::new("name", DataType::new("TEXT", TypeCategory::Text));
+    name.origin = Some(fg_core::ColumnOrigin {
+        namespace: None,
+        table: "items".to_owned(),
+        column: "name".to_owned(),
+    });
+    vec![id, name]
+}
+
+fn feed_single_table(cx: &mut TestAppContext, f: &Fixture) {
+    feed(
+        cx,
+        f,
+        vec![
+            Event::ResultStart {
+                index: 0,
+                columns: origin_columns(),
+            },
+            Event::Rows(rows(2)),
+            end(false),
+        ],
+    );
+}
+
+#[gpui_kit::test]
+fn a_single_table_result_becomes_editable_once_its_key_is_known(cx: &mut TestAppContext) {
+    let f = open(cx, "SELECT id, name FROM items;");
+    feed_single_table(cx, &f);
+    assert!(
+        !cx.read_entity(&f.view, |t, cx| t.result_editable(cx)),
+        "no key yet, so read-only"
+    );
+    cx.update_window(f.window, |_, window, cx| {
+        f.view.update(cx, |t, cx| {
+            t.set_result_primary_key(0, vec!["id".to_owned()], cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert!(cx.read_entity(&f.view, |t, cx| t.result_editable(cx)));
+
+    // Edit a cell through the result editor, then commit through the event.
+    cx.update_window(f.window, |_, window, cx| {
+        f.view
+            .update(cx, |t, cx| t.begin_result_edit(0, 1, None, window, cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let input = cx
+        .read_entity(&f.view, |t, cx| t.result_editor_input(cx))
+        .expect("editor opens on an editable cell");
+    cx.update_window(f.window, |_, window, cx| {
+        input.update(cx, |s, cx| s.set_value("renamed".to_owned(), window, cx));
+        window.render_frame(cx);
+        f.view.update(cx, |t, cx| {
+            assert!(t.commit_result_edit(window, cx));
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(cx.read_entity(&f.view, |t, cx| t.result_pending(cx)), 1);
+    assert_eq!(
+        cx.read_entity(&f.view, |t, cx| t.result_shown(0, 1, cx)),
+        Some(Value::Text("renamed".into()))
+    );
+    assert!(
+        cx.update_window(f.window, |_, window, _| window
+            .try_find("result-commit")
+            .is_some())
+            .unwrap(),
+        "a staged edit offers a save button"
+    );
+    cx.update_window(f.window, |_, window, cx| {
+        f.view.update(cx, |t, cx| t.request_result_commit(cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert!(
+        drain(cx, &f)
+            .iter()
+            .any(|e| matches!(e, QueryTabEvent::CommitResultEdits))
+    );
+    cx.update_window(f.window, |_, window, cx| {
+        f.view
+            .update(cx, |t, cx| t.result_commit_finished(Ok(()), cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(cx.read_entity(&f.view, |t, cx| t.result_pending(cx)), 0);
+    assert_eq!(
+        cx.read_entity(&f.view, |t, cx| t.result_shown(0, 1, cx)),
+        Some(Value::Text("renamed".into())),
+        "the committed value stays on screen without a re-run"
+    );
+}
+
+#[gpui_kit::test]
+fn a_result_without_a_single_table_stays_read_only(cx: &mut TestAppContext) {
+    let f = open(cx, "SELECT count(*) AS n FROM items;");
+    feed(
+        cx,
+        &f,
+        vec![
+            Event::ResultStart {
+                index: 0,
+                columns: columns(),
+            },
+            Event::Rows(rows(1)),
+            end(false),
+        ],
+    );
+    cx.update_window(f.window, |_, window, cx| {
+        f.view
+            .update(cx, |t, cx| t.begin_result_edit(0, 1, None, window, cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert!(
+        cx.read_entity(&f.view, |t, cx| t.result_editor_input(cx))
+            .is_none(),
+        "no editor on a read-only result"
+    );
+    assert!(
+        cx.read_entity(&f.view, |t, _| t.result_error()).is_some(),
+        "the refusal is shown, not silent"
+    );
+}

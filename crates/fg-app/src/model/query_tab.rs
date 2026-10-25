@@ -287,6 +287,27 @@ impl ResultSetState {
         self.rows.len()
     }
 
+    /// The table this result set reads from, when every column maps to one table. An expression,
+    /// an aggregate, a join, or a column the engine could not place has no origin, and a result
+    /// like that can never be edited safely: there is no single row to write back to.
+    pub fn editable_table(&self) -> Option<fg_core::ObjectPath> {
+        if self.columns.is_empty() {
+            return None;
+        }
+        let mut table: Option<(Option<String>, String)> = None;
+        for column in &self.columns {
+            let origin = column.origin.as_ref()?;
+            let this = (origin.namespace.clone(), origin.table.clone());
+            match &table {
+                None => table = Some(this),
+                Some(known) if *known == this => {}
+                Some(_) => return None,
+            }
+        }
+        let (namespace, name) = table?;
+        Some(fg_core::ObjectPath::new(namespace.as_deref(), name))
+    }
+
     /// A statement that returns rows has columns; DML and DDL report only an affected count.
     pub fn returns_rows(&self) -> bool {
         !self.columns.is_empty()
@@ -555,6 +576,54 @@ impl QueryResults {
         self.sets.get(index)
     }
 
+    /// Fold committed updates back into a result set's rows, so a committed edit shows without
+    /// re-running the query. Only `Set` cells change: a `Default` cell's new value is whatever
+    /// the engine picked, which only a re-run would reveal.
+    pub fn apply_result_changes(&mut self, set_index: usize, changes: &[fg_sql::RowChange]) {
+        let Some(set) = self.sets.get_mut(set_index) else {
+            return;
+        };
+        let columns: Vec<String> = set
+            .columns
+            .iter()
+            .map(|m| {
+                m.origin
+                    .as_ref()
+                    .map(|o| o.column.clone())
+                    .unwrap_or_else(|| m.name.clone())
+            })
+            .collect();
+        for change in changes {
+            let fg_sql::RowChange::Update { key, cells } = change else {
+                continue;
+            };
+            let key_positions: Vec<usize> = key
+                .iter()
+                .filter_map(|(name, _)| columns.iter().position(|c| c == name))
+                .collect();
+            if key_positions.len() != key.len() {
+                continue;
+            }
+            for row in set.rows.iter_mut() {
+                let matches = key_positions
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &pos)| row.get(pos) == Some(&key[i].1));
+                if !matches {
+                    continue;
+                }
+                for (name, cell) in cells {
+                    if let Some(pos) = columns.iter().position(|c| c == name)
+                        && let fg_sql::CellChange::Set(value) = cell
+                        && let Some(slot) = row.get_mut(pos)
+                    {
+                        *slot = value.clone();
+                    }
+                }
+            }
+        }
+    }
+
     /// Rows delivered across every set.
     pub fn total_rows(&self) -> usize {
         self.sets.iter().map(ResultSetState::row_count).sum()
@@ -765,6 +834,55 @@ mod tests {
             elapsed_ms,
             warnings: Vec::new(),
         }
+    }
+
+    fn with_origin(mut meta: ColumnMeta, table: &str, column: &str) -> ColumnMeta {
+        meta.origin = Some(fg_core::ColumnOrigin {
+            namespace: None,
+            table: table.to_owned(),
+            column: column.to_owned(),
+        });
+        meta
+    }
+
+    fn editable_columns() -> Vec<ColumnMeta> {
+        vec![
+            with_origin(
+                ColumnMeta::new("id", DataType::new("INTEGER", TypeCategory::Integer)),
+                "items",
+                "id",
+            ),
+            with_origin(
+                ColumnMeta::new("name", DataType::new("TEXT", TypeCategory::Text)),
+                "items",
+                "name",
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_single_table_result_with_origins_is_editable_and_a_join_is_not() {
+        let mut set = ResultSetState::started(0, editable_columns());
+        set.rows = vec![vec![Value::Int(1), Value::Text("a".into())]];
+        assert_eq!(
+            set.editable_table(),
+            Some(fg_core::ObjectPath::new(None, "items"))
+        );
+        let mut joined = ResultSetState::started(0, editable_columns());
+        joined.columns[1] = with_origin(
+            ColumnMeta::new("name", DataType::new("TEXT", TypeCategory::Text)),
+            "other",
+            "name",
+        );
+        assert_eq!(joined.editable_table(), None, "a join has no single table");
+        let mut expression = ResultSetState::started(0, editable_columns());
+        expression.columns[1] =
+            ColumnMeta::new("n", DataType::new("INTEGER", TypeCategory::Integer));
+        assert_eq!(
+            expression.editable_table(),
+            None,
+            "an expression column has no origin"
+        );
     }
 
     fn query_error(message: &str, position: Option<usize>) -> Error {

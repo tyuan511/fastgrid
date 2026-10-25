@@ -45,6 +45,13 @@ pub trait Dialect: Send + Sync {
         true
     }
 
+    /// Whether `INSERT/UPDATE/DELETE ... RETURNING` is valid, so a commit can
+    /// read back the row it just wrote (defaults, generated keys) instead of
+    /// trusting the values it sent.
+    fn supports_returning(&self) -> bool {
+        false
+    }
+
     /// An `INSERT` that sets no column: every column takes its default.
     fn insert_defaults(&self, table: &str) -> String {
         format!("INSERT INTO {table} DEFAULT VALUES")
@@ -76,6 +83,10 @@ impl Dialect for SqliteDialect {
     fn supports_default_keyword(&self) -> bool {
         false
     }
+
+    fn supports_returning(&self) -> bool {
+        true
+    }
 }
 
 impl Dialect for PostgresDialect {
@@ -90,6 +101,10 @@ impl Dialect for PostgresDialect {
     }
     fn default_port(&self) -> Option<u16> {
         Some(5432)
+    }
+
+    fn supports_returning(&self) -> bool {
+        true
     }
 }
 

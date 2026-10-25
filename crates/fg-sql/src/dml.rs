@@ -42,6 +42,9 @@ pub struct DmlStatement {
     pub preview: String,
     /// Rows this statement must affect; `None` when any count is acceptable (inserts).
     pub expect_rows: Option<u64>,
+    /// The statement ends in `RETURNING *` and its result set is the row as
+    /// written (defaults and generated keys included), not a row count.
+    pub returns_row: bool,
 }
 
 /// Compile in order. One bad change fails the whole batch: a partial script is worse than none.
@@ -67,16 +70,17 @@ pub fn compile_changes(
 
 fn compile_one(table: &str, change: &RowChange, dialect: &dyn Dialect) -> Result<DmlStatement> {
     let mut params = Vec::new();
-    let (sql, expect_rows) = build(table, change, dialect, &mut |v: &Value| {
+    let (sql, expect_rows, returns_row) = build(table, change, dialect, &mut |v: &Value| {
         params.push(v.clone());
         dialect.placeholder(params.len())
     })?;
-    let (preview, _) = build(table, change, dialect, &mut |v: &Value| literal(v))?;
+    let (preview, _, _) = build(table, change, dialect, &mut |v: &Value| literal(v))?;
     Ok(DmlStatement {
         sql,
         params,
         preview: format!("{preview};"),
         expect_rows,
+        returns_row,
     })
 }
 
@@ -87,7 +91,7 @@ fn build(
     change: &RowChange,
     dialect: &dyn Dialect,
     bind: &mut dyn FnMut(&Value) -> String,
-) -> Result<(String, Option<u64>)> {
+) -> Result<(String, Option<u64>, bool)> {
     match change {
         RowChange::Insert { cells } => {
             check_unique(cells.iter().map(|(c, _)| c.as_str()))?;
@@ -98,18 +102,29 @@ fn build(
                     CellChange::Default => None,
                 })
                 .collect();
+            // Read the row back: an insert that omits a column (a default, a
+            // generated key) is not fully known until the engine says what it
+            // wrote. Dialects without RETURNING leave `returns_row` false and
+            // the caller falls back to whatever the driver reports.
+            let returning = dialect.supports_returning();
+            let suffix = if returning { " RETURNING *" } else { "" };
             if set.is_empty() {
-                return Ok((dialect.insert_defaults(table), None));
+                return Ok((
+                    format!("{}{suffix}", dialect.insert_defaults(table)),
+                    None,
+                    returning,
+                ));
             }
             let names: Vec<_> = set.iter().map(|(c, _)| dialect.quote_ident(c)).collect();
             let marks: Vec<_> = set.iter().map(|(_, v)| bind(v)).collect();
             Ok((
                 format!(
-                    "INSERT INTO {table} ({}) VALUES ({})",
+                    "INSERT INTO {table} ({}) VALUES ({}){suffix}",
                     names.join(", "),
                     marks.join(", ")
                 ),
                 None,
+                returning,
             ))
         }
         RowChange::Update { key, cells } => {
@@ -137,11 +152,16 @@ fn build(
             Ok((
                 format!("UPDATE {table} SET {} WHERE {filter}", sets.join(", ")),
                 Some(1),
+                false,
             ))
         }
         RowChange::Delete { key } => {
             let filter = key_filter(key, dialect, bind)?;
-            Ok((format!("DELETE FROM {table} WHERE {filter}"), Some(1)))
+            Ok((
+                format!("DELETE FROM {table} WHERE {filter}"),
+                Some(1),
+                false,
+            ))
         }
     }
 }
@@ -256,13 +276,14 @@ mod tests {
         .unwrap();
         assert_eq!(
             out[0].sql,
-            r#"INSERT INTO "users" ("name", "age") VALUES ($1, $2)"#
+            r#"INSERT INTO "users" ("name", "age") VALUES ($1, $2) RETURNING *"#
         );
         assert_eq!(
             out[0].params,
             [Value::Text("a'; DROP TABLE users;--".into()), Value::Null]
         );
         assert_eq!(out[0].expect_rows, None);
+        assert!(out[0].returns_row, "Postgres reads the inserted row back");
     }
 
     #[test]
@@ -273,10 +294,13 @@ mod tests {
                 .sql
                 .clone()
         };
-        assert_eq!(sql(&SqliteDialect), r#"INSERT INTO "users" DEFAULT VALUES"#);
+        assert_eq!(
+            sql(&SqliteDialect),
+            r#"INSERT INTO "users" DEFAULT VALUES RETURNING *"#
+        );
         assert_eq!(
             sql(&PostgresDialect),
-            r#"INSERT INTO "users" DEFAULT VALUES"#
+            r#"INSERT INTO "users" DEFAULT VALUES RETURNING *"#
         );
         assert_eq!(sql(&MySqlDialect), "INSERT INTO `users` () VALUES ()");
     }
@@ -389,7 +413,7 @@ mod tests {
         );
         assert_eq!(
             out[1].preview,
-            r#"INSERT INTO "users" ("data") VALUES (X'00FF');"#
+            r#"INSERT INTO "users" ("data") VALUES (X'00FF') RETURNING *;"#
         );
         // What is executed is still the parameterised text.
         assert_eq!(

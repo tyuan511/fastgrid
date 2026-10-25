@@ -541,3 +541,80 @@ fn selecting_a_row_in_a_table_populates_the_details_inspector(cx: &mut TestAppCo
     })
     .unwrap();
 }
+
+#[gpui_kit::test]
+fn closing_a_dirty_table_tab_asks_first_and_only_then_closes(cx: &mut TestAppContext) {
+    let f = open(cx);
+    open_table(cx, &f, "users");
+    let id = cx.read_entity(&f.view, |v, _| v.tabs().tabs()[0].id.clone());
+    let tab = cx.read_entity(&f.view, |v, _| v.tab_view(&id).unwrap().clone());
+    cx.update_window(f.window, |_, window, cx| {
+        tab.update(cx, |t, cx| {
+            t.set_primary_key(vec!["id".to_owned()], cx);
+            let generation = t.begin_load(cx);
+            t.set_columns(
+                generation,
+                vec![
+                    fg_core::ColumnMeta::new(
+                        "id",
+                        fg_core::DataType::new("INTEGER", fg_core::TypeCategory::Integer),
+                    ),
+                    fg_core::ColumnMeta::new(
+                        "username",
+                        fg_core::DataType::new("TEXT", fg_core::TypeCategory::Text),
+                    ),
+                ],
+                cx,
+            );
+            t.append_rows(
+                generation,
+                vec![vec![
+                    fg_core::Value::Int(42),
+                    fg_core::Value::Text("alice".into()),
+                ]],
+                cx,
+            );
+            t.finish(generation, 1, cx);
+            t.select_cell(0, 1, cx);
+            t.set_selected_cell_to_null(cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(
+        cx.read_entity(&tab, |t, cx| t.pending(cx).total()),
+        1,
+        "one staged edit"
+    );
+
+    let banner = |cx: &mut TestAppContext| {
+        cx.update_window(f.window, |_, window, _| {
+            window.try_find("confirm-close-tab").is_some()
+        })
+        .unwrap()
+    };
+    cx.update_window(f.window, |_, window, cx| {
+        f.view.update(cx, |v, cx| v.close_tab(&id, cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(titles(cx, &f), vec!["users"], "first close only asks");
+    assert!(banner(cx));
+
+    cx.update_window(f.window, |_, window, cx| {
+        window.click("confirm-close-no", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(titles(cx, &f), vec!["users"], "cancel keeps the tab");
+    assert!(!banner(cx));
+
+    cx.update_window(f.window, |_, window, cx| {
+        f.view.update(cx, |v, cx| v.close_tab(&id, cx));
+        window.render_frame(cx);
+        window.click("confirm-close-yes", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert!(titles(cx, &f).is_empty(), "confirming closes the tab");
+}

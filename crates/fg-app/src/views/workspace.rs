@@ -96,6 +96,8 @@ pub enum WorkspaceEvent {
     SnippetDelete { id: fg_core::SnippetId },
     /// Explain the statement in a query tab instead of running it.
     QueryExplain { tab: Entity<QueryTab> },
+    /// Commit the staged edits of a query tab's editable result set.
+    QueryResultCommit { tab: Entity<QueryTab> },
     /// `⌘Y` / the history button: load the recent statements of this connection.
     HistoryRequested { search: String },
     /// Put a history entry into the active query tab (the user picked it).
@@ -151,6 +153,9 @@ pub struct WorkspaceView {
     collapsed: HashSet<SharedString>,
     tabs: TabSet,
     tab_views: HashMap<TabId, TabContent>,
+    /// A tab whose close was requested while it still had staged edits, and
+    /// is waiting for the second click in the confirmation banner.
+    confirm_close: Option<TabId>,
     sidebar_visible: bool,
     details_visible: bool,
     focus: FocusHandle,
@@ -244,6 +249,7 @@ impl WorkspaceView {
             collapsed: HashSet::new(),
             tabs: TabSet::new(),
             tab_views: HashMap::new(),
+            confirm_close: None,
             sidebar_visible: true,
             details_visible: true,
             focus: cx.focus_handle(),
@@ -598,6 +604,11 @@ impl WorkspaceView {
     /// The controller persisted the change; reflect it (and the pill colour) immediately.
     pub fn set_safe_mode(&mut self, mode: SafeMode, cx: &mut Context<Self>) {
         self.safe_mode = mode;
+        for content in self.tab_views.values() {
+            if let TabContent::Table(tab) = content {
+                tab.update(cx, |t, cx| t.set_safe_mode(mode, cx));
+            }
+        }
         cx.notify();
     }
 
@@ -750,7 +761,9 @@ impl WorkspaceView {
         let id = self.tabs.open_table(path, TableViewMode::Data);
         if !self.tab_views.contains_key(&id) {
             let query_path = path.clone();
+            let mode = self.safe_mode;
             let tab = cx.new(|cx| TableTab::new(query_path, window, cx));
+            tab.update(cx, |t, cx| t.set_safe_mode(mode, cx));
             // Persist view state when the user changes the query, and let the controller load.
             let on_tab = cx.subscribe_in(
                 &tab,
@@ -809,6 +822,9 @@ impl WorkspaceView {
                 script: script.clone(),
             }),
             QueryTabEvent::Explain => cx.emit(WorkspaceEvent::QueryExplain { tab: tab.clone() }),
+            QueryTabEvent::CommitResultEdits => {
+                cx.emit(WorkspaceEvent::QueryResultCommit { tab: tab.clone() })
+            }
             QueryTabEvent::DismissedConfirmation => {}
         });
         let on_tab_change = cx.observe(&tab, |_, _, cx| cx.notify());
@@ -845,10 +861,27 @@ impl WorkspaceView {
         }
     }
 
+    /// Close a tab. A table tab with staged edits does not close on the
+    /// first request: it opens the confirmation banner instead, and only
+    /// the second request (the banner's button) actually closes it.
     pub fn close_tab(&mut self, id: &TabId, cx: &mut Context<Self>) {
+        let dirty = self
+            .tab_view(id)
+            .is_some_and(|tab| tab.read(cx).pending(cx).total() > 0);
+        if dirty && self.confirm_close.as_ref() != Some(id) {
+            self.confirm_close = Some(id.clone());
+            cx.notify();
+            return;
+        }
+        self.confirm_close = None;
         self.tabs.close(id);
         self.tab_views.remove(id);
         cx.emit(WorkspaceEvent::SessionChanged);
+        cx.notify();
+    }
+
+    pub fn cancel_close(&mut self, cx: &mut Context<Self>) {
+        self.confirm_close = None;
         cx.notify();
     }
 
@@ -2101,6 +2134,64 @@ impl WorkspaceView {
     fn render_main(&mut self, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let strip = self.render_tab_strip(cx);
+        let confirm_banner = self.confirm_close.clone().and_then(|id| {
+            let pending = self
+                .tab_view(&id)
+                .map(|tab| tab.read(cx).pending(cx).total())
+                .unwrap_or(0);
+            if pending == 0 {
+                return None;
+            }
+            let is_zh = crate::views::style::is_zh_locale();
+            let close_id = id.clone();
+            Some(
+                h_flex()
+                    .id("confirm-close-tab")
+                    .test_support()
+                    .w_full()
+                    .flex_shrink_0()
+                    .gap_3()
+                    .px_3()
+                    .py_1p5()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(theme.danger.opacity(0.5))
+                    .bg(theme.danger.opacity(0.14))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_size(px(13.))
+                            .text_color(theme.foreground)
+                            .child(if is_zh {
+                                format!("关闭此标签页将丢失 {pending} 项未保存的更改，确认关闭吗？")
+                            } else {
+                                format!(
+                                    "Closing this tab will lose {pending} unsaved changes. Close anyway?"
+                                )
+                            }),
+                    )
+                    .child(
+                        Button::new("confirm-close-yes")
+                            .label(if is_zh { "确认关闭" } else { "Close tab" })
+                            .small()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_tab(&close_id, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("confirm-close-no")
+                            .label(if is_zh { "保留" } else { "Keep tab" })
+                            .small()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.cancel_close(cx);
+                            })),
+                    )
+                    .into_any_element(),
+            )
+        });
 
         let content: AnyElement = match self.tabs.active().and_then(|t| self.tab_views.get(&t.id)) {
             Some(TabContent::Table(tab)) => tab.clone().into_any_element(),
@@ -2122,6 +2213,7 @@ impl WorkspaceView {
             .min_w_0()
             .h_full()
             .children(strip)
+            .children(confirm_banner)
             .child(div().flex_1().min_h_0().child(content))
             .into_any_element()
     }

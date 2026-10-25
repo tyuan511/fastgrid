@@ -9,10 +9,14 @@ use fg_sql::{RowChange, compile_changes};
 use crate::conn::OpenConnection;
 
 /// What a successful commit did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CommitOutcome {
     pub statements: usize,
     pub affected_rows: u64,
+    /// One row per insert that read itself back, in insert order: the row as
+    /// written, with defaults and generated keys filled in. Empty on dialects
+    /// without `RETURNING`, where no readback was possible.
+    pub returned_rows: Vec<Vec<fg_core::Value>>,
 }
 
 impl OpenConnection {
@@ -42,6 +46,7 @@ impl OpenConnection {
             return Ok(CommitOutcome {
                 statements: 0,
                 affected_rows: 0,
+                returned_rows: Vec::new(),
             });
         }
         let detail = self.describe(path).await?;
@@ -83,16 +88,37 @@ impl OpenConnection {
                             .run_statement(&sql, &params, ExecOptions::default())
                             .await?;
                         let sets = stream.collect().await?;
-                        Ok::<_, Error>(sets.last().and_then(|s| s.affected_rows))
+                        let last = sets.last();
+                        Ok::<_, Error>((
+                            last.and_then(|s| s.affected_rows),
+                            last.map(|s| s.rows.clone()).unwrap_or_default(),
+                        ))
                     }
                 };
 
                 run("BEGIN".into(), Vec::new()).await?;
                 let mut affected = 0;
+                let mut returned_rows = Vec::new();
                 let mut failure = None;
                 for (i, statement) in statements.iter().enumerate() {
                     match run(statement.sql.clone(), statement.params.clone()).await {
-                        Ok(rows) => {
+                        Ok((rows, returned)) => {
+                            if statement.returns_row {
+                                // A RETURNING insert has no row count; its
+                                // result set is the row as written, and there
+                                // must be exactly one of it.
+                                if returned.len() != 1 {
+                                    failure = Some(Error::Other(format!(
+                                        "change {}: expected to insert 1 row, got {}",
+                                        i + 1,
+                                        returned.len()
+                                    )));
+                                    break;
+                                }
+                                affected += 1;
+                                returned_rows.push(returned.into_iter().next().unwrap_or_default());
+                                continue;
+                            }
                             let rows = rows.unwrap_or(0);
                             if let Some(want) = statement.expect_rows
                                 && rows != want
@@ -132,6 +158,7 @@ impl OpenConnection {
                     None => Ok(CommitOutcome {
                         statements: statements.len(),
                         affected_rows: affected,
+                        returned_rows,
                     }),
                 }
             })

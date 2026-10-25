@@ -11,8 +11,8 @@ use std::rc::Rc;
 use std::collections::{HashMap, HashSet};
 
 use fg_core::{
-    ColumnMeta, DbKind, Filter, FilterOp, ObjectPath, TableViewState, TypeCategory, Value,
-    dialect_for,
+    ColumnMeta, DbKind, Filter, FilterOp, ObjectPath, SafeMode, TableViewState, TypeCategory,
+    Value, dialect_for,
 };
 use fg_sql::{CellChange, RowChange, compile_changes};
 use gpui_kit::base::actions::{SelectNextColumn, SelectPrevColumn};
@@ -29,7 +29,7 @@ use gpui_kit::*;
 use super::actions::{
     BeginEdit, CELL_EDITOR_CONTEXT, CancelCellEdit, CloneRow, CommitChanges, CopySelection,
     GRID_CONTEXT, InsertRow, PreviewChanges, RedoEdit, RevertCell, SetCellDefault, SetCellEmpty,
-    SetCellNull, ToggleDeleteRow, UndoEdit,
+    SetCellNull, ToggleDeleteRow, ToggleRowDetail, UndoEdit,
 };
 use super::cells::{CellMark, CellSelection};
 use super::filter_drawer::{FilterDrawer, FilterDrawerEvent};
@@ -139,6 +139,39 @@ impl GridDelegate {
         self.rows.len() + self.new_row_ids().len()
     }
 
+    /// The on-screen row for one staged change, if it is loaded here. An
+    /// update or delete is found by its primary-key values; an insert is the
+    /// loaded rows plus its position among the inserts. A row staged from
+    /// another page is not on screen, so this returns `None` and the
+    /// selection stays where it was.
+    fn failed_change_row(
+        &self,
+        change: &RowChange,
+        changes: &[RowChange],
+        number: usize,
+    ) -> Option<usize> {
+        match change {
+            RowChange::Update { key, .. } | RowChange::Delete { key, .. } => {
+                let wanted: Vec<Value> = key.iter().map(|(_, v)| v.clone()).collect();
+                let indices = self.changeset.as_ref()?.key_column_indices().to_vec();
+                self.rows.iter().position(|row| {
+                    indices
+                        .iter()
+                        .map(|&i| row.get(i).cloned())
+                        .collect::<Option<Vec<_>>>()
+                        == Some(wanted.clone())
+                })
+            }
+            RowChange::Insert { .. } => {
+                let ordinal = changes[..number.saturating_sub(1)]
+                    .iter()
+                    .filter(|c| matches!(c, RowChange::Insert { .. }))
+                    .count();
+                Some(self.rows.len() + ordinal)
+            }
+        }
+    }
+
     fn row_id_at(&self, row_ix: usize) -> Option<RowId> {
         let cs = self.changeset.as_ref()?;
         match self.rows.get(row_ix) {
@@ -210,6 +243,16 @@ impl GridDelegate {
         });
         self.columns = std::iter::once(gutter).chain(data).collect();
     }
+}
+
+/// The 1-based change number in a commit error like `change 3: …`, if any.
+fn parse_change_number(message: &str) -> Option<usize> {
+    let rest = message.strip_prefix("change ")?;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() || !rest[digits.len()..].starts_with(':') {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 /// What an unset cell of a new row shows.
@@ -344,13 +387,30 @@ impl TableDelegate for GridDelegate {
         let theme = cx.theme().clone();
         if col_ix < GUTTER {
             let selected = self.selected.is_some_and(|(r, _)| r == row_ix);
+            // A 3px status bar at the left of the gutter slot, coloured by the
+            // row's staged state so a staged row reads at a glance even when
+            // its cells are scrolled out of view.
+            let row_mark = match (self.changeset.as_ref(), self.row_id_at(row_ix)) {
+                (Some(cs), Some(id)) => match cs.row_state(&id) {
+                    RowState::Deleted => CellMark::Deleted,
+                    RowState::Inserted => CellMark::Inserted,
+                    RowState::Modified => CellMark::Modified,
+                    RowState::Unchanged => CellMark::None,
+                },
+                _ => CellMark::None,
+            };
+            let bar_color = match row_mark {
+                CellMark::Modified => Some(theme.warning),
+                CellMark::Inserted => Some(theme.success),
+                CellMark::Deleted => Some(theme.danger),
+                CellMark::None => None,
+            };
             return div()
                 .id(SharedString::from(format!("row-number-{row_ix}")))
                 .test_support()
                 .size_full()
                 .flex()
                 .items_center()
-                .justify_center()
                 .font_family(theme.mono_font_family.clone())
                 .text_size(super::cells::GRID_TEXT_SIZE)
                 .when(selected, |d| d.bg(theme.primary.opacity(0.12)))
@@ -359,7 +419,24 @@ impl TableDelegate for GridDelegate {
                 } else {
                     theme.muted_foreground.opacity(0.7)
                 })
-                .child((row_ix + 1).to_string())
+                .when_some(bar_color, |d, color| {
+                    d.child(
+                        div()
+                            .id(SharedString::from(format!("row-status-{row_ix}")))
+                            .test_support()
+                            .w(px(3.))
+                            .h_full()
+                            .bg(color),
+                    )
+                })
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child((row_ix + 1).to_string()),
+                )
                 .into_any_element();
         }
         // `col_ix` counts the columns on screen; the data may have hidden ones in between.
@@ -506,6 +583,33 @@ pub struct TableTab {
     /// The engine, to write the changes in its dialect for the SQL preview.
     engine: Option<DbKind>,
     preview_open: bool,
+    /// The Discard button was pressed and is waiting for a second click.
+    confirm_discard: bool,
+    /// Values the open cell editor offers as a list: an enum column's
+    /// variants, or, for a foreign-key column, the distinct values on the
+    /// loaded page (typing anything else still works). Empty = no list.
+    editor_options: Vec<String>,
+    /// Whether `editor_options` are the column's allowed values or page values.
+    editor_options_are_allowed: bool,
+    /// The row-detail inspector (`Space`): the selected cell's full value,
+    /// editable, with Text and JSON modes. `detail_cell` is the cell the
+    /// input last synced to; a mismatch makes the next render resync it,
+    /// which is how grid edits flow back into the inspector.
+    detail_open: bool,
+    detail_json: bool,
+    detail_input: Option<Entity<InputState>>,
+    detail_error: Option<String>,
+    detail_cell: Option<(usize, usize)>,
+    _detail_subscription: Option<Subscription>,
+    /// The cell a right-click opened the action menu for, as (row, screen column). The menu is
+    /// a panel, not the library's floating menu: that one is row-based, while these actions need
+    /// the exact cell.
+    cell_menu: Option<(usize, usize)>,
+    /// The Save button was pressed under Alert/Strict and is waiting for
+    /// the batch confirmation below.
+    confirm_commit: bool,
+    /// The connection's guard level, as the workspace last told this tab.
+    safe_mode: SafeMode,
     _edit_subscription: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
 }
@@ -584,12 +688,19 @@ impl TableTab {
             cx.notify();
         });
         // A double click opens the cell for editing, like `Enter` does.
-        let on_table =
-            cx.subscribe_in(&table, window, |this, _, event: &TableEvent, window, cx| {
-                if let TableEvent::DoubleClickedCell(row, col) = event {
+        let on_table = cx.subscribe_in(
+            &table,
+            window,
+            |this, _, event: &TableEvent, window, cx| match event {
+                TableEvent::DoubleClickedCell(row, col) => {
                     this.begin_edit_at(*row, *col, None, window, cx);
                 }
-            });
+                TableEvent::RightClickedCell(row, col) => {
+                    this.open_cell_menu(*row, *col, cx);
+                }
+                _ => {}
+            },
+        );
         let initial = FilterDraft::from_applied(&query.filters, query.raw_where.as_deref());
         drawer.update(cx, |d, cx| d.load(initial, cx));
         Self {
@@ -609,6 +720,18 @@ impl TableTab {
             committing: false,
             engine: None,
             preview_open: false,
+            confirm_discard: false,
+            editor_options: Vec::new(),
+            editor_options_are_allowed: false,
+            detail_open: false,
+            detail_json: false,
+            detail_input: None,
+            detail_error: None,
+            detail_cell: None,
+            _detail_subscription: None,
+            cell_menu: None,
+            confirm_commit: false,
+            safe_mode: SafeMode::default(),
             _edit_subscription: None,
             _subscriptions: vec![observer, on_apply, on_table],
         }
@@ -845,6 +968,37 @@ impl TableTab {
             self.fail_edit("This row is marked for deletion; restore it first.", cx);
             return;
         }
+        // The editor's list, when the column has one: an enum/set column's
+        // variants are the allowed values; a foreign-key column offers the
+        // distinct values already on the loaded page as a shortcut, and
+        // typing a different key still works.
+        let (options, allowed) = {
+            let meta = &d.metas[data_col];
+            if matches!(
+                meta.data_type.category,
+                TypeCategory::Enum | TypeCategory::Set
+            ) && !meta.data_type.variants.is_empty()
+            {
+                (meta.data_type.variants.clone(), true)
+            } else if d.jumps.contains_key(&meta.name) {
+                let mut seen = HashSet::new();
+                let mut values = Vec::new();
+                for row in &d.rows {
+                    if let Some(v) = row.get(data_col)
+                        && !v.is_null()
+                        && seen.insert(copy_text(v))
+                    {
+                        values.push(copy_text(v));
+                    }
+                }
+                values.truncate(100);
+                (values, false)
+            } else {
+                (Vec::new(), false)
+            }
+        };
+        self.editor_options = options;
+        self.editor_options_are_allowed = allowed;
         let replacing = initial.is_some();
         let text = match initial {
             Some(typed) => typed,
@@ -925,6 +1079,10 @@ impl TableTab {
             Ok(()) => {
                 self.error = None;
                 self._edit_subscription = None;
+                self.editor_options.clear();
+                if self.detail_open {
+                    self.detail_cell = None;
+                }
                 self.focus_table(window, cx);
                 cx.notify();
                 true
@@ -933,6 +1091,219 @@ impl TableTab {
                 self.fail_edit(message, cx);
                 false
             }
+        }
+    }
+
+    /// Pick one of the editor's listed values and stage it, as choosing from
+    /// a dropdown does. A value that does not parse keeps the editor open
+    /// with the reason, like typing it by hand would.
+    pub fn pick_editor_option(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(value) = self.editor_options.get(index).cloned() else {
+            return;
+        };
+        let d = self.table.read(cx).delegate();
+        if let Some(editor) = d.editing.as_ref() {
+            let input = editor.input.clone();
+            input.update(cx, |state, cx| state.set_value(value, window, cx));
+        }
+        self.commit_edit(window, cx);
+    }
+
+    // ---- row-detail inspector ---------------------------------------------------------------
+
+    pub fn detail_open(&self, cx: &App) -> bool {
+        let _ = cx;
+        self.detail_open && self.detail_input.is_some()
+    }
+
+    pub fn detail_text(&self, cx: &App) -> Option<String> {
+        self.detail_input
+            .as_ref()
+            .map(|input| input.read(cx).value().to_string())
+    }
+
+    /// Replace the inspector's text, e.g. after pasting a value into it.
+    pub fn set_detail_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(input) = self.detail_input.clone() {
+            let text = text.to_owned();
+            input.update(cx, |state, cx| state.set_value(text, window, cx));
+        }
+    }
+
+    /// Open the inspector on the selected cell, or close it. While a cell
+    /// editor is open, Space types into that editor instead.
+    pub fn toggle_detail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_editing(cx) {
+            return;
+        }
+        if self.detail_open {
+            self.close_detail();
+            cx.notify();
+            return;
+        }
+        if !matches!(self.table.read(cx).selection(), TableSelection::Cell(..)) {
+            return;
+        }
+        let input = cx.new(|cx| InputState::new(window, cx));
+        self.detail_input = Some(input.clone());
+        self.detail_open = true;
+        self.detail_cell = None;
+        self._detail_subscription =
+            Some(
+                cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
+                    if matches!(event, InputEvent::PressEnter { .. }) {
+                        this.save_detail(window, cx);
+                    }
+                }),
+            );
+        cx.notify();
+    }
+
+    fn close_detail(&mut self) {
+        self.detail_open = false;
+        self.detail_input = None;
+        self.detail_cell = None;
+        self.detail_error = None;
+        self._detail_subscription = None;
+    }
+
+    /// Switch the inspector between raw text and JSON. Switching to JSON
+    /// formats the current text when it parses, and reports the parse error
+    /// when it does not, instead of staging anything.
+    pub fn set_detail_json(&mut self, json: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.detail_json = json;
+        if let Some(input) = self.detail_input.clone() {
+            let text = input.read(cx).value().to_string();
+            if json {
+                match serde_json::from_str::<serde_json::Value>(&text) {
+                    Ok(value) => {
+                        let pretty = serde_json::to_string_pretty(&value).unwrap_or(text);
+                        input.update(cx, |state, cx| state.set_value(pretty, window, cx));
+                        self.detail_error = None;
+                    }
+                    Err(e) => self.detail_error = Some(format!("Invalid JSON: {e}")),
+                }
+            } else {
+                self.detail_error = None;
+            }
+        }
+        cx.notify();
+    }
+
+    /// Stage the inspector's text back into the grid cell it shows. JSON
+    /// mode validates first and stages the formatted text; Text mode parses
+    /// like the cell editor. Success resyncs the input from the grid, so a
+    /// typed `042` in an integer cell comes back as `42`.
+    pub fn save_detail(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(input) = self.detail_input.clone() else {
+            return false;
+        };
+        let text = input.read(cx).value().to_string();
+        let table = self.table.read(cx);
+        let (row, screen_col) = match table.selection() {
+            TableSelection::Cell(r, c) => (r, c),
+            _ => return false,
+        };
+        let d = table.delegate();
+        let Some(data_col) = d.data_index(screen_col) else {
+            return false;
+        };
+        let category = d.metas[data_col].data_type.category;
+        let value = if self.detail_json {
+            match serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(value) => Value::Text(serde_json::to_string_pretty(&value).unwrap_or(text)),
+                Err(e) => {
+                    self.detail_error = Some(format!("Invalid JSON: {e}"));
+                    cx.notify();
+                    return false;
+                }
+            }
+        } else {
+            match parse_cell_text(&text, category) {
+                Ok(value) => value,
+                Err(message) => {
+                    self.detail_error = Some(message);
+                    cx.notify();
+                    return false;
+                }
+            }
+        };
+        let staged = self.table.update(cx, |t, cx| {
+            let d = t.delegate_mut();
+            let id = d.row_id_at(row).ok_or("This row is no longer on screen.")?;
+            let baseline = d.rows.get(row).cloned().unwrap_or_default();
+            let cs = d.changeset.as_mut().ok_or("Nothing to edit yet.")?;
+            cs.edit_cell(&id, &baseline, data_col, CellChange::Set(value))?;
+            cx.notify();
+            Ok::<(), String>(())
+        });
+        match staged {
+            Ok(()) => {
+                self.detail_error = None;
+                self.detail_cell = None;
+                cx.notify();
+                true
+            }
+            Err(message) => {
+                self.detail_error = Some(message);
+                cx.notify();
+                false
+            }
+        }
+    }
+
+    /// Sync the inspector's input to the selected cell, when the selection
+    /// moved since the last sync. Called from `render`, which is the only
+    /// place with both the window and the fresh selection; typing in the
+    /// inspector does not move the selection, so it never fights the user.
+    fn sync_detail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.detail_open {
+            return;
+        }
+        let table = self.table.read(cx);
+        let (row, screen_col) = match table.selection() {
+            TableSelection::Cell(r, c) => (r, c),
+            _ => {
+                self.close_detail();
+                return;
+            }
+        };
+        let d = table.delegate();
+        let Some(data_col) = d.data_index(screen_col) else {
+            self.close_detail();
+            return;
+        };
+        if self.detail_cell == Some((row, data_col)) {
+            return;
+        }
+        let value = d.shown_value(row, data_col);
+        let category = d.metas[data_col].data_type.category;
+        let text = match &value {
+            Value::Null => "NULL".to_owned(),
+            Value::Other { type_name, text } if type_name.is_empty() && text == "DEFAULT" => {
+                String::new()
+            }
+            other => copy_text(other),
+        };
+        let json = matches!(category, TypeCategory::Json);
+        let (display, error) = if json {
+            match serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(parsed) => (serde_json::to_string_pretty(&parsed).unwrap_or(text), None),
+                Err(e) => (text, Some(format!("Invalid JSON: {e}"))),
+            }
+        } else {
+            (text, None)
+        };
+        self.detail_json = json;
+        self.detail_error = error;
+        self.detail_cell = Some((row, data_col));
+        if let Some(input) = self.detail_input.clone() {
+            input.update(cx, |state, cx| state.set_value(display, window, cx));
         }
     }
 
@@ -984,6 +1355,7 @@ impl TableTab {
         });
         if was_open {
             self._edit_subscription = None;
+            self.editor_options.clear();
             self.error = None;
             self.focus_table(window, cx);
             cx.notify();
@@ -1016,6 +1388,31 @@ impl TableTab {
     }
 
     /// Mark the selected row for deletion, or bring it back if it is already marked (`⌘⌫`).
+    /// Open the cell action menu for a right-clicked cell, and select that cell so the menu's
+    /// actions (which all work on the selection) hit it. The gutter is not a cell: a right-click
+    /// there selects the row instead and opens no menu.
+    pub fn open_cell_menu(&mut self, row: usize, screen_col: usize, cx: &mut Context<Self>) {
+        if screen_col < GUTTER || self.is_editing(cx) {
+            return;
+        }
+        self.table.update(cx, |t, cx| {
+            t.set_selected_cell(row, screen_col, cx);
+        });
+        self.cell_menu = Some((row, screen_col));
+        cx.notify();
+    }
+
+    /// Close the cell action menu without doing anything.
+    pub fn close_cell_menu(&mut self, cx: &mut Context<Self>) {
+        self.cell_menu = None;
+        cx.notify();
+    }
+
+    /// Whether the cell menu is open, and for which cell, for tests.
+    pub fn cell_menu_cell(&self) -> Option<(usize, usize)> {
+        self.cell_menu
+    }
+
     pub fn toggle_delete_row(&mut self, cx: &mut Context<Self>) {
         let Some(row) = self.selected_row_index(cx) else {
             return;
@@ -1192,8 +1589,20 @@ impl TableTab {
         cx.notify();
     }
 
-    /// Throw every staged change away (undoable).
+    /// Ask before throwing every staged change away: the first click only
+    /// opens the confirmation strip, the second actually discards.
     pub fn discard_changes(&mut self, cx: &mut Context<Self>) {
+        if self.pending(cx).total() == 0 {
+            return;
+        }
+        self.confirm_discard = true;
+        cx.notify();
+    }
+
+    /// Discard after the second click. Still undoable, like any other step.
+    pub fn confirm_discard_now(&mut self, cx: &mut Context<Self>) {
+        self.confirm_discard = false;
+        self.editor_options.clear();
         self.table.update(cx, |t, cx| {
             let d = t.delegate_mut();
             d.editing = None;
@@ -1204,6 +1613,11 @@ impl TableTab {
         });
         self.preview_open = false;
         self.error = None;
+        cx.notify();
+    }
+
+    pub fn cancel_discard(&mut self, cx: &mut Context<Self>) {
+        self.confirm_discard = false;
         cx.notify();
     }
 
@@ -1237,6 +1651,13 @@ impl TableTab {
 
     /// Ask the owner to commit (`⌘S`). An open editor is staged first, so what is on screen is
     /// what gets committed.
+    /// The workspace tells every table tab the guard level, so a batch
+    /// commit can ask first when the level says so.
+    pub fn set_safe_mode(&mut self, mode: SafeMode, cx: &mut Context<Self>) {
+        self.safe_mode = mode;
+        cx.notify();
+    }
+
     pub fn request_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_editing(cx) && !self.commit_edit(window, cx) {
             return; // the value was rejected; the message is showing
@@ -1244,9 +1665,22 @@ impl TableTab {
         if self.committing || self.pending(cx).total() == 0 {
             return;
         }
+        // Alert and Strict both confirm a batch write before it runs; Normal
+        // does not, and ReadOnly is refused by the commit itself instead.
+        if matches!(self.safe_mode, SafeMode::Alert | SafeMode::Strict) && !self.confirm_commit {
+            self.confirm_commit = true;
+            cx.notify();
+            return;
+        }
+        self.confirm_commit = false;
         self.committing = true;
         self.error = None;
         cx.emit(TableTabEvent::CommitRequested);
+        cx.notify();
+    }
+
+    pub fn cancel_commit(&mut self, cx: &mut Context<Self>) {
+        self.confirm_commit = false;
         cx.notify();
     }
 
@@ -1267,9 +1701,34 @@ impl TableTab {
                 self.query.page.set_total(None);
                 cx.emit(TableTabEvent::Reload);
             }
-            Err(message) => self.error = Some(message.into()),
+            Err(message) => {
+                self.error = Some(message.clone().into());
+                self.locate_failed_change(&message, cx);
+            }
         }
         cx.notify();
+    }
+
+    /// Move the selection to the row a failed commit named, when it is on
+    /// screen. The service names the failing change 1-based (`change 3: …`)
+    /// in the same delete → update → insert order as [`Self::changes`], so
+    /// the user lands on the row to fix instead of hunting for it.
+    fn locate_failed_change(&mut self, message: &str, cx: &mut Context<Self>) {
+        let Some(number) = parse_change_number(message) else {
+            return;
+        };
+        let changes = self.changes(cx);
+        let Some(change) = changes.get(number.wrapping_sub(1)) else {
+            return;
+        };
+        let row = self
+            .table
+            .read(cx)
+            .delegate()
+            .failed_change_row(change, &changes, number);
+        if let Some(row) = row {
+            self.select_cell(row, 0, cx);
+        }
     }
 
     pub fn is_committing(&self) -> bool {
@@ -1735,6 +2194,109 @@ impl TableTab {
             .into_any_element()
     }
 
+    /// The second click for Discard: restate what is about to be lost.
+    fn confirm_discard_bar(
+        &self,
+        pending: Counts,
+        is_zh: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        let summary = Self::pending_summary(pending, is_zh);
+        h_flex()
+            .id("confirm-discard")
+            .test_support()
+            .aria_label(summary.clone())
+            .w_full()
+            .flex_shrink_0()
+            .gap_3()
+            .px_3()
+            .py_1p5()
+            .items_center()
+            .border_t_1()
+            .border_color(theme.danger.opacity(0.5))
+            .bg(theme.danger.opacity(0.14))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_size(px(13.))
+                    .text_color(theme.foreground)
+                    .child(if is_zh {
+                        format!("确认放弃以下更改？{summary}")
+                    } else {
+                        format!("Discard these changes? {summary}")
+                    }),
+            )
+            .child(
+                Button::new("confirm-discard-yes")
+                    .label(if is_zh { "确认放弃" } else { "Discard all" })
+                    .small()
+                    .on_click(cx.listener(|this, _, _, cx| this.confirm_discard_now(cx))),
+            )
+            .child(
+                Button::new("confirm-discard-no")
+                    .label(if is_zh { "保留" } else { "Keep changes" })
+                    .small()
+                    .on_click(cx.listener(|this, _, _, cx| this.cancel_discard(cx))),
+            )
+            .into_any_element()
+    }
+
+    /// The batch confirmation for Alert/Strict: restate the batch, then Save
+    /// for real or keep editing.
+    fn confirm_commit_bar(
+        &self,
+        pending: Counts,
+        is_zh: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        let summary = Self::pending_summary(pending, is_zh);
+        h_flex()
+            .id("confirm-commit")
+            .test_support()
+            .aria_label(summary.clone())
+            .w_full()
+            .flex_shrink_0()
+            .gap_3()
+            .px_3()
+            .py_1p5()
+            .items_center()
+            .border_t_1()
+            .border_color(theme.warning.opacity(0.5))
+            .bg(theme.warning.opacity(0.14))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_size(px(13.))
+                    .text_color(theme.foreground)
+                    .child(if is_zh {
+                        format!("确认提交以下更改？{summary}")
+                    } else {
+                        format!("Commit these changes? {summary}")
+                    }),
+            )
+            .child(
+                Button::new("confirm-commit-yes")
+                    .label(if is_zh { "确认提交" } else { "Commit" })
+                    .small()
+                    .on_click(cx.listener(|this, _, window, cx| this.request_commit(window, cx))),
+            )
+            .child(
+                Button::new("confirm-commit-no")
+                    .label(if is_zh { "再想想" } else { "Keep editing" })
+                    .small()
+                    .on_click(cx.listener(|this, _, _, cx| this.cancel_commit(cx))),
+            )
+            .into_any_element()
+    }
+
     /// The SQL a save would run, in the order it runs, inside one transaction.
     fn preview_panel(&self, is_zh: bool, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
@@ -1784,7 +2346,8 @@ impl TableTab {
 }
 
 impl Render for TableTab {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_detail(window, cx);
         let theme = cx.theme().clone();
         let page = &self.query.page;
         let (has_prev, has_next) = (page.has_prev(), page.has_next());
@@ -1802,6 +2365,296 @@ impl Render for TableTab {
         let pending = self.pending(cx);
         let pending_bar = (pending.total() > 0)
             .then(|| self.pending_bar(pending, crate::views::style::is_zh_locale(), cx));
+        let confirm_discard_bar = (pending.total() > 0 && self.confirm_discard)
+            .then(|| self.confirm_discard_bar(pending, crate::views::style::is_zh_locale(), cx));
+        let confirm_commit_bar = (pending.total() > 0 && self.confirm_commit)
+            .then(|| self.confirm_commit_bar(pending, crate::views::style::is_zh_locale(), cx));
+        let detail_panel = self.detail_input.clone().and_then(|input| {
+            if !self.detail_open {
+                return None;
+            }
+            let is_zh = crate::views::style::is_zh_locale();
+            let column = match self.table.read(cx).selection() {
+                TableSelection::Cell(_, screen_col) => self
+                    .table
+                    .read(cx)
+                    .delegate()
+                    .data_index(screen_col)
+                    .and_then(|i| {
+                        self.table
+                            .read(cx)
+                            .delegate()
+                            .metas
+                            .get(i)
+                            .map(|m| m.name.clone())
+                    })
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
+            let error = self.detail_error.clone();
+            let json = self.detail_json;
+            let panel = v_flex()
+                .id("row-detail")
+                .test_support()
+                .w_full()
+                .flex_shrink_0()
+                .gap_2()
+                .px_3()
+                .py_2()
+                .border_t_1()
+                .border_color(theme.border)
+                .bg(theme.background)
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .text_color(theme.muted_foreground)
+                                .child(if is_zh {
+                                    format!("行详情：{column}")
+                                } else {
+                                    format!("Row detail: {column}")
+                                }),
+                        )
+                        .child(
+                            Button::new("detail-mode-text")
+                                .label("Text")
+                                .small()
+                                .when(!json, |b| b.primary())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_detail_json(false, window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("detail-mode-json")
+                                .label("JSON")
+                                .small()
+                                .when(json, |b| b.primary())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_detail_json(true, window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("detail-save")
+                                .label(if is_zh { "应用" } else { "Apply" })
+                                .small()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.save_detail(window, cx);
+                                })),
+                        ),
+                )
+                .child(
+                    div().w_full().child(
+                        Input::new(&input)
+                            .id("detail-input")
+                            .appearance(false)
+                            .bordered(false),
+                    ),
+                )
+                .when_some(error, |d, e| {
+                    d.child(
+                        div()
+                            .id("detail-error")
+                            .test_support()
+                            .aria_label(e.clone())
+                            .text_size(px(13.))
+                            .text_color(theme.danger)
+                            .child(e),
+                    )
+                })
+                .into_any_element();
+            Some(panel)
+        });
+        let cell_menu_panel = self.cell_menu.map(|(row, screen_col)| {
+            let is_zh = crate::views::style::is_zh_locale();
+            let column = self
+                .table
+                .read(cx)
+                .delegate()
+                .data_index(screen_col)
+                .and_then(|i| {
+                    self.table
+                        .read(cx)
+                        .delegate()
+                        .metas
+                        .get(i)
+                        .map(|m| m.name.clone())
+                })
+                .unwrap_or_default();
+            let label = if is_zh {
+                format!("单元格：第 {} 行 · {column}", row + 1)
+            } else {
+                format!("Cell: row {} · {column}", row + 1)
+            };
+            let button = |id: &'static str, label: String| Button::new(id).label(label).small();
+            v_flex()
+                .id("cell-menu")
+                .test_support()
+                .gap_2()
+                .px_3()
+                .py_2()
+                .border_t_1()
+                .border_color(theme.border)
+                .bg(theme.background)
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .flex_wrap()
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .text_color(theme.muted_foreground)
+                                .child(label),
+                        )
+                        .child(
+                            button(
+                                "cell-menu-null",
+                                if is_zh {
+                                    "设为 NULL".into()
+                                } else {
+                                    "Set NULL".into()
+                                },
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_selected_cell_to_null(cx);
+                                this.close_cell_menu(cx);
+                            })),
+                        )
+                        .child(
+                            button(
+                                "cell-menu-empty",
+                                if is_zh {
+                                    "设为空串".into()
+                                } else {
+                                    "Set empty".into()
+                                },
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_selected_cell_to_empty(cx);
+                                this.close_cell_menu(cx);
+                            })),
+                        )
+                        .child(
+                            button(
+                                "cell-menu-default",
+                                if is_zh {
+                                    "设为默认值".into()
+                                } else {
+                                    "Set default".into()
+                                },
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_selected_cell_to_default(cx);
+                                this.close_cell_menu(cx);
+                            })),
+                        )
+                        .child(
+                            button(
+                                "cell-menu-revert",
+                                if is_zh {
+                                    "还原".into()
+                                } else {
+                                    "Revert".into()
+                                },
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.revert_selected_cell(cx);
+                                this.close_cell_menu(cx);
+                            })),
+                        )
+                        .child(
+                            button(
+                                "cell-menu-clone",
+                                if is_zh {
+                                    "克隆行".into()
+                                } else {
+                                    "Clone row".into()
+                                },
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.clone_row(cx);
+                                this.close_cell_menu(cx);
+                            })),
+                        )
+                        .child(
+                            button(
+                                "cell-menu-delete",
+                                if is_zh {
+                                    "删除 / 恢复行".into()
+                                } else {
+                                    "Delete / restore row".into()
+                                },
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.toggle_delete_row(cx);
+                                this.close_cell_menu(cx);
+                            })),
+                        )
+                        .child(
+                            button(
+                                "cell-menu-close",
+                                if is_zh {
+                                    "关闭".into()
+                                } else {
+                                    "Close".into()
+                                },
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.close_cell_menu(cx);
+                            })),
+                        ),
+                )
+                .into_any_element()
+        });
+        let editor_options_panel =
+            (!self.editor_options.is_empty() && self.is_editing(cx)).then(|| {
+                let is_zh = crate::views::style::is_zh_locale();
+                let label = if self.editor_options_are_allowed {
+                    if is_zh { "可选值" } else { "Values" }
+                } else if is_zh {
+                    "本页已有的值（也可直接输入其他值）"
+                } else {
+                    "Values on this page (type any other value)"
+                };
+                let buttons: Vec<AnyElement> = self
+                    .editor_options
+                    .iter()
+                    .enumerate()
+                    .map(|(i, option)| {
+                        Button::new(SharedString::from(format!("cell-option-{i}")))
+                            .label(option.clone())
+                            .small()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.pick_editor_option(i, window, cx);
+                            }))
+                            .into_any_element()
+                    })
+                    .collect();
+                h_flex()
+                    .id("cell-options")
+                    .test_support()
+                    .w_full()
+                    .flex_shrink_0()
+                    .flex_wrap()
+                    .gap_2()
+                    .px_3()
+                    .py_1p5()
+                    .items_center()
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .bg(theme.background)
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(theme.muted_foreground)
+                            .child(label),
+                    )
+                    .children(buttons)
+                    .into_any_element()
+            });
         let preview_panel = (pending.total() > 0 && self.preview_open)
             .then(|| self.preview_panel(crate::views::style::is_zh_locale(), cx));
         let filter_count = self.query.active_filter_count();
@@ -1986,6 +2839,9 @@ impl Render for TableTab {
                 }),
             )
             .on_action(cx.listener(|this, _: &RevertCell, _, cx| this.revert_selected_cell(cx)))
+            .on_action(cx.listener(|this, _: &ToggleRowDetail, window, cx| {
+                this.toggle_detail(window, cx);
+            }))
             .bg(theme.background)
             .when_some(self.error.clone(), |d, e| {
                 d.child(
@@ -2014,6 +2870,11 @@ impl Render for TableTab {
             .children(column_panel)
             .children(preview_panel)
             .children(pending_bar)
+            .children(confirm_commit_bar)
+            .children(confirm_discard_bar)
+            .children(editor_options_panel)
+            .children(detail_panel)
+            .children(cell_menu_panel)
             .children(paging_panel)
             .child(
                 // Status bar, as TablePlus lays it out:
