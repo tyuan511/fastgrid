@@ -72,7 +72,7 @@ pub async fn list_objects(client: &Client, namespace: &str) -> Result<Vec<Object
 }
 
 /// Resolve `(namespace, name)` to a class oid, or fail closed when it does not exist.
-async fn class_oid(client: &Client, namespace: &str, name: &str) -> Result<i32> {
+async fn class_oid(client: &Client, namespace: &str, name: &str) -> Result<u32> {
     let row = client
         .query_opt(
             "SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
@@ -97,7 +97,7 @@ fn ref_action(code: &str) -> ReferentialAction {
 }
 
 /// Column names for a `conkey`/`confkey` int2 array, in key order.
-async fn key_columns(client: &Client, relid: i32, keys: &[i16]) -> Result<Vec<String>> {
+async fn key_columns(client: &Client, relid: u32, keys: &[i16]) -> Result<Vec<String>> {
     if keys.is_empty() {
         return Ok(Vec::new());
     }
@@ -164,12 +164,12 @@ pub async fn describe(client: &Client, path: &ObjectPath) -> Result<TableDetail>
     }
     // Enum variants for enum-typed columns, in declaration order, keyed by type OID
     // (type names are not unique across schemas).
-    let mut enum_variants: BTreeMap<i32, Vec<String>> = BTreeMap::new();
-    let mut wanted: Vec<i32> = Vec::new();
+    let mut enum_variants: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+    let mut wanted: Vec<u32> = Vec::new();
     for row in &col_rows {
         let typtype: String = row.get(8);
         if typtype == "e" {
-            let typid: i32 = row.get(10);
+            let typid: u32 = row.get(10);
             if !wanted.contains(&typid) {
                 wanted.push(typid);
             }
@@ -199,7 +199,7 @@ pub async fn describe(client: &Client, path: &ObjectPath) -> Result<TableDetail>
         let comment: Option<String> = row.get(7);
         let typtype: String = row.get(8);
         let collation: Option<String> = row.get(9);
-        let typid: i32 = row.get(10);
+        let typid: u32 = row.get(10);
         let mut data_type = data_type_from_native(&native);
         if typtype == "e"
             && let Some(variants) = enum_variants.get(&typid)
@@ -251,7 +251,7 @@ pub async fn describe(client: &Client, path: &ObjectPath) -> Result<TableDetail>
     for row in &fk_rows {
         let conname: Option<String> = row.get(0);
         let conkey: Vec<i16> = row.get(1);
-        let confrelid: i32 = row.get(2);
+        let confrelid: u32 = row.get(2);
         let confkey: Vec<i16> = row.get(3);
         let confupdtype: String = row.get(4);
         let confdeltype: String = row.get(5);
@@ -602,8 +602,8 @@ pub async fn list_relations(client: &Client, namespace: &str) -> Result<Vec<Rela
         let confkey: Vec<i16> = row.get(5);
         let confupdtype: String = row.get(6);
         let confdeltype: String = row.get(7);
-        let owner_oid: i32 = row.get(8);
-        let ref_oid: i32 = row.get(9);
+        let owner_oid: u32 = row.get(8);
+        let ref_oid: u32 = row.get(9);
         out.push(Relation {
             from: ObjectPath::new(Some(namespace), from_table),
             key: ForeignKeyInfo {

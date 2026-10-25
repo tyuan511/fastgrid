@@ -244,3 +244,123 @@ async fn tunnel_forwards_bytes_and_refuses_unknown_keys() {
     .await
     .expect("test timed out");
 }
+
+/// Start an SSH server forwarding to `target_port`; returns its port, its
+/// public key line, and the temp dir holding the host key.
+async fn start_ssh_server() -> (u16, String, PathBuf) {
+    let dir = std::env::temp_dir().join(format!("fg-ssh-tls-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let key_path = dir.join("host_key");
+    let status = std::process::Command::new("ssh-keygen")
+        .args([
+            "-t",
+            "ed25519",
+            "-f",
+            key_path.to_str().unwrap(),
+            "-N",
+            "",
+            "-q",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let private = std::fs::read_to_string(&key_path).unwrap();
+    let server_key = russh::keys::decode_secret_key(&private, None).unwrap();
+    let public = std::process::Command::new("ssh-keygen")
+        .args(["-y", "-f", key_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(public.status.success());
+    let public_line = String::from_utf8(public.stdout).unwrap();
+    let public_line = public_line.trim().to_owned();
+
+    let ssh_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ssh_port = ssh_listener.local_addr().unwrap().port();
+    let server_config = Arc::new(server::Config {
+        keys: vec![server_key],
+        ..server::Config::default()
+    });
+    tokio::spawn(async move {
+        loop {
+            let Ok((socket, _)) = ssh_listener.accept().await else {
+                break;
+            };
+            let config = Arc::clone(&server_config);
+            tokio::spawn(async move {
+                let session = server::run_stream(config, socket, TestServer).await;
+                if let Ok(session) = session {
+                    let _ = session.await;
+                }
+            });
+        }
+    });
+    (ssh_port, public_line, dir)
+}
+
+/// The roadmap's M4 acceptance case: a PostgreSQL session over verify-full
+/// TLS, reached through an SSH tunnel. The tunnel is TCP-transparent, so the
+/// driver verifies the server certificate exactly as it would on a direct
+/// connection; the certificate is for IP 127.0.0.1, which is also the tunnel
+/// endpoint, so the name check applies unchanged.
+///
+/// Skips when the TLS test server is absent (no CA file, or its port refuses
+/// TCP). Like `postgres.rs`, run with `-- --nocapture` and confirm no
+/// `skipping` line appears; a run with skips proves nothing.
+#[tokio::test]
+async fn tunnel_plus_verify_full_tls_reaches_postgres() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let tls_port: u16 = std::env::var("FG_TEST_PG_TLS_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(54400);
+        let ca_path = std::env::var("FG_TEST_PG_TLS_CA")
+            .ok()
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| "/home/pgtest/certs/ca.crt".to_owned());
+        if !std::path::Path::new(&ca_path).exists() {
+            eprintln!("skipping tunnel+TLS test: no CA file at {ca_path}");
+            return;
+        }
+        if TcpStream::connect(("127.0.0.1", tls_port)).await.is_err() {
+            eprintln!("skipping tunnel+TLS test: TLS server not listening on {tls_port}");
+            return;
+        }
+
+        let (ssh_port, public_line, dir) = start_ssh_server().await;
+        let _guard = KnownHostsGuard::add(ssh_port, &public_line);
+        let tunnel = SshTunnel::open(&ssh_config(ssh_port), Some(PASSWORD), "127.0.0.1", tls_port)
+            .await
+            .unwrap();
+
+        let mut cfg = fg_core::ConnectionConfig::new(
+            "pg-tunnel-tls-test",
+            fg_core::DbKind::Postgres,
+            fg_core::ConnectionParams::Network {
+                host: "127.0.0.1".to_owned(),
+                port: tunnel.local_port(),
+                user: "postgres".to_owned(),
+                database: Some("postgres".to_owned()),
+                socket: None,
+            },
+        );
+        cfg.tls = Some(fg_core::TlsConfig {
+            mode: fg_core::TlsMode::VerifyFull,
+            ca_cert_path: Some(ca_path),
+            client_cert_path: None,
+            client_key_path: None,
+            server_name: None,
+        });
+        let session = fg_driver::driver_for(fg_core::DbKind::Postgres)
+            .unwrap()
+            .connect(&cfg, None)
+            .await
+            .unwrap();
+        session.ping().await.unwrap();
+        let namespaces = session.list_namespaces().await.unwrap();
+        assert!(namespaces.iter().any(|n| n == "public"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    })
+    .await
+    .expect("test timed out");
+}

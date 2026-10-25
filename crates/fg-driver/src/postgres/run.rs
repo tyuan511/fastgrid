@@ -63,7 +63,18 @@ pub fn map_err(e: tokio_postgres::Error) -> Error {
     if e.is_closed() {
         return Error::Connection(e.to_string());
     }
-    Error::Query(QueryError::new(e.to_string()))
+    // Keep the underlying reason: tokio-postgres reports a failed TLS handshake
+    // as a bare "error performing TLS handshake", which hides whether the
+    // certificate was untrusted, expired, or for the wrong name — exactly what
+    // the connection form's "test connection" needs to show.
+    let mut message = e.to_string();
+    let mut source = <tokio_postgres::Error as std::error::Error>::source(&e);
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    Error::Query(QueryError::new(message))
 }
 
 /// How a cancel reaches the server: plaintext, or the same TLS factory the
@@ -131,7 +142,7 @@ async fn origins_by_oid(
                  JOIN pg_class c ON c.oid = a.attrelid \
                  JOIN pg_namespace n ON n.oid = c.relnamespace \
                  WHERE a.attrelid = $1 AND a.attnum > 0",
-                &[&(oid as i32)],
+                &[&oid],
             )
             .await;
         if let Ok(rows) = rows {

@@ -188,6 +188,10 @@ fn load_client_cert(
 }
 
 fn factory_for(tls: &TlsConfig) -> Result<RustlsFactory> {
+    // Install a crypto provider first: both WebPkiServerVerifier::builder()
+    // and ClientConfig::builder() below read the process default provider and
+    // panic when none is installed, instead of returning an error.
+    default_provider()?;
     let (roots, ders) = load_roots(tls)?;
     let roots = Arc::new(roots);
     let client_cert = load_client_cert(tls)?;

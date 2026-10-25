@@ -239,7 +239,7 @@
 - [x] 连接配置界面（网络型）：host / port / user / password / database、环境色标、SSL、SSH、连接 URL 粘贴自动解析、测试连接（显示延迟与精确错误）
 - [x] 数据库切换（`⌘K`）：PG 通过重连实现；切换关闭全部标签页，有暂存修改时拒绝，失败回滚到原数据库
 - [x] 方言细节：`$n` 占位符、`RETURNING`、事务性 DDL、`EXPLAIN`
-- [ ] 共享的行为测试（与 SQLite 同一组场景）通过 testcontainers 在 PG 12–17 上运行。*需真实 PG 服务器；开发机无 PG / testcontainers，待装机验证*
+- [~] 共享的行为测试（与 SQLite 同一组场景）通过 testcontainers 在 PG 12–17 上运行。*行为测试已写（`crates/fg-driver/tests/postgres.rs`，含类型矩阵、取消、截断后会话可用、Unix socket、TLS Verify-Full / Verify-CA / Require 及错误拒绝、SSH 隧道 + verify-full 联合），在本地 PG 16.2 上全部通过（明文 54399、TLS 54400；无服务器的机器上测试跳过，须以 `-- --nocapture` 确认无跳过行）。testcontainers 矩阵（12 / 14 / 16 / 17）仍未跑*
 
 **验收**
 
