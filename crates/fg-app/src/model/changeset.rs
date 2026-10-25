@@ -304,6 +304,23 @@ impl Changeset {
         self.push_new_row(cells)
     }
 
+    /// Duplicate a staged new row. Primary-key columns are cleared, like
+    /// [`Self::clone_row`], so the copy takes its column defaults instead of
+    /// reusing a key that would collide on commit.
+    pub fn clone_new_row(&mut self, id: u64) -> Result<RowId, String> {
+        let mut cells = self
+            .state
+            .inserted
+            .iter()
+            .find(|r| r.id == id)
+            .map(|r| r.cells.clone())
+            .ok_or_else(|| "no such new row".to_owned())?;
+        for key in &self.key_columns {
+            cells.remove(key);
+        }
+        self.push_new_row(cells)
+    }
+
     /// Mark a loaded row for deletion, or drop a new row outright.
     pub fn delete_row(&mut self, id: &RowId) -> Result<(), String> {
         self.check_editable()?;
@@ -545,6 +562,25 @@ mod tests {
                 cells: vec![("name".into(), set(text("r3"))), ("n".into(), set(int(30)))]
             }]
         );
+    }
+
+    #[test]
+    fn a_clone_of_a_new_row_clears_its_key_and_keeps_its_edits() {
+        let mut c = cs();
+        let new = c.insert_row().unwrap();
+        c.edit_cell(&new, &[], 0, set(int(7))).unwrap();
+        c.edit_cell(&new, &[], 1, set(text("fresh"))).unwrap();
+        let RowId::New(id) = new else {
+            panic!("inserted row must be new");
+        };
+        let copy = c.clone_new_row(id).unwrap();
+        assert_eq!(c.cell_state(&copy, 0), CellState::Unchanged);
+        assert_eq!(
+            c.cell_state(&copy, 1),
+            CellState::Modified(set(text("fresh")))
+        );
+        assert_eq!(c.counts().inserted_rows, 2);
+        assert!(c.clone_new_row(999).is_err());
     }
 
     #[test]

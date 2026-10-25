@@ -615,3 +615,67 @@ fn the_sql_preview_shows_the_statements_with_values_written_in(cx: &mut TestAppC
     assert!(label(cx, &f, "preview-panel").is_none());
     assert!(label(cx, &f, "pending-bar").is_none());
 }
+
+#[gpui_kit::test]
+fn cloning_a_row_copies_it_without_its_key(cx: &mut TestAppContext) {
+    let f = open(cx, &["id"]);
+    select(cx, &f, 1, 0);
+    focus_grid(cx, &f);
+    press(cx, &f, "secondary-d");
+
+    assert_eq!(cx.read_entity(&f.view, |v, cx| v.total_rows(cx)), 4);
+    assert_eq!(mark(cx, &f, 3, 1), CellMark::Inserted);
+    assert_eq!(shown(cx, &f, 3, 1), Some(Value::Text("item 2".into())));
+    // The key column is cleared, so the copy takes its default on commit.
+    assert_eq!(
+        cx.read_entity(&f.view, |v, cx| v.changes(cx)),
+        [RowChange::Insert {
+            cells: vec![("name".into(), CellChange::Set(Value::Text("item 2".into())))]
+        }]
+    );
+    assert_eq!(pending(cx, &f).inserted_rows, 1);
+}
+
+#[gpui_kit::test]
+fn set_null_empty_default_and_revert_act_on_the_selected_cell(cx: &mut TestAppContext) {
+    let f = open(cx, &["id"]);
+    macro_rules! act {
+        ($method:ident) => {
+            cx.update_window(f.window, |_, _, cx| {
+                f.view.update(cx, |v, cx| v.$method(cx));
+            })
+            .unwrap()
+        };
+    }
+
+    select(cx, &f, 0, 1);
+    act!(set_selected_cell_to_null);
+    assert_eq!(shown(cx, &f, 0, 1), Some(Value::Null));
+    assert_eq!(mark(cx, &f, 0, 1), CellMark::Modified);
+
+    act!(revert_selected_cell);
+    assert_eq!(shown(cx, &f, 0, 1), Some(Value::Text("item 1".into())));
+    assert_eq!(mark(cx, &f, 0, 1), CellMark::None);
+    assert_eq!(pending(cx, &f).total(), 0);
+
+    act!(set_selected_cell_to_empty);
+    assert_eq!(shown(cx, &f, 0, 1), Some(Value::Text(String::new())));
+
+    act!(set_selected_cell_to_default);
+    assert!(
+        matches!(shown(cx, &f, 0, 1), Some(Value::Other { ref text, .. }) if text == "DEFAULT")
+    );
+    assert_eq!(
+        cx.read_entity(&f.view, |v, cx| v.changes(cx)),
+        [RowChange::Update {
+            key: vec![("id".into(), Value::Int(1))],
+            cells: vec![("name".into(), CellChange::Default)],
+        }]
+    );
+
+    // Empty is refused on a non-text column instead of staging a bad value.
+    select(cx, &f, 0, 0);
+    act!(set_selected_cell_to_empty);
+    assert_eq!(shown(cx, &f, 0, 0), Some(Value::Int(1)));
+    assert!(error_text(cx, &f).unwrap().contains("text columns"));
+}

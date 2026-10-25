@@ -957,11 +957,23 @@ impl Render for Launcher {
                                     .disabled(!has_selection)
                                     .on_click(cx.listener(|this, _, _, cx| this.ask_delete(cx))),
                             )
-                            .child(Button::new("cycle-theme").on_click(cx.listener(
-                                |_, _, _, cx| {
-                                    cx.emit(LauncherEvent::CycleTheme);
-                                },
-                            ))),
+                            .child(
+                                Button::new("cycle-theme")
+                                    .icon(match crate::theme_control::chosen(cx) {
+                                        fg_core::ThemeMode::Light => hugeicon(Hugeicon::Sun),
+                                        fg_core::ThemeMode::Dark => hugeicon(Hugeicon::Moon),
+                                        _ => hugeicon(Hugeicon::Sun),
+                                    })
+                                    .label(format!(
+                                        "Theme: {}",
+                                        crate::theme_control::label(crate::theme_control::chosen(
+                                            cx
+                                        ))
+                                    ))
+                                    .on_click(cx.listener(|_, _, _, cx| {
+                                        cx.emit(LauncherEvent::CycleTheme);
+                                    })),
+                            ),
                     )
                     .when_some(confirm, |d, name| {
                         d.child(

@@ -678,11 +678,18 @@ fn the_record_failure_is_shown_to_the_user(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn cmd_y_opens_the_history_panel_and_asks_for_entries(cx: &mut TestAppContext) {
+fn the_history_shortcut_opens_the_history_panel_and_asks_for_entries(cx: &mut TestAppContext) {
     let w = open_workspace(cx);
+    // On Windows/Linux the history key is `Ctrl+Shift+Y`: plain `Ctrl+Y` is
+    // the text input's Redo and wins while an input is focused.
+    let history_key = if cfg!(target_os = "macos") {
+        "secondary-y"
+    } else {
+        "secondary-shift-y"
+    };
     cx.update_window(w.window, |_, window, cx| {
         window.click("sidebar-filter", cx);
-        window.press("secondary-y", cx);
+        window.press(history_key, cx);
         window.render_frame(cx);
     })
     .unwrap();

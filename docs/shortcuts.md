@@ -6,7 +6,7 @@
 
 约定：⌘=Cmd，⌃=Control，⌥=Option，⇧=Shift。Win/Linux 列只写与「⌘→Ctrl」不同的项。
 
-> **实现状态**：数据网格的 `⌘S`（提交）、`⌘⇧P`（预览 SQL）、`⌘Z` / `⌘⇧Z`、`⌘I`（插入行）、`⌘⌫`（标记删除 / 恢复）、`Enter`（开始编辑）、直接键入（开始编辑）与单元格编辑框内的 `Tab` / `⇧Tab` / `Enter` / `Esc` 已实现。已实现 `⌘P`、`⌘W`、`⌘B`、`⌘R`（刷新对象树）、`⌘F`（过滤抽屉）、`⌘C`（复制选区）、`⌘[` / `⌘]` / `Ctrl+Tab`，启动页 `⌘N`（新建连接）与上下 / 回车；查询标签的 `⌘T`（新建查询）、`⌘Y`（查询历史）与编辑器焦点内的 `⌘Return` / `⌘⇧Return` / `⌘.`。其余为规划。绑定集中在 `crates/fg-app/src/views/actions.rs`，编辑器上下文常量是 `EDITOR_CONTEXT`（GPUI Kit 在编辑器元素上压入 `Input mode=editor`，绑定谓词写作 `Input && mode == editor`）。
+> **实现状态**：数据网格的 `⌘S`（提交）、`⌘⇧P`（预览 SQL）、`⌘Z` / `⌘⇧Z`、`⌘I`（插入行）、`⌘D`（克隆行）、`⌘⌫`（标记删除 / 恢复）、`Enter`（开始编辑）、直接键入（开始编辑）与单元格编辑框内的 `Tab` / `⇧Tab` / `Enter` / `Esc` 已实现。已实现 `⌘P`、`⌘W`、`⌘B`、`⌘R`（刷新对象树）、`⌘F`（过滤抽屉）、`⌘C`（复制选区）、`⌘[` / `⌘]` / `Ctrl+Tab`，启动页 `⌘N`（新建连接）与上下 / 回车；查询标签的 `⌘T`（新建查询）、`⌘Y`（查询历史）与编辑器焦点内的 `⌘Return` / `⌘⇧Return` / `⌘.`。其余为规划。绑定集中在 `crates/fg-app/src/views/actions.rs`，编辑器上下文常量是 `EDITOR_CONTEXT`（GPUI Kit 在编辑器元素上压入 `Input mode=editor`，绑定谓词写作 `Input && mode == editor`）。
 
 ## 全局（任何焦点）
 
@@ -20,12 +20,15 @@
 | 下一个 / 上一个标签 | `⌘]` / `⌘[` | `Ctrl+Tab` / `Ctrl+Shift+Tab` |
 | 第 1–9 个标签 | `⌘1`–`⌘9` | `Alt+1`–`Alt+9` |
 | 显示 / 隐藏侧栏 | `⌘B` | `Ctrl+B` |
-| 查询历史 | `⌘Y` | `Ctrl+Y` |
+| 查询历史 | `⌘Y` | `Ctrl+Shift+Y` |
 | 收藏片段面板 | `⌘⇧S` | `Ctrl+Shift+S` |
 | 把当前语句存为片段 | `⌘⇧K` | `Ctrl+Shift+K` |
 | 刷新 | `⌘R` | `F5` |
 | 导出 | `⌘⇧E` | `Ctrl+Shift+E` |
 | 切换到数据 / 结构视图 | `⌘⌃[` / `⌘⌃]` | `Ctrl+Alt+[` / `Ctrl+Alt+]` |
+
+> Win / Linux 上查询历史不用 `Ctrl+Y`：那是输入框的重做键，焦点在输入框时会抢先执行，
+> 所以历史改用 `Ctrl+Shift+Y`，在任何焦点下都能打开。
 
 ## 对象树（`tree`）
 
@@ -95,7 +98,7 @@
 |---|---|---|
 | 把选中的语句填进当前查询标签 | `Return` | `Enter` |
 | 上下移动 | `↑` / `↓` | 同 |
-| 关闭面板 | `Escape` / `⌘Y` | `Esc` / `Ctrl+Y` |
+| 关闭面板 | `Escape` / `⌘Y` | `Esc` / `Ctrl+Shift+Y` |
 
 ## Escape 逐级退出
 

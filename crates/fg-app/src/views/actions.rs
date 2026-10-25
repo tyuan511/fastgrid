@@ -61,6 +61,11 @@ gpui_kit::actions!(
         CancelCellEdit,
         InsertRow,
         ToggleDeleteRow,
+        CloneRow,
+        SetCellNull,
+        SetCellEmpty,
+        SetCellDefault,
+        RevertCell,
         PreviewChanges,
     ]
 );
@@ -85,6 +90,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-shift-z", RedoEdit, Some(GRID_CONTEXT)),
         KeyBinding::new("enter", BeginEdit, Some(GRID_CONTEXT)),
         KeyBinding::new("secondary-i", InsertRow, Some(GRID_CONTEXT)),
+        KeyBinding::new("secondary-d", CloneRow, Some(GRID_CONTEXT)),
         KeyBinding::new("secondary-backspace", ToggleDeleteRow, Some(GRID_CONTEXT)),
         KeyBinding::new("secondary-shift-p", PreviewChanges, Some(GRID_CONTEXT)),
         KeyBinding::new("escape", CancelCellEdit, Some(CELL_EDITOR_CONTEXT)),
@@ -94,7 +100,14 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-n", NewConnection, Some(LAUNCHER_CONTEXT)),
         // A new query tab, reachable whether or not the editor has focus.
         KeyBinding::new("secondary-t", NewQuery, Some(WORKSPACE_CONTEXT)),
+        // Query history is a global shortcut, but on Windows/Linux `Ctrl+Y`
+        // is the text input's own Redo and its deeper context wins, so the
+        // history key there is `Ctrl+Shift+Y` instead. On macOS `⌘Y` has no
+        // such conflict.
+        #[cfg(target_os = "macos")]
         KeyBinding::new("secondary-y", ToggleHistory, Some(WORKSPACE_CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("secondary-shift-y", ToggleHistory, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("enter", HistoryOpen, Some(HISTORY_CONTEXT)),
         KeyBinding::new("down", HistoryNext, Some(HISTORY_CONTEXT)),
         KeyBinding::new("up", HistoryPrev, Some(HISTORY_CONTEXT)),

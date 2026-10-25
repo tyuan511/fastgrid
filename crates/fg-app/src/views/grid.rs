@@ -11,7 +11,8 @@ use std::rc::Rc;
 use std::collections::{HashMap, HashSet};
 
 use fg_core::{
-    ColumnMeta, DbKind, Filter, FilterOp, ObjectPath, TableViewState, Value, dialect_for,
+    ColumnMeta, DbKind, Filter, FilterOp, ObjectPath, TableViewState, TypeCategory, Value,
+    dialect_for,
 };
 use fg_sql::{CellChange, RowChange, compile_changes};
 use gpui_kit::base::actions::{SelectNextColumn, SelectPrevColumn};
@@ -26,8 +27,9 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::actions::{
-    BeginEdit, CELL_EDITOR_CONTEXT, CancelCellEdit, CommitChanges, CopySelection, GRID_CONTEXT,
-    InsertRow, PreviewChanges, RedoEdit, ToggleDeleteRow, UndoEdit,
+    BeginEdit, CELL_EDITOR_CONTEXT, CancelCellEdit, CloneRow, CommitChanges, CopySelection,
+    GRID_CONTEXT, InsertRow, PreviewChanges, RedoEdit, RevertCell, SetCellDefault, SetCellEmpty,
+    SetCellNull, ToggleDeleteRow, UndoEdit,
 };
 use super::cells::{CellMark, CellSelection};
 use super::filter_drawer::{FilterDrawer, FilterDrawerEvent};
@@ -1042,6 +1044,136 @@ impl TableTab {
         }
     }
 
+    /// Duplicate the selected row (`⌘D`). A loaded row is copied with its
+    /// primary-key columns cleared, so the copy takes its defaults; a staged
+    /// new row is copied the same way. The copy shows after the loaded rows.
+    pub fn clone_row(&mut self, cx: &mut Context<Self>) {
+        let Some(row) = self.selected_row_index(cx) else {
+            return;
+        };
+        let outcome = self.table.update(cx, |t, cx| {
+            let d = t.delegate_mut();
+            let id = d.row_id_at(row).ok_or("This row is no longer on screen.")?;
+            let result = match &id {
+                RowId::Existing(_) => {
+                    let baseline = d.rows.get(row).cloned().unwrap_or_default();
+                    let clear = d
+                        .changeset
+                        .as_ref()
+                        .map(|cs| cs.key_column_indices().to_vec())
+                        .unwrap_or_default();
+                    d.changeset
+                        .as_mut()
+                        .ok_or("Nothing to edit yet.")?
+                        .clone_row(&baseline, &clear)
+                }
+                RowId::New(n) => d
+                    .changeset
+                    .as_mut()
+                    .ok_or("Nothing to edit yet.")?
+                    .clone_new_row(*n),
+            };
+            cx.notify();
+            result
+        });
+        match outcome {
+            Ok(_) => {
+                self.error = None;
+                let last = self.total_rows(cx).saturating_sub(1);
+                self.select_cell(last, 0, cx);
+            }
+            Err(message) => self.fail_edit(message, cx),
+        }
+    }
+
+    /// Stage a value for the selected cell without opening the editor. An
+    /// open editor wins: staging underneath it would silently replace what
+    /// the user is typing.
+    fn stage_selected_cell(&mut self, change: CellChange, cx: &mut Context<Self>) {
+        if self.is_editing(cx) {
+            self.fail_edit("Finish the open edit first.", cx);
+            return;
+        }
+        let Some((row, data_col)) = self.selected_cell(cx) else {
+            return;
+        };
+        let outcome = self.table.update(cx, |t, cx| {
+            let d = t.delegate_mut();
+            let id = d
+                .row_id_at(row)
+                .ok_or("This cell is no longer on screen.")?;
+            let baseline = d.rows.get(row).cloned().unwrap_or_default();
+            let cs = d.changeset.as_mut().ok_or("Nothing to edit yet.")?;
+            cs.edit_cell(&id, &baseline, data_col, change)?;
+            cx.notify();
+            Ok::<(), String>(())
+        });
+        match outcome {
+            Ok(()) => {
+                self.error = None;
+                cx.notify();
+            }
+            Err(message) => self.fail_edit(message, cx),
+        }
+    }
+
+    /// Stage SQL NULL for the selected cell.
+    pub fn set_selected_cell_to_null(&mut self, cx: &mut Context<Self>) {
+        self.stage_selected_cell(CellChange::Set(Value::Null), cx);
+    }
+
+    /// Stage an empty string for the selected cell. Only text-like columns
+    /// have an empty value; for other columns this is refused instead of
+    /// staging a value the commit would reject.
+    pub fn set_selected_cell_to_empty(&mut self, cx: &mut Context<Self>) {
+        let Some((_, data_col)) = self.selected_cell(cx) else {
+            return;
+        };
+        let category = self
+            .table
+            .read(cx)
+            .delegate()
+            .metas
+            .get(data_col)
+            .map(|m| m.data_type.category);
+        if !matches!(
+            category,
+            Some(TypeCategory::Text | TypeCategory::Json | TypeCategory::Enum | TypeCategory::Set)
+        ) {
+            self.fail_edit("Empty is only for text columns.", cx);
+            return;
+        }
+        self.stage_selected_cell(CellChange::Set(Value::Text(String::new())), cx);
+    }
+
+    /// Stage the column default for the selected cell. On insert the column
+    /// is omitted; on update it compiles to `SET c = DEFAULT` where the
+    /// dialect has it, and the commit refuses it where it does not.
+    pub fn set_selected_cell_to_default(&mut self, cx: &mut Context<Self>) {
+        self.stage_selected_cell(CellChange::Default, cx);
+    }
+
+    /// Put the selected cell back to its loaded value, staging nothing for
+    /// it. A cell with no staged edit is left alone.
+    pub fn revert_selected_cell(&mut self, cx: &mut Context<Self>) {
+        if self.is_editing(cx) {
+            self.fail_edit("Finish the open edit first.", cx);
+            return;
+        }
+        let Some((row, data_col)) = self.selected_cell(cx) else {
+            return;
+        };
+        self.table.update(cx, |t, cx| {
+            let d = t.delegate_mut();
+            if let (Some(id), Some(cs)) = (d.row_id_at(row), d.changeset.as_mut()) {
+                cs.revert_cell(&id, data_col);
+            }
+            cx.notify();
+        });
+        self.error = None;
+        cx.notify();
+    }
+
     pub fn undo_edit(&mut self, cx: &mut Context<Self>) {
         self.step_history(cx, Changeset::undo);
     }
@@ -1841,6 +1973,19 @@ impl Render for TableTab {
             }))
             .on_action(cx.listener(|this, _: &InsertRow, _, cx| this.insert_row(cx)))
             .on_action(cx.listener(|this, _: &ToggleDeleteRow, _, cx| this.toggle_delete_row(cx)))
+            .on_action(cx.listener(|this, _: &CloneRow, _, cx| this.clone_row(cx)))
+            .on_action(
+                cx.listener(|this, _: &SetCellNull, _, cx| this.set_selected_cell_to_null(cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &SetCellEmpty, _, cx| this.set_selected_cell_to_empty(cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &SetCellDefault, _, cx| {
+                    this.set_selected_cell_to_default(cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &RevertCell, _, cx| this.revert_selected_cell(cx)))
             .bg(theme.background)
             .when_some(self.error.clone(), |d, e| {
                 d.child(
