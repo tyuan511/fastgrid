@@ -8,7 +8,7 @@ use std::collections::HashSet;
 
 use fg_core::{
     ConnectionConfig, ConnectionGroup, ConnectionId, ConnectionParams, DbKind, Environment,
-    GroupId, TagColor,
+    GroupId, SafeMode, TagColor,
 };
 use fg_store::StoredConnection;
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
@@ -27,8 +27,8 @@ use super::actions::{LAUNCHER_CONTEXT, LauncherNext, LauncherOpen, LauncherPrev,
 use super::icons::{Hugeicon, hugeicon};
 use super::style::environment_color;
 use crate::model::{
-    ConnectionDraft, ENVIRONMENTS, TAG_COLORS, color_from_label, duplicate, environment_from_label,
-    rank,
+    ConnectionDraft, ENVIRONMENTS, SAFE_MODES, TAG_COLORS, color_from_label, duplicate,
+    environment_from_label, environment_label, rank, safe_mode_from_label, safe_mode_label,
 };
 
 /// One entry of the rendered launcher list.
@@ -131,6 +131,7 @@ struct Editor {
     environment: Choice,
     color: Choice,
     group: Choice,
+    safe_mode: Choice,
     /// The group ids in the same order as the group choice's items (after "No group").
     group_ids: Vec<GroupId>,
     create_if_missing: bool,
@@ -179,6 +180,27 @@ fn choice(
             cx,
         )
     })
+}
+
+/// What the safe-mode dropdown's hint says for an explicit mode.
+fn safe_mode_hint(mode: SafeMode, is_zh: bool) -> SharedString {
+    let (en, zh) = match mode {
+        SafeMode::Normal => (
+            "Normal: run everything without asking.",
+            "标准：所有语句直接运行，不确认。",
+        ),
+        SafeMode::Alert => (
+            "Alert: ask before dangerous statements, like dropping a table or deleting without a WHERE clause.",
+            "提醒：危险语句（删表、无 WHERE 的删除等）执行前会确认。",
+        ),
+        SafeMode::Strict => (
+            "Strict: ask before every statement that may write.",
+            "严格：任何可能写入的语句执行前都会确认。",
+        ),
+        // ReadOnly, and anything newer and unknown: the most restrictive text.
+        _ => ("Read-only: refuse every write.", "只读：拒绝一切写入。"),
+    };
+    SharedString::from(if is_zh { zh } else { en })
 }
 
 impl Launcher {
@@ -529,6 +551,15 @@ impl Launcher {
             .map(|i| i + 1)
             .unwrap_or(0);
         let group = choice(group_items, group_ix, window, cx);
+        let safe_items: Vec<SharedString> = SAFE_MODES
+            .iter()
+            .map(|(_, l)| SharedString::from(*l))
+            .collect();
+        let safe_ix = SAFE_MODES
+            .iter()
+            .position(|(m, _)| *m == draft.safe_mode)
+            .unwrap_or(0);
+        let safe_mode = choice(safe_items, safe_ix, window, cx);
         let create_if_missing = draft.create_if_missing;
         let selected_engine = base.as_ref().map_or(DbKind::Sqlite, |c| c.kind);
         self.editor = Some(Editor {
@@ -540,6 +571,7 @@ impl Launcher {
             color,
             group,
             group_ids,
+            safe_mode,
             create_if_missing,
             error: None,
             selected_engine,
@@ -602,6 +634,12 @@ impl Launcher {
             Some(_) => None,
             None => e.draft.group_id.clone(),
         };
+        // "Default" parses back to None (follow the environment); only a missing selection
+        // keeps the draft's previous value.
+        let safe_mode = match e.safe_mode.read(cx).selected_value() {
+            Some(label) => safe_mode_from_label(label),
+            None => e.draft.safe_mode,
+        };
         Some(ConnectionDraft {
             id: e.draft.id.clone(),
             name: e.name.read(cx).value().to_string(),
@@ -612,6 +650,7 @@ impl Launcher {
             path: e.path.read(cx).value().to_string(),
             create_if_missing: e.create_if_missing,
             group_id,
+            safe_mode,
         })
     }
 
@@ -763,7 +802,7 @@ fn with_window_drag<E: InteractiveElement>(element: E, cx: &Context<Launcher>) -
 }
 
 impl Render for Launcher {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let items = self.list_items(cx);
         let is_zh = is_chinese_locale();
@@ -1030,7 +1069,7 @@ impl Render for Launcher {
                 .find(|r| r.id == id)
                 .map(|r| r.name.clone())
         });
-        let editor = self.render_editor(cx);
+        let editor = self.render_editor(window.viewport_size().height, cx);
 
         h_flex()
             .id("launcher")
@@ -1457,7 +1496,7 @@ impl Launcher {
         )
     }
 
-    fn render_editor(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_editor(&self, viewport_h: Pixels, cx: &mut Context<Self>) -> Option<AnyElement> {
         let e = self.editor.as_ref()?;
         let theme = cx.theme().clone();
         let is_zh = is_chinese_locale();
@@ -1487,6 +1526,41 @@ impl Launcher {
         };
         let error = e.error.clone();
         let active_engine = e.selected_engine;
+
+        // The hint follows both dropdowns as they stand right now: the mode's own explanation,
+        // or, for Default, the mode the currently chosen environment suggests.
+        let safe_hint: SharedString = {
+            let env = e
+                .environment
+                .read(cx)
+                .selected_value()
+                .map(|l| environment_from_label(l))
+                .unwrap_or(e.draft.environment);
+            match e
+                .safe_mode
+                .read(cx)
+                .selected_value()
+                .and_then(|label| safe_mode_from_label(label))
+            {
+                Some(mode) => safe_mode_hint(mode, is_zh),
+                None => {
+                    let suggested = env.default_safe_mode();
+                    if is_zh {
+                        SharedString::from(format!(
+                            "默认：跟随环境，当前为{}，建议使用 {}。",
+                            environment_label(env),
+                            safe_mode_label(Some(suggested))
+                        ))
+                    } else {
+                        SharedString::from(format!(
+                            "Default: follows the environment — this connection would use {} ({}).",
+                            safe_mode_label(Some(suggested)),
+                            environment_label(env)
+                        ))
+                    }
+                }
+            }
+        };
 
         let engine_cards: Vec<AnyElement> = ENGINES
             .iter()
@@ -1564,7 +1638,14 @@ impl Launcher {
                 .bg(theme.background.opacity(0.85))
                 .child(
                     v_flex()
+                        .id("editor-card")
+                        .test_support()
                         .w(px(520.))
+                        // The form is taller than the 480px launcher window, and network
+                        // fields will grow it further: cap it at the window and scroll
+                        // instead of pushing the save button off-screen.
+                        .max_h(viewport_h - px(32.))
+                        .overflow_y_scroll()
                         .gap_3()
                         .p_4()
                         .rounded_lg()
@@ -1649,6 +1730,30 @@ impl Launcher {
                                 "Group".into()
                             },
                             Select::new(&e.group).id("editor-group").into_any_element(),
+                        ))
+                        .child(field(
+                            if is_zh {
+                                "安全模式".into()
+                            } else {
+                                "Safe mode".into()
+                            },
+                            v_flex()
+                                .gap_1()
+                                .child(
+                                    Select::new(&e.safe_mode)
+                                        .id("editor-safe-mode")
+                                        .into_any_element(),
+                                )
+                                .child(
+                                    div()
+                                        .id("editor-safe-mode-hint")
+                                        .test_support()
+                                        .aria_label(safe_hint.clone())
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child(safe_hint),
+                                )
+                                .into_any_element(),
                         ))
                         .child(
                             Checkbox::new("editor-create")

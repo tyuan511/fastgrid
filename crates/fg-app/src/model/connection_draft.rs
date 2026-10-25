@@ -4,7 +4,9 @@
 //! SSH fields together with their drivers (M4, M5). Everything the form does not show is carried
 //! over untouched, so editing a connection never drops settings it cannot display.
 
-use fg_core::{ConnectionConfig, ConnectionId, ConnectionParams, DbKind, Environment, TagColor};
+use fg_core::{
+    ConnectionConfig, ConnectionId, ConnectionParams, DbKind, Environment, SafeMode, TagColor,
+};
 
 /// Colour choices in menu order; `None` = follow the environment.
 pub const TAG_COLORS: &[(Option<TagColor>, &str)] = &[
@@ -52,6 +54,29 @@ pub fn environment_from_label(label: &str) -> Environment {
         .map_or(Environment::Development, |(e, _)| *e)
 }
 
+/// Safe-mode choices in menu order; `None` = follow the environment.
+pub const SAFE_MODES: &[(Option<SafeMode>, &str)] = &[
+    (None, "Default"),
+    (Some(SafeMode::Normal), "Normal"),
+    (Some(SafeMode::Alert), "Alert"),
+    (Some(SafeMode::Strict), "Strict"),
+    (Some(SafeMode::ReadOnly), "Read-only"),
+];
+
+pub fn safe_mode_label(m: Option<SafeMode>) -> &'static str {
+    SAFE_MODES
+        .iter()
+        .find(|(v, _)| *v == m)
+        .map_or("Default", |(_, l)| l)
+}
+
+pub fn safe_mode_from_label(label: &str) -> Option<SafeMode> {
+    SAFE_MODES
+        .iter()
+        .find(|(_, l)| *l == label)
+        .and_then(|(m, _)| *m)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConnectionDraft {
     /// `Some` when editing an existing connection.
@@ -65,6 +90,8 @@ pub struct ConnectionDraft {
     pub create_if_missing: bool,
     /// The group the connection belongs to, if any.
     pub group_id: Option<fg_core::GroupId>,
+    /// Explicit safe mode; `None` follows the environment's default.
+    pub safe_mode: Option<SafeMode>,
 }
 
 impl ConnectionDraft {
@@ -77,6 +104,7 @@ impl ConnectionDraft {
             path: String::new(),
             create_if_missing: false,
             group_id: None,
+            safe_mode: None,
         }
     }
 
@@ -92,6 +120,7 @@ impl ConnectionDraft {
             },
             create_if_missing: c.option_enabled("create"),
             group_id: c.group_id.clone(),
+            safe_mode: c.safe_mode,
         }
     }
 
@@ -135,6 +164,7 @@ impl ConnectionDraft {
         config.environment = self.environment;
         config.color = self.color;
         config.group_id = self.group_id.clone();
+        config.safe_mode = self.safe_mode;
         config.params = ConnectionParams::File {
             path: path.to_owned(),
         };
@@ -168,6 +198,26 @@ mod tests {
             path: path.into(),
             ..ConnectionDraft::blank()
         }
+    }
+
+    #[test]
+    fn the_safe_mode_survives_a_draft_round_trip() {
+        let mut d = draft("x", "/data/x.db");
+        d.safe_mode = Some(SafeMode::Strict);
+        let c = d.to_config(None).unwrap();
+        assert_eq!(c.safe_mode, Some(SafeMode::Strict));
+        let back = ConnectionDraft::from_config(&c);
+        assert_eq!(back.safe_mode, Some(SafeMode::Strict));
+        let saved = back.to_config(Some(&c)).unwrap();
+        assert_eq!(saved.safe_mode, Some(SafeMode::Strict));
+
+        let d = draft("y", "/data/y.db");
+        let c = d.to_config(None).unwrap();
+        assert_eq!(c.safe_mode, None, "a new draft follows the environment");
+        assert_eq!(ConnectionDraft::from_config(&c).safe_mode, None);
+        assert_eq!(safe_mode_label(None), "Default");
+        assert_eq!(safe_mode_from_label("Strict"), Some(SafeMode::Strict));
+        assert_eq!(safe_mode_from_label("Default"), None);
     }
 
     #[test]

@@ -38,6 +38,10 @@ pub struct Relation {
 pub struct Scope {
     /// Relations in the order they were written; a later alias shadows an earlier one.
     pub relations: Vec<Relation>,
+    /// CTE declarations in this statement, in order: the name and the byte range of the name
+    /// in the `WITH` clause, so go-to-definition can jump to where a CTE is defined rather
+    /// than to one of its uses.
+    pub cte_spans: Vec<(String, std::ops::Range<usize>)>,
     /// Byte offset the analysis was asked about.
     pub offset: usize,
 }
@@ -144,11 +148,13 @@ pub fn scope_at(sql: &str, offset: usize, kind: DbKind, catalog: &dyn Catalog) -
         catalog,
         relations: Vec::new(),
         ctes: Vec::new(),
+        cte_spans: Vec::new(),
         depth: 0,
     };
     analyser.run(start, end);
     Scope {
         relations: analyser.relations,
+        cte_spans: analyser.cte_spans,
         offset,
     }
 }
@@ -196,6 +202,10 @@ struct Analyser<'a> {
     /// CTE declarations visible to this statement: name -> columns, when the body could be
     /// analysed.
     ctes: Vec<(String, Option<Vec<ColumnMeta>>)>,
+    /// CTE declarations in this statement: name and the byte range of the name in the `WITH`
+    /// clause. Inner analysers (subquery bodies) keep their own; only the outermost one's
+    /// spans reach the returned `Scope`.
+    cte_spans: Vec<(String, std::ops::Range<usize>)>,
     /// How deep the analysis has recursed into subqueries. A pathological query must not blow the
     /// stack, and beyond a few levels the columns are not worth the work.
     depth: usize,
@@ -254,6 +264,8 @@ impl<'a> Analyser<'a> {
                     return;
                 }
                 let name = unquote(name_token.text(self.sql));
+                self.cte_spans
+                    .push((name.clone(), name_token.start..name_token.end));
                 let declared = self.column_list_after(cursor);
                 // Find `AS (`, then the body's token range.
                 let Some((body_start, body_end, after)) = self.cte_body(cursor, end) else {
@@ -270,6 +282,7 @@ impl<'a> Analyser<'a> {
                         catalog: self.catalog,
                         relations: Vec::new(),
                         ctes: self.ctes.clone(),
+                        cte_spans: Vec::new(),
                         depth: self.depth + 1,
                     };
                     // A recursive CTE sees itself; without columns of its own, which is honest.
@@ -413,6 +426,7 @@ impl<'a> Analyser<'a> {
             catalog: self.catalog,
             relations: Vec::new(),
             ctes: self.ctes.clone(),
+            cte_spans: Vec::new(),
             depth: self.depth,
         };
         inner.collect_relations(start, end);
@@ -603,6 +617,7 @@ impl<'a> Analyser<'a> {
                         catalog: self.catalog,
                         relations: Vec::new(),
                         ctes: self.ctes.clone(),
+                        cte_spans: Vec::new(),
                         depth: self.depth + 1,
                     };
                     inner.select_columns(ix + 1, close)
@@ -793,7 +808,7 @@ fn matching_paren(tokens: &[Token], sql: &str, open: usize) -> Option<usize> {
 
 /// Strip the quoting an identifier may carry, so `"items"`, `` `items` `` and `[items]` all compare
 /// equal to `items`.
-fn unquote(text: &str) -> String {
+pub(crate) fn unquote(text: &str) -> String {
     let trimmed = text.trim();
     let bytes = trimmed.as_bytes();
     if bytes.len() >= 2 {

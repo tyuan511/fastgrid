@@ -8,14 +8,14 @@ use std::rc::Rc;
 use fg_app::views::{Launcher, LauncherEvent, Row, bind_keys};
 use fg_core::{
     ConnectionConfig, ConnectionGroup, ConnectionId, ConnectionParams, DbKind, Environment,
-    GroupId, TagColor,
+    GroupId, SafeMode, TagColor,
 };
 use gpui_kit::test::TestWindowExt as _;
 // No `use gpui_kit::*`: it would import `gpui_kit::test`, which then shadows the built-in
 // `#[test]` that `#[gpui_kit::test]` expands to.
 use gpui_kit::{
-    AnyWindowHandle, AppContext as _, Bounds, Entity, Point, TestAppContext, WindowBounds,
-    WindowOptions, px, size,
+    AnyWindowHandle, AppContext as _, Bounds, Entity, Point, ScrollDelta, TestAppContext,
+    WindowBounds, WindowOptions, point, px, size,
 };
 
 fn config(name: &str) -> ConnectionConfig {
@@ -120,6 +120,19 @@ fn click(cx: &mut TestAppContext, f: &Fixture, id: &str) {
     let id = id.to_owned();
     cx.update_window(f.window, |_, window, cx| {
         window.click(id, cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+}
+
+/// The editor card scrolls on short windows, so bring the save button into view first.
+fn scroll_editor_to_save(cx: &mut TestAppContext, f: &Fixture) {
+    cx.update_window(f.window, |_, window, cx| {
+        window.scroll(
+            "editor-card",
+            ScrollDelta::Pixels(point(px(0.), px(-1000.))),
+            cx,
+        );
         window.render_frame(cx);
     })
     .unwrap();
@@ -374,7 +387,9 @@ fn a_new_connection_is_created_from_the_form(cx: &mut TestAppContext) {
     cx.update_window(f.window, |_, window, cx| window.click("editor-path", cx))
         .unwrap();
     type_text(cx, &f, "/data/shop.db");
+    scroll_editor_to_save(cx, &f);
     click(cx, &f, "editor-create");
+    scroll_editor_to_save(cx, &f);
     click(cx, &f, "editor-save");
 
     let configs = saved(&f);
@@ -399,6 +414,7 @@ fn a_new_connection_is_created_from_the_form(cx: &mut TestAppContext) {
 fn the_form_needs_a_file_and_keeps_open_until_it_has_one(cx: &mut TestAppContext) {
     let f = open(cx, vec![]);
     click(cx, &f, "new-connection");
+    scroll_editor_to_save(cx, &f);
     click(cx, &f, "editor-save");
     assert!(exists(cx, &f, "connection-editor"));
     assert!(exists(cx, &f, "editor-error"));
@@ -412,6 +428,7 @@ fn the_form_needs_a_file_and_keeps_open_until_it_has_one(cx: &mut TestAppContext
         window.render_frame(cx);
     })
     .unwrap();
+    scroll_editor_to_save(cx, &f);
     click(cx, &f, "editor-save");
     assert_eq!(saved(&f)[0].name, "orders");
 }
@@ -421,6 +438,7 @@ fn cancel_and_the_new_connection_shortcut(cx: &mut TestAppContext) {
     let f = open(cx, vec![row("a", true)]);
     press(cx, &f, "secondary-n");
     assert!(exists(cx, &f, "connection-editor"), "⌘N opens the form");
+    scroll_editor_to_save(cx, &f);
     click(cx, &f, "editor-cancel");
     assert!(!exists(cx, &f, "connection-editor"));
     assert!(f.events.borrow().is_empty());
@@ -454,6 +472,7 @@ fn editing_starts_from_the_saved_connection_and_keeps_its_other_settings(cx: &mu
     // Select all, then replace the name.
     press(cx, &f, "secondary-a");
     type_text(cx, &f, "Billing DB");
+    scroll_editor_to_save(cx, &f);
     click(cx, &f, "editor-save");
 
     let configs = saved(&f);
@@ -751,4 +770,56 @@ fn the_connection_editor_offers_a_group_choice(cx: &mut TestAppContext) {
         exists(cx, &f, "editor-group"),
         "group assignment lives in the editor"
     );
+}
+
+#[gpui_kit::test]
+fn the_connection_editor_offers_a_safe_mode_choice(cx: &mut TestAppContext) {
+    let f = open(cx, vec![]);
+    click(cx, &f, "new-connection");
+    assert!(exists(cx, &f, "editor-safe-mode"));
+    assert!(exists(cx, &f, "editor-safe-mode-hint"));
+
+    cx.update_window(f.window, |_, window, cx| window.click("editor-name", cx))
+        .unwrap();
+    type_text(cx, &f, "Shop");
+    cx.update_window(f.window, |_, window, cx| window.click("editor-path", cx))
+        .unwrap();
+    type_text(cx, &f, "/data/shop.db");
+    scroll_editor_to_save(cx, &f);
+    click(cx, &f, "editor-save");
+
+    let configs = saved(&f);
+    assert_eq!(configs.len(), 1);
+    assert_eq!(
+        configs[0].safe_mode, None,
+        "the default choice follows the environment"
+    );
+}
+
+#[gpui_kit::test]
+fn editing_a_connection_keeps_its_safe_mode_when_untouched(cx: &mut TestAppContext) {
+    let mut strict = row("shop", true);
+    strict.config.as_mut().unwrap().safe_mode = Some(SafeMode::Strict);
+    let f = open(cx, vec![strict]);
+    click(cx, &f, "edit-selected");
+    assert!(exists(cx, &f, "editor-safe-mode"));
+    let hint = cx
+        .update_window(f.window, |_, window, _| {
+            window
+                .find("editor-safe-mode-hint")
+                .label()
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .unwrap();
+    assert!(
+        hint.contains("Strict") || hint.contains("严格"),
+        "the hint describes the stored mode: {hint}"
+    );
+    scroll_editor_to_save(cx, &f);
+    click(cx, &f, "editor-save");
+
+    let configs = saved(&f);
+    assert_eq!(configs.len(), 1);
+    assert_eq!(configs[0].safe_mode, Some(SafeMode::Strict));
 }

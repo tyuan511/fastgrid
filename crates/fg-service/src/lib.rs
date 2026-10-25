@@ -710,10 +710,36 @@ impl Service {
         self.with_store(move |s| s.save_document(&doc)).await
     }
 
-    /// Tombstone a draft. `false` when there was no live row.
+    /// Tombstone a draft. `false` when there was no live row. The crash journal goes with it:
+    /// a deleted draft must not resurrect through its journal.
     pub async fn delete_document(&self, id: &DocumentId) -> Result<bool> {
         let id = id.clone();
-        self.with_store(move |s| s.delete_document(&id)).await
+        self.with_store(move |s| {
+            let deleted = s.delete_document(&id)?;
+            let _ = s.delete_journal(&id);
+            Ok(deleted)
+        })
+        .await
+    }
+
+    /// Overwrite the crash journal for a draft: the newest unsaved buffer, written on every
+    /// edit and cleared by the next successful save. Best-effort scratch; the saved draft is
+    /// the authority, so callers ignore failures here.
+    pub async fn save_journal(&self, doc: QueryDocument) -> Result<()> {
+        self.with_store(move |s| s.save_journal(&doc)).await
+    }
+
+    /// The journal entry for a draft, if any. An unreadable row is reported, not hidden, so
+    /// the caller can treat it as absent and never restore from it.
+    pub async fn journal(&self, id: &DocumentId) -> Result<Option<StoredDocument>> {
+        let id = id.clone();
+        self.with_store(move |s| s.journal(&id)).await
+    }
+
+    /// Tombstone the journal entry. `false` when there was no live row.
+    pub async fn delete_journal(&self, id: &DocumentId) -> Result<bool> {
+        let id = id.clone();
+        self.with_store(move |s| s.delete_journal(&id)).await
     }
 
     /// Snippets visible for `connection` (globals plus that connection's own). `None` is every

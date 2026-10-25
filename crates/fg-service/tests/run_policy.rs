@@ -715,7 +715,11 @@ async fn documents_and_snippets_round_trip_through_the_service() {
             .content,
         "SELECT 9"
     );
+    // The crash journal goes with the draft: a deleted draft must not resurrect through it.
+    svc.save_journal(older.clone()).await.unwrap();
+    assert!(svc.journal(&older.id).await.unwrap().is_some());
     assert!(svc.delete_document(&older.id).await.unwrap());
+    assert!(svc.journal(&older.id).await.unwrap().is_none());
     assert!(!svc.delete_document(&older.id).await.unwrap());
     assert_eq!(svc.documents(&conn).await.unwrap().len(), 1);
     assert_eq!(svc.documents(&other).await.unwrap().len(), 1);

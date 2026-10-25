@@ -42,6 +42,12 @@ pub mod kinds {
     pub const SECRET: &str = "secret";
     pub const SNIPPET: &str = "snippet";
     pub const DOCUMENT: &str = "document";
+    /// Crash journal: the newest unsaved buffer of a draft, written on every edit and cleared
+    /// on the next successful save. Same payload as `document`, disposable by design: the saved
+    /// draft is the authority, the journal only bridges the gap between keystrokes and the
+    /// debounced save. Local-only: deliberately absent from `SYNCED`, so it never leaves the
+    /// device.
+    pub const JOURNAL: &str = "journal";
     pub const HISTORY: &str = "history";
     pub const AUDIT: &str = "audit";
     pub const WORKSPACE: &str = "workspace";

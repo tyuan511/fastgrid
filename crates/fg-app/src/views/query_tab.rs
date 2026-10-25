@@ -465,6 +465,92 @@ impl SqlCompletion {
     }
 }
 
+/// SQL hover and go-to-definition for the editor, backed by the same `fg-lsp` analysis as
+/// completion, so the three agree about what a name means. Hover explains a table (with its
+/// columns), a column (with its type and source), an alias, or a CTE; definition jumps within
+/// the script, to a CTE's `WITH` clause or an alias's `FROM` / `JOIN` site. A table's
+/// definition lives in the database, not in the buffer, so there is nothing to jump to for
+/// one, and a column has no definition in the script either.
+pub struct SqlInspect {
+    catalog: Rc<RefCell<CompletionCatalog>>,
+    kind: DbKind,
+}
+
+impl SqlInspect {
+    fn new(catalog: Rc<RefCell<CompletionCatalog>>, kind: DbKind) -> Self {
+        Self { catalog, kind }
+    }
+
+    fn range_of(text: &str, range: std::ops::Range<usize>) -> lsp_types::Range {
+        let (start_line, start_character) = fg_lsp::position_of(text, range.start);
+        let (end_line, end_character) = fg_lsp::position_of(text, range.end);
+        lsp_types::Range {
+            start: lsp_types::Position {
+                line: start_line,
+                character: start_character,
+            },
+            end: lsp_types::Position {
+                line: end_line,
+                character: end_character,
+            },
+        }
+    }
+}
+
+impl gpui_kit::component::input::HoverProvider for SqlInspect {
+    fn hover(
+        &self,
+        text: &gpui_kit::component::input::Rope,
+        offset: usize,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Task<anyhow::Result<Option<lsp_types::Hover>>> {
+        let text = text.to_string();
+        let catalog = self.catalog.borrow();
+        let hover =
+            fg_lsp::hover_at(&text, offset, self.kind, &*catalog).map(|hover| lsp_types::Hover {
+                contents: lsp_types::HoverContents::Markup(lsp_types::MarkupContent {
+                    kind: lsp_types::MarkupKind::Markdown,
+                    value: hover.markdown,
+                }),
+                range: Some(Self::range_of(&text, hover.range)),
+            });
+        Task::ready(Ok(hover))
+    }
+}
+
+impl gpui_kit::component::input::DefinitionProvider for SqlInspect {
+    fn definitions(
+        &self,
+        text: &gpui_kit::component::input::Rope,
+        offset: usize,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Task<anyhow::Result<Vec<lsp_types::LocationLink>>> {
+        let text = text.to_string();
+        let catalog = self.catalog.borrow();
+        // Any non-http(s) URI takes the editor's same-document path: it moves the caret to
+        // the target range instead of opening anything. The literal parses; failing closed
+        // (no links) beats panicking if it ever did not.
+        let Ok(uri) = "untitled:query".parse::<lsp_types::Uri>() else {
+            return Task::ready(Ok(Vec::new()));
+        };
+        let links = fg_lsp::definitions_at(&text, offset, self.kind, &*catalog)
+            .into_iter()
+            .map(|definition| {
+                let target = Self::range_of(&text, definition.target_range);
+                lsp_types::LocationLink {
+                    origin_selection_range: Some(Self::range_of(&text, definition.origin_range)),
+                    target_uri: uri.clone(),
+                    target_range: target,
+                    target_selection_range: target,
+                }
+            })
+            .collect();
+        Task::ready(Ok(links))
+    }
+}
+
 impl gpui_kit::component::input::CompletionProvider for SqlCompletion {
     fn completions(
         &self,
@@ -588,6 +674,9 @@ impl QueryTab {
                 .default_value(script);
             state.lsp_mut().completion_provider =
                 Some(Rc::new(SqlCompletion::new(Rc::clone(&catalog), kind)));
+            let inspect = Rc::new(SqlInspect::new(Rc::clone(&catalog), kind));
+            state.lsp_mut().hover_provider = Some(Rc::clone(&inspect) as _);
+            state.lsp_mut().definition_provider = Some(inspect as _);
             state
         });
         let on_edit = cx.subscribe(&editor, |this, _, event: &InputEvent, cx| {
@@ -735,6 +824,15 @@ impl QueryTab {
             editor.replace_all(text, window, cx);
         });
         self.document.mark_clean();
+        cx.notify();
+    }
+
+    /// Content recovered from the crash journal: show it, but leave the draft dirty, so the
+    /// next debounced save persists it and clears the journal. A plain `set_content` would
+    /// mark it clean and the recovery would never converge.
+    pub fn restore_unsaved(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_content(text, window, cx);
+        self.document.mark_dirty();
         cx.notify();
     }
 

@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use fg_core::{
     AppearanceSettings, ConnectionConfig, DbKind, GridSettings, ObjectInfo, ObjectPath,
-    QueryDocument, Result, SafeMode, TabKind, UnixMillis, WorkspaceState,
+    QueryDocument, Result, SafeMode, StatementClass, TabKind, UnixMillis, WorkspaceState,
 };
 use fg_driver::Event;
 use fg_service::{
@@ -263,16 +263,17 @@ fn wire_workspace(
             new_query(&service, &conn, &view, window, cx);
         }
         WorkspaceEvent::QueryRun { tab, mode } => {
-            run_from_editor(&conn, &runs, tab, RunSubject::Mode(*mode), cx);
+            run_from_editor(&view, &conn, &runs, tab, RunSubject::Mode(*mode), cx);
         }
         WorkspaceEvent::QueryConfirmed { tab, script } => {
             // `script` is the buffer text the prompt was built from; the tab hands the same string
             // back through `confirmation_target`, so the digest and the SQL cannot disagree.
             let _ = script;
-            run_from_editor(&conn, &runs, tab, RunSubject::Confirmed, cx);
+            run_from_editor(&view, &conn, &runs, tab, RunSubject::Confirmed, cx);
         }
         WorkspaceEvent::QueryCancel { tab } => cancel_run(&runs, tab, cx),
         WorkspaceEvent::QueryDraftChanged { tab } => {
+            write_journal(&service, tab, cx);
             save_draft_debounced(&service, &draft_timers, tab, cx);
         }
         WorkspaceEvent::SnippetsRequested => load_snippets(&service, &conn, &view, cx),
@@ -875,11 +876,28 @@ fn load_draft(
         let fg_store::StoredDocument::Ok(doc) = found else {
             return;
         };
-        if doc.content.is_empty() {
+        // A journal entry newer than the saved draft is unsaved work from before a crash:
+        // restore it dirty, so the next debounced save persists it and clears the journal.
+        // Anything else (older, identical, unreadable, or absent) leaves the saved draft alone.
+        let (content, from_journal) = match service.journal(&document_id).await {
+            Ok(Some(fg_store::StoredDocument::Ok(journal)))
+                if journal.updated_at > doc.updated_at && journal.content != doc.content =>
+            {
+                (journal.content, true)
+            }
+            _ => (doc.content.clone(), false),
+        };
+        if content.is_empty() {
             return;
         }
         let _ = window.update(cx, |_, window, cx| {
-            tab.update(cx, |t, cx| t.set_content(&doc.content, window, cx))
+            tab.update(cx, |t, cx| {
+                if from_journal {
+                    t.restore_unsaved(&content, window, cx);
+                } else {
+                    t.set_content(&content, window, cx);
+                }
+            })
         });
     })
     .detach();
@@ -889,6 +907,7 @@ fn load_draft(
 /// service is what is on screen at this instant - and, for a confirmed run, the byte-identical
 /// string the confirmation digest was taken over.
 fn run_from_editor(
+    view: &Entity<WorkspaceView>,
     conn: &Arc<OpenConnection>,
     runs: &Rc<RefCell<HashMap<EntityId, QueryRun>>>,
     tab: &Entity<QueryTab>,
@@ -951,13 +970,20 @@ fn run_from_editor(
     let generation = tab.update(cx, |t, cx| t.begin_run(target, script, cx));
     tab.update(cx, |t, cx| t.apply_plan(generation, &plan, cx));
 
+    // The plan already classifies every statement, so a DDL run is known before it starts.
+    let ddl = plan
+        .statements
+        .iter()
+        .any(|s| s.class == StatementClass::Ddl);
     let canceller: Arc<Mutex<Option<TaskCanceller>>> = Arc::default();
     let (weak, conn, id) = (tab.downgrade(), Arc::clone(conn), tab.entity_id());
-    let (task_tab, task_canceller, task_sql, task_plan) = (
+    let (task_tab, task_canceller, task_sql, task_plan, task_view, task_ddl) = (
         weak.clone(),
         Arc::clone(&canceller),
         sql.clone(),
         plan.clone(),
+        view.downgrade(),
+        ddl,
     );
     let task = cx.spawn(async move |cx| {
         let mut stream = match conn.run(&task_sql, &[], options).await {
@@ -1005,6 +1031,17 @@ fn run_from_editor(
                 t.editable_result_tables()
             })
             .unwrap_or_default();
+        // A successful DDL run changes what the sidebar lists: reload the schema the same way
+        // ⌘R does, instead of leaving the new table out until a manual refresh. Failed or
+        // cancelled runs change nothing, so they refresh nothing.
+        if succeeded && task_ddl {
+            let (refresh_view, refresh_conn) = (task_view.clone(), Arc::clone(&conn));
+            cx.update(|cx| {
+                if let Some(view) = refresh_view.upgrade() {
+                    load_schema(&view, &refresh_conn, None, cx);
+                }
+            });
+        }
         // A finished run's single-table sets become editable once their primary key is known. A
         // description that fails (a view, a dropped table) just leaves that set read-only.
         if succeeded && !tables.is_empty() {
@@ -1086,6 +1123,29 @@ fn cancel_run(
 }
 
 /// Persist the draft shortly after the last keystroke, not on every character.
+/// The crash journal: the newest unsaved buffer, written on every edit without waiting for
+/// the debounced save, so a crash inside the 600ms window loses nothing. A clean tab has
+/// nothing unsaved, so it writes nothing; an unreadable draft is never written back, same
+/// as the debounced save. Failures are ignored: the journal is best-effort scratch, and the
+/// next save still persists the draft.
+fn write_journal(service: &Service, tab: &Entity<QueryTab>, cx: &mut App) {
+    if tab.read(cx).is_unavailable() {
+        return;
+    }
+    let (document, content) = (tab.read(cx).document().clone(), tab.read(cx).script(cx));
+    if !document.dirty() {
+        return;
+    }
+    let service = service.clone();
+    let now = UnixMillis::now();
+    cx.spawn(async move |_| {
+        let _ = service
+            .save_journal(document.to_document(&content, now))
+            .await;
+    })
+    .detach();
+}
+
 fn save_draft_debounced(
     service: &Service,
     timers: &Rc<RefCell<HashMap<EntityId, Task<()>>>>,
@@ -1118,6 +1178,8 @@ fn save_draft_debounced(
             .is_ok()
         {
             let _ = tab.update(cx, |t, cx| t.mark_saved(cx));
+            // The draft is on disk now; the journal that bridged the gap is stale.
+            let _ = service.delete_journal(document.id()).await;
         }
     });
     timers.borrow_mut().insert(id, task);

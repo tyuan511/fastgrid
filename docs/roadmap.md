@@ -125,7 +125,7 @@
 
 ## M2 SQL 编辑器 + 一级安全模式（3w）
 
-对应调研报告 §7、§8。无界面的策略与落盘已有；编辑器、执行快捷键、结果区、L1 确认框、补全、查询历史与安全模式切换已落地。**不要把本里程碑标成完成**：hover / 跳转定义、崩溃恢复、完整的连接级安全模式界面仍未做，视觉也没有人眼验证过。
+对应调研报告 §7、§8。无界面的策略与落盘已有；编辑器、执行快捷键、结果区、L1 确认框、补全、查询历史与安全模式切换已落地。**不要把本里程碑标成完成**：视觉没有人眼验证过，十万行界面表现也未实测。
 
 无界面，已落地：
 
@@ -145,22 +145,22 @@
 界面与其余行为，仍未做：
 
 - [x] 补全（经 `fg-lsp` 的作用域分析）：`i.` 解析到 `items` 是因为 `i` 被声明成它的别名，不是名字前缀碰巧对上。列 > 作用域内关系 > 表 > 关键字；`alias.` 只给该关系的列；CTE 与 JOIN 别名各自解析；大小写不敏感；同名不重推；上限 50 条。数据来自元数据缓存（schema 落地后逐表 `describe` 灌入，不在敲键时查库）。
-- [x] **SQL language server `fg-lsp` + `fastgrid-cli lsp`**：进程层的完整实现——`wire.rs` 是 `Content-Length` 分帧（长度按**字节**算，UTF-16 位置换算在 `protocol.rs` 里做一次），`protocol.rs` 是纯函数式的「请求 → 响应」状态机（`initialize` / `initialized` / `shutdown` / `exit`、`didOpen` / `didChange` / `didClose`、`completion`、`diagnostic`、`publishDiagnostics`），`fg-cli` 只负责 stdin/stdout 的循环。客户端可以通过 `initializationOptions.fastgrid` 传 schema（`kind` + `tables[].columns[]`），进程才有列可补全。**进程级测试**（`crates/fg-cli/tests/lsp_process.rs`，7 个）真的 spawn 二进制、走管道：`initialize` 应答、别名解析出列、`didOpen` 推空诊断、畸形消息不断连、stdout 只有协议字节、`exit` 后正常退出。
+- [x] **SQL language server `fg-lsp` + `fastgrid-cli lsp`**：进程层的完整实现——`wire.rs` 是 `Content-Length` 分帧（长度按**字节**算，UTF-16 位置换算在 `protocol.rs` 里做一次），`protocol.rs` 是纯函数式的「请求 → 响应」状态机（`initialize` / `initialized` / `shutdown` / `exit`、`didOpen` / `didChange` / `didClose`、`completion`、`diagnostic`、`publishDiagnostics`、`hover`、`definition`），`fg-cli` 只负责 stdin/stdout 的循环。客户端可以通过 `initializationOptions.fastgrid` 传 schema（`kind` + `tables[].columns[]`），进程才有列可补全。**进程级测试**（`crates/fg-cli/tests/lsp_process.rs`，7 个）真的 spawn 二进制、走管道：`initialize` 应答、别名解析出列、`didOpen` 推空诊断、畸形消息不断连、stdout 只有协议字节、`exit` 后正常退出。
 - [x] **SQL 分析核心 `fg-lsp`**（补全与诊断的所在地，而不是编辑器侧）：`scope.rs` 解析一条语句在光标处能看见什么（`FROM` / `JOIN` / 逗号列表 / `AS` 别名 / 限定名 / CTE / 派生表，后出现的别名遮蔽先出现的，只有光标所在那条语句被分析）；`complete.rs` 在此基础上排序候选；`diagnostics.rs` 解决「错误属于哪条语句」——靠「产生了几个结果集」推断失败的是第几条，所以**多语句脚本现在也能正确下划线**。纯函数、无 IO，schema 由调用方通过 `Catalog` 提供。前缀匹配器已删除，不并存。
-   - 已接入编辑器的 `CompletionProvider`；`HoverProvider` / `DefinitionProvider` 的挂点还在（`gpui_base::input::Lsp`），是后续增量。
+   - 已接入编辑器的 `CompletionProvider`、`HoverProvider`、`DefinitionProvider`：hover 解释表（含列）、列（含类型与来源）、别名、CTE，关键字与未知词不弹；定义跳转只在同脚本内——CTE 跳到 `WITH` 子句（`Scope.cte_spans` 记声明位置）、别名跳到 `FROM` / `JOIN` 声明处，列、声明处自身、普通表名不跳（表的定义在数据库里，不在缓冲区里）。编辑器侧（`SqlInspect`，与补全共用 `CompletionCatalog`）与 stdio Server（`textDocument/hover` / `textDocument/definition`）共用 `inspect.rs` 的同一套分析。
    - **CTE 与派生表的列已解析**：递归分析子查询的 `SELECT` 列表（`SELECT *` 按它自己的 `FROM` 展开、`AS name` 改名、类型从内层表带出），显式列名列表优先；CTE 体里的表**不会**泄漏到外层作用域；递归 CTE 与 `AS MATERIALIZED` 都处理；嵌套超过 8 层就停止（`MAX_DEPTH`），不会爆栈。
 - [x] 格式化 SQL（`⌥⇧F`）：`fg-sql::format_sql` 是纯函数——子句各占一行、括号内按层缩进并在逗号处换行、关键字统一大写、字符串 / 引号标识符 / 注释原样保留、语句之间空一行；幂等（`format_sql(format_sql(x)) == format_sql(x)`，有测试）。刻意保守：不做需要语法树的重新排版，宁可少格式化也不改语义。
 - [x] 注释切换（`⌘/`）：`fg-sql::toggle_line_comments`，用 lexer 判断某行是否**真的**是行注释（`SELECT '--x'` 不会被当成注释），只给非空行加/去 `--`，保留缩进；整段选中时若已全注释则取消、否则全部注释（混合选择按其他编辑器的惯例全注释）。只做行注释，块注释不做。
 - [x] 查询历史界面（`⌘Y` / 顶栏按钮）：右侧抽屉，按语句搜索、按结果着色（ok / error / cancelled / not run）、显示耗时与相对时间，点一条把语句填进当前查询标签。数据走 `Service::history`（加密历史记录），不另存一份。
 - [x] 收藏片段界面（`⌘⇧S` 打开 / `⌘⇧K` 把当前语句存为片段）：右侧抽屉，按标题 / SQL / 标签搜索，点一条填进当前查询标签，可删除；读不懂的片段单独提示且不可编辑。存储走 `fg-store` 的加密 `snippet` 记录（M1.1 已勾选），界面不另存副本。
-- [ ] 未保存内容的崩溃恢复：现在只有 600ms 防抖的 `save_document`，没有独立的崩溃日记。
+- [x] 未保存内容的崩溃恢复：独立的崩溃日记（`journal` kind，与草稿同 id、同载荷，不同步不导出）。每次编辑即写日记（不再只等 600ms 防抖的 `save_document`），保存成功后清日记，删除草稿时连带清日记；打开标签时若日记比已存草稿新且内容不同，就把日记内容以 dirty 状态恢复进编辑器，下一轮防抖保存会把它落盘并清日记。并发写入以 `updated_at` 严格更新者胜（同一锁内先读后写）；不可读的日记行视为不存在、永不恢复；不可读的草稿仍按旧规则只展示不回写。
 - [x] EXPLAIN（`⌘⇧E`）：走同一条受检路径 `OpenConnection::run` 跑 `EXPLAIN QUERY PLAN …`（SQLite）/ `EXPLAIN …`（其他引擎），计划就是引擎返回的行，直接显示在结果区；因为被分类的是 `EXPLAIN` 本身（读），**只读连接也能解释一条写语句**，且这次尝试照样进历史。
 - [x] 安全模式切换：顶栏锁形按钮按 Normal → Alert → Strict → ReadOnly 循环（只读时图标变实锁），tooltip 说明当前级别，改动立刻写回连接配置并关闭旧连接，所以下一条语句就按新级别执行。L1 / L2 确认对话框也在上面勾选。
-- [ ] 完整的连接级安全模式设置界面（下拉、说明文字、按环境给建议值）。现在只有这个循环按钮；默认映射已在 `Environment::default_safe_mode`（生产与未知 → Alert）
+- [x] 完整的连接级安全模式设置界面：连接编辑器里的安全模式下拉（默认 = 跟随环境，外加 Normal / Alert / Strict / Read-only 四档）+ 说明文字；选「默认」时说明按当前环境实时算出建议值（开发 → Normal，测试 / 生产 / 未知 → Alert，映射在 `Environment::default_safe_mode`）。顶栏循环按钮仍保留，作为已打开连接的快速切换；`ConnectionDraft.safe_mode`（`None` = 跟随环境）经 `from_config` / `to_config` 往返。
 
 ~~已知 API 缺口：多语句脚本的错误无法归属~~ —— **已解决**，不需要驱动改动：`fg-lsp::diagnostic_for` 用「产生了几个结果集」推断失败的是第几条语句（服务按顺序执行、遇错即停），再把语句内偏移加上语句起点。测试：`fg-lsp` 的 `a_failure_in_the_third_statement_is_attributed_to_it`、`a_position_is_relative_to_the_statement_not_the_script`；界面上是 `a_multi_statement_failure_underlines_the_statement_that_failed`。
 
-另外两条待办：确认框目前是标签内的内联区，不是模态；`⌘↵` 之后对象树不会因为 DDL 自动刷新（手动 `⌘R`）。
+另外一条待办：确认框目前是标签内的内联区，不是模态。`⌘↵` 跑成功 DDL 后对象树自动刷新（控制器在运行成功且计划里有 `Ddl` 语句时走与手动 `⌘R` 同一条 `load_schema` 路径；失败或取消的运行不刷新）。
 
 **验收**
 

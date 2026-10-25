@@ -75,6 +75,41 @@ impl Store {
     pub fn delete_document(&self, id: &DocumentId) -> Result<bool> {
         self.tombstone(kinds::DOCUMENT, id.as_str())
     }
+
+    /// Overwrite the crash journal for a draft. The journal is disposable scratch, not the
+    /// record: it uses a plain write, so a journal row a newer version wrote (and this one
+    /// cannot read) is replaced rather than blocking every later keystroke. The saved draft
+    /// stays the authority, and a successful save clears the journal.
+    ///
+    /// Writes race: keystrokes spawn them concurrently, so the read and the write share one
+    /// lock hold, and an entry that is not strictly newer than the stored one is dropped.
+    /// A same-millisecond tie keeps the first write; the next keystroke repairs it.
+    pub fn save_journal(&self, doc: &QueryDocument) -> Result<()> {
+        match self.journal(&doc.id)? {
+            Some(StoredDocument::Ok(old)) if old.updated_at >= doc.updated_at => return Ok(()),
+            _ => {}
+        }
+        self.put_json(
+            kinds::JOURNAL,
+            doc.id.as_str(),
+            Some(doc.connection_id.as_str()),
+            Some(doc.updated_at.0),
+            doc,
+        )
+    }
+
+    /// The journal entry for a draft, if any. An unreadable row is reported, not hidden: the
+    /// caller treats it as absent and never restores from it.
+    pub fn journal(&self, id: &DocumentId) -> Result<Option<StoredDocument>> {
+        Ok(self
+            .get_json::<QueryDocument>(kinds::JOURNAL, id.as_str())?
+            .map(stored_document))
+    }
+
+    /// Tombstone the journal entry. `false` when there was no live row.
+    pub fn delete_journal(&self, id: &DocumentId) -> Result<bool> {
+        self.tombstone(kinds::JOURNAL, id.as_str())
+    }
 }
 
 fn stored_document(loaded: Loaded<QueryDocument>) -> StoredDocument {
@@ -141,6 +176,29 @@ mod tests {
             .expect("tombstone stays");
         assert!(row.deleted_at.is_some());
         assert!(row.enc.is_empty());
+    }
+
+    #[test]
+    fn journal_roundtrip_and_delete() {
+        let s = store();
+        let conn = ConnectionId::new();
+        let doc = draft(&conn, "q", "SELECT 1", 10);
+        assert_eq!(s.journal(&doc.id).unwrap(), None);
+
+        s.save_journal(&doc).unwrap();
+        assert_eq!(ok(s.journal(&doc.id).unwrap()).as_ref(), Some(&doc));
+
+        let mut newer = doc.clone();
+        newer.content = "SELECT 2".into();
+        newer.updated_at = UnixMillis(20);
+        s.save_journal(&newer).unwrap();
+        assert_eq!(ok(s.journal(&doc.id).unwrap()).as_ref(), Some(&newer));
+
+        // The journal is scratch: deleting it never touches the saved draft.
+        assert!(s.delete_journal(&doc.id).unwrap());
+        assert_eq!(s.journal(&doc.id).unwrap(), None);
+        assert!(!s.delete_journal(&doc.id).unwrap());
+        assert_eq!(s.document(&doc.id).unwrap(), None);
     }
 
     #[test]

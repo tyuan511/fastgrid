@@ -11,8 +11,8 @@ use fg_app::controller::open_connection_window;
 use fg_app::model::{QueryDocumentState, RunStatus};
 use fg_app::views::{QueryTab, WorkspaceView};
 use fg_core::{
-    ConnectionConfig, ConnectionId, ConnectionParams, DbKind, Outcome, QuerySource, SafeMode,
-    UnixMillis, Value,
+    ConnectionConfig, ConnectionId, ConnectionParams, DbKind, ObjectPath, Outcome, QuerySource,
+    SafeMode, UnixMillis, Value,
 };
 use fg_driver::ExecOptions;
 use fg_service::{KeychainKeyProvider, MemoryBackend, PasswordUpdate, Service, ServiceOptions};
@@ -233,6 +233,25 @@ fn running_a_query_paints_the_result_and_records_history(cx: &mut TestAppContext
 }
 
 #[gpui_kit::test]
+fn creating_a_table_refreshes_the_sidebar_without_a_manual_reload(cx: &mut TestAppContext) {
+    let env = Env::new("ddl-refresh");
+    let (service, app) = start(cx, &env, SafeMode::Normal);
+    let path = ObjectPath::new(Some("main"), "fresh");
+    assert!(
+        !cx.read_entity(&app.view, |v, _| v.object_exists(&path)),
+        "the table does not exist before the run"
+    );
+
+    let _tab = query_tab(cx, &app, "CREATE TABLE fresh (id INTEGER PRIMARY KEY);");
+    run_and_wait(cx, &service, &app);
+
+    // No ⌘R anywhere in this test: the successful DDL run itself reloads the schema.
+    settle(cx, "the sidebar to pick up the new table", |cx| {
+        cx.read_entity(&app.view, |v, _| v.object_exists(&path))
+    });
+}
+
+#[gpui_kit::test]
 fn a_delete_without_where_waits_for_a_click_and_then_runs(cx: &mut TestAppContext) {
     let env = Env::new("confirm");
     let (service, app) = start(cx, &env, SafeMode::Alert);
@@ -387,6 +406,78 @@ fn typing_saves_the_draft_and_a_reopen_reads_it_back(cx: &mut TestAppContext) {
     );
 }
 
+#[gpui_kit::test]
+fn a_journal_newer_than_the_saved_draft_is_restored_on_reopen(cx: &mut TestAppContext) {
+    let env = Env::new("journal-restore");
+    let (service, app) = start(cx, &env, SafeMode::Normal);
+    let tab = query_tab(cx, &app, "");
+    let state = cx.read_entity(&tab, |t, _| t.document().clone());
+
+    // A saved draft from before the crash, and a journal entry holding newer, unsaved work.
+    block_on_save_doc(&service, state.to_document("SELECT 1;", UnixMillis(1000)));
+    block_on_save_journal(&service, state.to_document("SELECT 2;", UnixMillis(2000)));
+
+    let reopened = cx
+        .update_window(app.window, |_, window, cx| {
+            app.view
+                .update(cx, |v, cx| v.open_query(state, String::new(), window, cx))
+        })
+        .unwrap();
+    settle(cx, "the journal content to be restored", |cx| {
+        cx.run_until_parked();
+        cx.read_entity(&reopened, |t, cx| t.script(cx) == "SELECT 2;")
+    });
+    assert!(
+        cx.read_entity(&reopened, |t, _| t.is_dirty()),
+        "restored journal content is unsaved work, not a clean draft"
+    );
+}
+
+#[gpui_kit::test]
+fn typing_writes_the_journal_and_a_save_clears_it(cx: &mut TestAppContext) {
+    let env = Env::new("journal-write");
+    let (service, app) = start(cx, &env, SafeMode::Normal);
+    let tab = query_tab(cx, &app, "");
+
+    let editor = cx.read_entity(&tab, |t, _| t.editor_state().clone());
+    cx.update_window(app.window, |_, window, cx| {
+        window.click(("input", editor.entity_id()), cx);
+        window.input("SELECT 3;", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let id = cx.read_entity(&tab, |t, _| t.document_id().clone());
+
+    // The journal lands without waiting for the 600ms debounced save.
+    settle(cx, "the journal to hold the typed text", |cx| {
+        cx.run_until_parked();
+        block_on_journal(&service, &id).as_deref() == Some("SELECT 3;")
+    });
+
+    cx.executor().advance_clock(Duration::from_millis(700));
+    settle(cx, "the draft to be saved and the journal cleared", |cx| {
+        cx.run_until_parked();
+        !cx.read_entity(&tab, |t, _| t.is_dirty()) && block_on_journal(&service, &id).is_none()
+    });
+}
+
+#[gpui_kit::test]
+fn the_query_editor_wires_hover_and_definition_providers(cx: &mut TestAppContext) {
+    let env = Env::new("inspect-wiring");
+    let (_service, app) = start(cx, &env, SafeMode::Normal);
+    let tab = query_tab(cx, &app, "");
+    let editor = cx.read_entity(&tab, |t, _| t.editor_state().clone());
+    let (hover, definition) = cx.read_entity(&editor, |e, _| {
+        let lsp = e.lsp();
+        (
+            lsp.hover_provider.is_some(),
+            lsp.definition_provider.is_some(),
+        )
+    });
+    assert!(hover, "the editor has a hover provider");
+    assert!(definition, "the editor has a definition provider");
+}
+
 // ---- blocking helpers ---------------------------------------------------------------------------
 //
 // The service API is async and runs on its own runtime; tests read the store through it by driving
@@ -399,6 +490,38 @@ fn block_on_history(service: &Service, id: &ConnectionId) -> Vec<fg_core::QueryH
         .build()
         .unwrap();
     rt.block_on(async { service.history(&id, None, 50).await.unwrap() })
+}
+
+fn block_on_save_doc(service: &Service, doc: fg_core::QueryDocument) {
+    let service = service.clone();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async { service.save_document(doc).await.unwrap() });
+}
+
+fn block_on_save_journal(service: &Service, doc: fg_core::QueryDocument) {
+    let service = service.clone();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async { service.save_journal(doc).await.unwrap() });
+}
+
+/// The journal entry's content, if a readable one exists.
+fn block_on_journal(service: &Service, id: &fg_core::DocumentId) -> Option<String> {
+    let (service, id) = (service.clone(), id.clone());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async { service.journal(&id).await.unwrap() })
+        .and_then(|item| match item {
+            fg_store::StoredDocument::Ok(doc) => Some(doc.content),
+            fg_store::StoredDocument::Unreadable { .. } => None,
+        })
 }
 
 fn block_on_docs(service: &Service, id: &ConnectionId) -> Vec<Draft> {

@@ -17,12 +17,14 @@
 
 pub mod complete;
 pub mod diagnostics;
+pub mod inspect;
 pub mod protocol;
 pub mod scope;
 pub mod wire;
 
 pub use complete::{Completion, CompletionKind, complete_at};
 pub use diagnostics::{Diagnostic, diagnostic_for, diagnostic_for_script, failing_statement};
+pub use inspect::{Definition, HoverInfo, definitions_at, hover_at, identifier_at};
 pub use protocol::{Server, ServerConfig, offset_of, position_of};
 pub use scope::{Catalog, MapCatalog, Relation, Scope, scope_at};
 pub use wire::{Message, read_message, write_message};

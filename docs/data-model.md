@@ -26,6 +26,7 @@
 | `secret` | `<连接ID>:<种类>` | 连接 | ✓ | 密码、SSH 口令（`SecretRecord`） |
 | `snippet` | UUIDv7 | 连接（可空，空则全局） | ✓ | 片段。明文 `sort_ts` = `updated_at`。可读行的列表顺序是载荷里的 `sort_order` 升序，再 `updated_at` 降序，不靠 SQL 排这一列 |
 | `document` | UUIDv7 | 连接 | ✓ | 编辑器草稿。`sort_ts` = `updated_at`（调用方拥有时间戳，存储不改写） |
+| `journal` | UUIDv7（与草稿同 id） | 连接 | ✗ | 崩溃日记：草稿的最新未保存内容。每次编辑即写、保存成功后清；与 `document` 同载荷、不同 kind。本地专用，不同步不导出。并发写入以 `updated_at` 严格更新者胜，写读同一锁内完成 |
 | `history` | UUIDv7 | 连接 | ✓ | 查询历史，`sort_ts` = 执行时间（`executed_at`） |
 | `audit` | UUIDv7 | 连接（可空） | ✓ | 审计日志，只追加，连接删除后保留。`sort_ts` = `at`。插入拒绝重复 id，含已墓碑的 id |
 | `workspace` | `<连接ID>:<设备ID>` | 连接 | ✓ | 每台设备各自的布局 |

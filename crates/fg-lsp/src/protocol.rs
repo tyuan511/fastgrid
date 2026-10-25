@@ -9,8 +9,9 @@
 //! editor integration framework. It implements the lifecycle (`initialize`, `initialized`,
 //! `shutdown`, `exit`), document sync (`textDocument/didOpen`, `didChange`, `didClose`),
 //! `textDocument/completion`, `textDocument/diagnostic` and the `publishDiagnostics` notification
-//! that goes with it. Hover, go-to-definition and code actions are the next increment; the analysis
-//! they need is already in [`crate::scope`].
+//! that goes with it, plus `textDocument/hover` and `textDocument/definition` (same-script only:
+//! a table's definition lives in the database, not in a document). Code actions are the next
+//! increment.
 //!
 //! Two rules the spec makes easy to break:
 //! * `initialize` must be answered before anything else, and its `capabilities` decide what the
@@ -24,6 +25,7 @@ use serde_json::{Value, json};
 
 use crate::complete::{CompletionKind, complete_at};
 use crate::diagnostics::Diagnostic;
+use crate::inspect::{definitions_at, hover_at};
 use crate::scope::Catalog;
 
 /// Everything the server needs that is not in a request.
@@ -154,6 +156,11 @@ impl Server {
                         "triggerCharacters": [".", " "],
                         "resolveProvider": false,
                     },
+                    // Same-script only: a table's definition lives in the database, not in a
+                    // document, so definition jumps to a CTE's `WITH` clause or an alias's
+                    // `FROM` / `JOIN` site, and nowhere for anything else.
+                    "hoverProvider": true,
+                    "definitionProvider": true,
                     "diagnosticProvider": {
                         "interFileDependencies": false,
                         "workspaceDiagnostics": false,
@@ -223,6 +230,69 @@ impl Server {
                 // `isIncomplete: false` lets the client filter the list locally as the user types,
                 // which is what makes a 50-item menu feel instant.
                 ok(id, json!({ "isIncomplete": false, "items": items }))
+            }
+            "textDocument/hover" => {
+                let Some((uri, line, character)) = position_params(&params) else {
+                    return error(id, -32602, "hover needs textDocument.uri and position");
+                };
+                let Some(document) = self.documents.get(&uri) else {
+                    return error(id, -32602, "unknown document");
+                };
+                let offset = offset_of(&document.text, line, character);
+                let Some(hover) = hover_at(&document.text, offset, self.config.kind, &self.config)
+                else {
+                    return ok(id, Value::Null);
+                };
+                let (start_line, start_character) = position_of(&document.text, hover.range.start);
+                let (end_line, end_character) = position_of(&document.text, hover.range.end);
+                ok(
+                    id,
+                    json!({
+                        "contents": { "kind": "markdown", "value": hover.markdown },
+                        "range": {
+                            "start": { "line": start_line, "character": start_character },
+                            "end": { "line": end_line, "character": end_character },
+                        },
+                    }),
+                )
+            }
+            "textDocument/definition" => {
+                let Some((uri, line, character)) = position_params(&params) else {
+                    return error(id, -32602, "definition needs textDocument.uri and position");
+                };
+                let Some(document) = self.documents.get(&uri) else {
+                    return error(id, -32602, "unknown document");
+                };
+                let offset = offset_of(&document.text, line, character);
+                let links: Vec<Value> = definitions_at(&document.text, offset, self.config.kind, &self.config)
+                    .into_iter()
+                    .map(|definition| {
+                        let (start_line, start_character) =
+                            position_of(&document.text, definition.origin_range.start);
+                        let (end_line, end_character) =
+                            position_of(&document.text, definition.origin_range.end);
+                        let (target_start_line, target_start_character) =
+                            position_of(&document.text, definition.target_range.start);
+                        let (target_end_line, target_end_character) =
+                            position_of(&document.text, definition.target_range.end);
+                        json!({
+                            "originSelectionRange": {
+                                "start": { "line": start_line, "character": start_character },
+                                "end": { "line": end_line, "character": end_character },
+                            },
+                            "targetUri": uri,
+                            "targetRange": {
+                                "start": { "line": target_start_line, "character": target_start_character },
+                                "end": { "line": target_end_line, "character": target_end_character },
+                            },
+                            "targetSelectionRange": {
+                                "start": { "line": target_start_line, "character": target_start_character },
+                                "end": { "line": target_end_line, "character": target_end_character },
+                            },
+                        })
+                    })
+                    .collect();
+                ok(id, Value::Array(links))
             }
             "textDocument/diagnostic" => {
                 let Some(uri) = params
@@ -659,8 +729,46 @@ mod tests {
     fn an_unknown_method_is_method_not_found() {
         let mut server = server();
         request(&mut server, "initialize", json!({}));
-        let response = request(&mut server, "textDocument/hover", json!({}));
+        let response = request(&mut server, "textDocument/codeAction", json!({}));
         assert_eq!(response["error"]["code"], -32601);
+    }
+
+    #[test]
+    fn hover_and_definition_come_from_the_same_analysis() {
+        let mut server = server();
+        request(&mut server, "initialize", json!({}));
+        open(
+            &mut server,
+            "file:///a.sql",
+            "WITH r AS (SELECT 1 AS a) SELECT a FROM r",
+        );
+        // On the `r` in `FROM r`: a CTE hover, and a jump to the `WITH` clause.
+        let hover = request(
+            &mut server,
+            "textDocument/hover",
+            json!({ "textDocument": { "uri": "file:///a.sql" }, "position": { "line": 0, "character": 40 } }),
+        );
+        assert!(
+            hover["result"]["contents"]["value"]
+                .as_str()
+                .is_some_and(|v| v.contains("CTE `r`")),
+            "{hover:?}"
+        );
+        let links = request(
+            &mut server,
+            "textDocument/definition",
+            json!({ "textDocument": { "uri": "file:///a.sql" }, "position": { "line": 0, "character": 40 } }),
+        );
+        let target = &links["result"][0]["targetSelectionRange"];
+        assert_eq!(target["start"]["character"], 5, "{links:?}");
+        assert_eq!(target["end"]["character"], 6, "{links:?}");
+        // On a keyword: hover is null, definition is empty.
+        let nothing = request(
+            &mut server,
+            "textDocument/hover",
+            json!({ "textDocument": { "uri": "file:///a.sql" }, "position": { "line": 0, "character": 0 } }),
+        );
+        assert!(nothing["result"].is_null(), "{nothing:?}");
     }
 
     #[test]
