@@ -108,6 +108,45 @@ authorize a write.
 Still open: PostgreSQL / MySQL engine-level read-only (M4 / M5), the HTTP transport with real
 client authentication, and `allow_write` (no write tool exists; M7 adds a GUI-gated one).
 
+## Client configuration
+
+The server reads the same store as the GUI, so connections created in the GUI
+appear here with no extra setup; `FASTGRID_DATA_DIR` overrides the store
+location (same variable the GUI honours). The binary is the `fg-cli` package
+(`cargo run -p fg-cli -- mcp --stdio` from a checkout, or the installed
+`fastgrid-cli` next to the GUI build).
+
+Claude Code (from a terminal):
+
+```
+claude mcp add fastgrid -- /path/to/fastgrid-cli mcp --stdio
+```
+
+Claude Desktop and Cursor (their MCP settings file, same shape):
+
+```json
+{
+  "mcpServers": {
+    "fastgrid": {
+      "command": "/path/to/fastgrid-cli",
+      "args": ["mcp", "--stdio"]
+    }
+  }
+}
+```
+
+Interop check (2026-10-25): the official MCP TypeScript SDK client
+(`@modelcontextprotocol/sdk` 1.32.2, the same protocol client Claude
+Desktop and Claude Code speak) drove a debug `fastgrid-cli mcp --stdio`
+over a real encrypted store end to end — `initialize`, `tools/list`
+(five tools), `list_connections`, `list_tables`, `describe_table`, a
+`SELECT` through `run_query` (rows returned, with the data-not-instructions
+note), a `DROP TABLE` refused by policy, and an unknown connection refused
+with the same text as a hidden one. The table still held all 100 rows
+afterwards. The Claude apps themselves have not run against it: no Claude
+Desktop or Claude Code client exists on the Linux VM where this was
+checked, so that last step stays open for a machine that has one.
+
 ## Planned surface
 
 - Tools: `list_connections`, `list_schemas`, `describe_table`, `run_query`, `explain`, `sample_rows`,

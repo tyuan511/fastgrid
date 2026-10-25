@@ -11,8 +11,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use fg_core::{
-    AppearanceSettings, ConnectionConfig, DbKind, GridSettings, ObjectInfo, ObjectPath,
-    QueryDocument, Result, SafeMode, StatementClass, TabKind, UnixMillis, WorkspaceState,
+    AppearanceSettings, DbKind, GridSettings, ObjectInfo, ObjectPath, QueryDocument, Result,
+    SafeMode, StatementClass, TabKind, UnixMillis, WorkspaceState,
 };
 use fg_driver::Event;
 use fg_service::{
@@ -74,7 +74,10 @@ pub fn launcher(service: Service, window: &mut Window, cx: &mut App) -> Entity<L
     let events_service = service.clone();
     cx.subscribe(&view, move |view, event: &LauncherEvent, cx| match event {
         LauncherEvent::Open(id) => open(&view, &events_service, id.clone(), cx),
-        LauncherEvent::Save(config) => save(&view, &events_service, (**config).clone(), cx),
+        LauncherEvent::Save(req) => save(&view, &events_service, req.clone(), cx),
+        LauncherEvent::TestConnection(req) => {
+            test_connection(&view, &events_service, req.clone(), cx)
+        }
         LauncherEvent::Delete(id) => delete(&view, &events_service, id.clone(), cx),
         LauncherEvent::CycleTheme => cycle_theme(&events_service, cx),
         LauncherEvent::DismissBackupNudge => dismiss_backup_nudge(&view, &events_service, cx),
@@ -200,13 +203,41 @@ fn open(view: &Entity<Launcher>, service: &Service, id: fg_core::ConnectionId, c
 }
 
 /// Save a new, edited or duplicated connection.
-fn save(view: &Entity<Launcher>, service: &Service, config: ConnectionConfig, cx: &mut App) {
+fn save(view: &Entity<Launcher>, service: &Service, req: crate::views::SaveRequest, cx: &mut App) {
     let (view, service) = (view.downgrade(), service.clone());
     cx.spawn(async move |cx| {
-        let outcome = service.save_connection(config, PasswordUpdate::Keep).await;
+        let outcome = service
+            .save_connection_with_secrets(req.config, req.password, req.ssh_secret)
+            .await;
         let _ = view.update(cx, |v, cx| match outcome {
             Ok(saved) => v.select(saved.id, cx),
             Err(e) => v.set_message(Some(format!("Could not save the connection: {e}")), cx),
+        });
+    })
+    .detach();
+}
+
+fn test_connection(
+    view: &Entity<Launcher>,
+    service: &Service,
+    req: crate::views::TestConnectionRequest,
+    cx: &mut App,
+) {
+    let (view, service) = (view.downgrade(), service.clone());
+    cx.spawn(async move |cx| {
+        let outcome = service
+            .test_connection(req.config, req.password, req.ssh_secret)
+            .await;
+        let _ = view.update(cx, |v, cx| {
+            let message = match outcome {
+                Ok(result) => format!(
+                    "Connected in {} ms — {}",
+                    result.latency.as_millis(),
+                    result.server_version
+                ),
+                Err(e) => format!("Could not connect: {e}"),
+            };
+            v.set_editor_test_result(message, cx);
         });
     })
     .detach();
@@ -251,67 +282,138 @@ fn wire_workspace(
     let draft_timers: Rc<RefCell<HashMap<EntityId, Task<()>>>> = Rc::default();
     // One running statement per tab, plus its canceller so `⌘.` can reach it from the UI thread.
     let runs: Rc<RefCell<HashMap<EntityId, QueryRun>>> = Rc::default();
-    cx.subscribe(&view, move |view, event: &WorkspaceEvent, cx| match event {
-        WorkspaceEvent::TableOpened { path, tab } => {
-            attach_table(&service, &conn, path.clone(), tab.clone(), cx);
+    // The connection this window talks to. Switching databases replaces the
+    // pool under the same id, so every event reads the current connection
+    // from this cell instead of the one captured when the window opened.
+    let conn_cell = Rc::new(RefCell::new(conn));
+    cx.subscribe(&view, move |view, event: &WorkspaceEvent, cx| {
+        let conn = conn_cell.borrow().clone();
+        match event {
+            WorkspaceEvent::TableOpened { path, tab } => {
+                attach_table(&service, &conn, path.clone(), tab.clone(), cx);
+            }
+            WorkspaceEvent::QueryOpened { tab } => {
+                load_draft(&service, &conn, tab.clone(), window, cx);
+                feed_completion(&conn, &view, cx);
+            }
+            WorkspaceEvent::NewQueryRequested => {
+                new_query(&service, &conn, &view, window, cx);
+            }
+            WorkspaceEvent::QueryRun { tab, mode } => {
+                run_from_editor(&view, &conn, &runs, tab, RunSubject::Mode(*mode), cx);
+            }
+            WorkspaceEvent::QueryConfirmed { tab, script } => {
+                // `script` is the buffer text the prompt was built from; the tab hands the same string
+                // back through `confirmation_target`, so the digest and the SQL cannot disagree.
+                let _ = script;
+                run_from_editor(&view, &conn, &runs, tab, RunSubject::Confirmed, cx);
+            }
+            WorkspaceEvent::QueryCancel { tab } => cancel_run(&runs, tab, cx),
+            WorkspaceEvent::QueryDraftChanged { tab } => {
+                write_journal(&service, tab, cx);
+                save_draft_debounced(&service, &draft_timers, tab, cx);
+            }
+            WorkspaceEvent::SnippetsRequested => load_snippets(&service, &conn, &view, cx),
+            WorkspaceEvent::SnippetSave { title, sql } => {
+                save_snippet(&service, &conn, &view, title.clone(), sql.clone(), cx);
+            }
+            WorkspaceEvent::SnippetDelete { id } => {
+                delete_snippet(&service, &conn, &view, id.clone(), cx);
+            }
+            WorkspaceEvent::QueryExplain { tab } => {
+                explain(&conn, &runs, tab, cx);
+            }
+            WorkspaceEvent::QueryResultCommit { tab } => {
+                commit_result(&conn, tab, cx);
+            }
+            WorkspaceEvent::HistoryRequested { search } => {
+                load_history(&service, &conn, &view, search.clone(), cx);
+            }
+            WorkspaceEvent::HistoryPicked { sql } => {
+                insert_into_active_query(&view, sql, window, cx);
+            }
+            WorkspaceEvent::SafeModeChanged { mode } => {
+                set_safe_mode(&service, &conn, &view, *mode, cx);
+            }
+            WorkspaceEvent::RefreshSchema => load_schema(&view, &conn, None, cx),
+            WorkspaceEvent::SwitchDatabaseRequested => {
+                load_databases(&conn, &view, cx);
+            }
+            WorkspaceEvent::SwitchDatabase { database } => {
+                switch_database(&service, &conn_cell, &view, database.clone(), cx);
+            }
+            WorkspaceEvent::CycleTheme => cycle_theme(&service, cx),
+            WorkspaceEvent::SessionChanged => {
+                // Save shortly after the last change, not on every click.
+                let (service, id, weak) = (service.clone(), conn.id().clone(), view.downgrade());
+                let task = cx.spawn(async move |cx| {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(600))
+                        .await;
+                    if let Ok(state) = weak.read_with(cx, |v, _| v.session()) {
+                        let _ = service.save_workspace(&id, state).await;
+                    }
+                });
+                *save_timer.borrow_mut() = Some(task);
+            }
         }
-        WorkspaceEvent::QueryOpened { tab } => {
-            load_draft(&service, &conn, tab.clone(), window, cx);
-            feed_completion(&conn, &view, cx);
-        }
-        WorkspaceEvent::NewQueryRequested => {
-            new_query(&service, &conn, &view, window, cx);
-        }
-        WorkspaceEvent::QueryRun { tab, mode } => {
-            run_from_editor(&view, &conn, &runs, tab, RunSubject::Mode(*mode), cx);
-        }
-        WorkspaceEvent::QueryConfirmed { tab, script } => {
-            // `script` is the buffer text the prompt was built from; the tab hands the same string
-            // back through `confirmation_target`, so the digest and the SQL cannot disagree.
-            let _ = script;
-            run_from_editor(&view, &conn, &runs, tab, RunSubject::Confirmed, cx);
-        }
-        WorkspaceEvent::QueryCancel { tab } => cancel_run(&runs, tab, cx),
-        WorkspaceEvent::QueryDraftChanged { tab } => {
-            write_journal(&service, tab, cx);
-            save_draft_debounced(&service, &draft_timers, tab, cx);
-        }
-        WorkspaceEvent::SnippetsRequested => load_snippets(&service, &conn, &view, cx),
-        WorkspaceEvent::SnippetSave { title, sql } => {
-            save_snippet(&service, &conn, &view, title.clone(), sql.clone(), cx);
-        }
-        WorkspaceEvent::SnippetDelete { id } => {
-            delete_snippet(&service, &conn, &view, id.clone(), cx);
-        }
-        WorkspaceEvent::QueryExplain { tab } => {
-            explain(&conn, &runs, tab, cx);
-        }
-        WorkspaceEvent::QueryResultCommit { tab } => {
-            commit_result(&conn, tab, cx);
-        }
-        WorkspaceEvent::HistoryRequested { search } => {
-            load_history(&service, &conn, &view, search.clone(), cx);
-        }
-        WorkspaceEvent::HistoryPicked { sql } => {
-            insert_into_active_query(&view, sql, window, cx);
-        }
-        WorkspaceEvent::SafeModeChanged { mode } => {
-            set_safe_mode(&service, &conn, &view, *mode, cx);
-        }
-        WorkspaceEvent::RefreshSchema => load_schema(&view, &conn, None, cx),
-        WorkspaceEvent::CycleTheme => cycle_theme(&service, cx),
-        WorkspaceEvent::SessionChanged => {
-            // Save shortly after the last change, not on every click.
-            let (service, id, weak) = (service.clone(), conn.id().clone(), view.downgrade());
-            let task = cx.spawn(async move |cx| {
-                cx.background_executor()
-                    .timer(Duration::from_millis(600))
-                    .await;
-                if let Ok(state) = weak.read_with(cx, |v, _| v.session()) {
-                    let _ = service.save_workspace(&id, state).await;
-                }
+    })
+    .detach();
+}
+
+fn load_databases(conn: &Arc<OpenConnection>, view: &Entity<WorkspaceView>, cx: &mut App) {
+    let (conn, view) = (Arc::clone(conn), view.downgrade());
+    cx.spawn(async move |cx| {
+        let outcome = conn.databases().await;
+        let _ = view.update(cx, |v, cx| match outcome {
+            Ok(list) => v.set_database_list(list, cx),
+            Err(e) => v.set_database_error(format!("Could not list databases: {e}"), cx),
+        });
+    })
+    .detach();
+}
+
+fn switch_database(
+    service: &Service,
+    conn_cell: &Rc<RefCell<Arc<OpenConnection>>>,
+    view: &Entity<WorkspaceView>,
+    database: String,
+    cx: &mut App,
+) {
+    let (service, conn_cell, view) = (service.clone(), Rc::clone(conn_cell), view.downgrade());
+    cx.spawn(async move |cx| {
+        // Switching closes every tab, so refuse while a table tab still has
+        // staged edits rather than discarding them.
+        let dirty = view
+            .read_with(cx, |v, cx| v.has_pending_changes(cx))
+            .unwrap_or(false);
+        if dirty {
+            let _ = view.update(cx, |v, cx| {
+                v.set_database_error(
+                    "Close or commit the tabs with staged edits first.".into(),
+                    cx,
+                );
             });
-            *save_timer.borrow_mut() = Some(task);
+            return;
+        }
+        let id = conn_cell.borrow().id().clone();
+        match service.switch_database(&id, &database).await {
+            Ok(new_conn) => {
+                *conn_cell.borrow_mut() = Arc::clone(&new_conn);
+                let _ = view.update(cx, |v, cx| {
+                    v.apply_switched_connection(new_conn.config().clone(), cx);
+                });
+                cx.update(|cx| {
+                    if let Some(entity) = view.upgrade() {
+                        load_schema(&entity, &new_conn, None, cx);
+                    }
+                });
+            }
+            Err(e) => {
+                let _ = view.update(cx, |v, cx| {
+                    v.set_database_error(format!("Could not switch database: {e}"), cx);
+                });
+            }
         }
     })
     .detach();

@@ -21,6 +21,7 @@ mod conn;
 mod keychain;
 mod pool;
 mod run;
+mod ssh;
 mod task;
 
 use std::collections::HashMap;
@@ -47,6 +48,7 @@ pub use keychain::{
     account_name, default_key_provider,
 };
 pub use run::{PlannedStatement, PolicyRefusal, RunOptions, RunPlan, RunStream, plan};
+pub use ssh::SshTunnel;
 pub use task::{TaskCanceller, TaskStream};
 
 use conn::{Rt, SharedRuntime};
@@ -416,12 +418,23 @@ impl Service {
         config: ConnectionConfig,
         password: PasswordUpdate,
     ) -> Result<ConnectionConfig> {
+        self.save_connection_with_secrets(config, password, PasswordUpdate::Keep)
+            .await
+    }
+
+    /// Save a connection with both its secrets: the database password and,
+    /// for a tunneled connection, the SSH password or key passphrase. Both
+    /// write in the same store transaction as the config.
+    pub async fn save_connection_with_secrets(
+        &self,
+        config: ConnectionConfig,
+        password: PasswordUpdate,
+        ssh_secret: PasswordUpdate,
+    ) -> Result<ConnectionConfig> {
         let inner = Arc::clone(&self.inner);
-        let task = self
-            .inner
-            .rt
-            .handle
-            .spawn(async move { persist_and_invalidate(inner, config, password).await });
+        let task = self.inner.rt.handle.spawn(async move {
+            persist_and_invalidate(inner, config, password, ssh_secret).await
+        });
         match task.await {
             Ok(result) => result,
             Err(err) => Err(Error::Other(format!("save task failed: {err}"))),
@@ -441,15 +454,54 @@ impl Service {
         Ok(deleted)
     }
 
-    /// Try a connection without saving it. `password` is the typed (not yet stored) one.
+    /// Open an SSH tunnel for `config` when it carries SSH settings, and return
+    /// the config the driver should actually connect to (localhost forward,
+    /// SSH cleared) plus the tunnel that must stay alive for the session.
+    /// Without SSH settings this is a no-op clone with no tunnel.
+    async fn tunnel_for(
+        &self,
+        config: &ConnectionConfig,
+        ssh_secret: Option<String>,
+    ) -> Result<(ConnectionConfig, Option<ssh::SshTunnel>)> {
+        let Some(ssh) = &config.ssh else {
+            return Ok((config.clone(), None));
+        };
+        let (target_host, target_port) = match &config.params {
+            ConnectionParams::Network { host, port, .. } => (host.clone(), *port),
+            ConnectionParams::File { .. } => {
+                return Err(Error::Connection(
+                    "an SSH tunnel requires a network connection".into(),
+                ));
+            }
+        };
+        let tunnel =
+            ssh::SshTunnel::open(ssh, ssh_secret.as_deref(), &target_host, target_port).await?;
+        let mut pool_config = config.clone();
+        if let ConnectionParams::Network {
+            host, port, socket, ..
+        } = &mut pool_config.params
+        {
+            *host = "127.0.0.1".to_owned();
+            *port = tunnel.local_port();
+            *socket = None;
+        }
+        pool_config.ssh = None;
+        Ok((pool_config, Some(tunnel)))
+    }
+
+    /// Try a connection without saving it. `password` is the typed (not yet stored) one, and
+    /// `ssh_secret` is the typed SSH password or key passphrase for a tunneled test.
     pub async fn test_connection(
         &self,
         config: ConnectionConfig,
         password: Option<String>,
+        ssh_secret: Option<String>,
     ) -> Result<TestReport> {
+        // The tunnel must stay alive for the whole test; it drops with the pool.
+        let (pool_config, _tunnel) = self.tunnel_for(&config, ssh_secret).await?;
         let pool = SessionPool::new(
-            driver_for(config.kind)?,
-            config,
+            driver_for(pool_config.kind)?,
+            pool_config,
             password,
             1,
             0,
@@ -522,9 +574,16 @@ impl Service {
             }
 
             let driver = driver_for(config.kind)?;
+            // An SSH tunnel rewrites the pool's endpoint to the local forward:
+            // the driver keeps seeing a plain TCP host and port, and the
+            // original config (with its SSH settings) stays on the connection
+            // for display. The tunnel lives on the connection, so it outlives
+            // every pooled session and closes when the connection closes.
+            let ssh_secret = self.load_ssh_secret(&config).await?;
+            let (pool_config, tunnel) = self.tunnel_for(&config, ssh_secret).await?;
             let pool = SessionPool::new(
                 Arc::clone(&driver),
-                config.clone(),
+                pool_config,
                 password,
                 pool_size(&config, self.inner.max_sessions),
                 epoch,
@@ -535,6 +594,7 @@ impl Service {
                 config,
                 driver,
                 Arc::clone(&pool),
+                tunnel,
                 Arc::clone(&self.inner.store),
                 self.inner.metadata_ttl,
                 Arc::clone(&self.inner.max_cell_bytes),
@@ -575,6 +635,142 @@ impl Service {
         Err(Error::Connection(
             "connection settings changed while opening; retry".into(),
         ))
+    }
+
+    /// Reconnect this connection to another database on the same server, without changing the
+    /// saved connection: the stored config keeps its old database, so reopening the connection
+    /// later returns to it. The old pool is closed and replaced; anyone holding the old
+    /// `Arc<OpenConnection>` must drop it (the app's workspace does this by reading the current
+    /// connection from a shared cell on every event). Only network connections have databases
+    /// to switch between. If the new database cannot be reached, the old database is restored
+    /// so a typo'd name does not wedge the connection.
+    pub async fn switch_database(
+        &self,
+        id: &ConnectionId,
+        database: &str,
+    ) -> Result<Arc<OpenConnection>> {
+        let key = id.clone();
+        let (stored, password) = self
+            .with_store(move |s| {
+                let stored = s.get_connection(&key)?;
+                let password = s.get_secret(&key, SecretKind::DatabasePassword)?;
+                Ok((stored, password))
+            })
+            .await?;
+        let mut config = match stored {
+            Some(StoredConnection::Ok(c)) => c,
+            Some(StoredConnection::Unreadable { reason, .. }) => {
+                return Err(Error::Unsupported(format!(
+                    "this connection was saved by a newer version and cannot be read ({reason})"
+                )));
+            }
+            None => return Err(Error::Other("no such connection".into())),
+        };
+        if self.inner.force_read_only {
+            config.safe_mode = Some(SafeMode::ReadOnly);
+        }
+        let original = config.clone();
+        match &mut config.params {
+            ConnectionParams::Network { database: db, .. } => {
+                *db = Some(database.to_owned());
+            }
+            ConnectionParams::File { .. } => {
+                return Err(Error::Unsupported(
+                    "database switching is only available for server connections".into(),
+                ));
+            }
+        }
+        // Pools snapshot the epoch at construction and refuse to hand out
+        // sessions once it moves, so the bump comes before building.
+        self.bump_epoch(id);
+        let epoch = self.epoch_of(id);
+        match self.connect_with(config, password.clone(), epoch).await {
+            Ok(conn) => {
+                self.swap_open(id, conn.clone());
+                self.emit(ServiceEvent::Connected(id.clone()));
+                Ok(conn)
+            }
+            Err(e) => {
+                // The old pool is epoch-invalid now; put the original database back.
+                self.bump_epoch(id);
+                let epoch = self.epoch_of(id);
+                match self.connect_with(original, password, epoch).await {
+                    Ok(conn) => {
+                        self.swap_open(id, conn);
+                        self.emit(ServiceEvent::Connected(id.clone()));
+                    }
+                    Err(_) => {
+                        // Last resort: drop the wedged pool so a fresh open works.
+                        self.close(id);
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Build and ping a pool for `config` without registering it: the caller
+    /// owns the epoch and the swap into the open map.
+    async fn connect_with(
+        &self,
+        config: ConnectionConfig,
+        password: Option<String>,
+        epoch: u64,
+    ) -> Result<Arc<OpenConnection>> {
+        let driver = driver_for(config.kind)?;
+        let ssh_secret = self.load_ssh_secret(&config).await?;
+        let (pool_config, tunnel) = self.tunnel_for(&config, ssh_secret).await?;
+        let pool = SessionPool::new(
+            Arc::clone(&driver),
+            pool_config,
+            password,
+            pool_size(&config, self.inner.max_sessions),
+            epoch,
+            Arc::clone(&self.inner.epochs),
+        );
+        let conn = OpenConnection::new(
+            self.inner.rt.clone(),
+            config,
+            driver,
+            Arc::clone(&pool),
+            tunnel,
+            Arc::clone(&self.inner.store),
+            self.inner.metadata_ttl,
+            Arc::clone(&self.inner.max_cell_bytes),
+            self.inner.events.clone(),
+            self.inner.recorder.clone(),
+        );
+        conn.measure_ping().await?;
+        Ok(conn)
+    }
+
+    /// Replace the open pool for `id`, closing whatever was there.
+    fn swap_open(&self, id: &ConnectionId, conn: Arc<OpenConnection>) {
+        let old = self
+            .inner
+            .open
+            .lock()
+            .ok()
+            .and_then(|mut open| open.insert(id.clone(), conn));
+        if let Some(old) = old {
+            old.close();
+        }
+    }
+
+    /// SSH secret for a connection: the SSH password, or the key passphrase.
+    /// Agent auth needs no secret. A missing secret is `None` here; the tunnel
+    /// open reports it with the auth method attached.
+    async fn load_ssh_secret(&self, config: &ConnectionConfig) -> Result<Option<String>> {
+        let Some(ssh) = &config.ssh else {
+            return Ok(None);
+        };
+        let kind = match ssh.auth {
+            fg_core::SshAuth::Password => SecretKind::SshPassword,
+            fg_core::SshAuth::PrivateKey { .. } => SecretKind::SshKeyPassphrase,
+            fg_core::SshAuth::Agent => return Ok(None),
+        };
+        let key = config.id.clone();
+        self.with_store(move |s| s.get_secret(&key, kind)).await
     }
 
     fn get_open(&self, id: &ConnectionId) -> Option<Arc<OpenConnection>> {
@@ -840,6 +1036,7 @@ async fn persist_and_invalidate(
     inner: Arc<Inner>,
     config: ConnectionConfig,
     password: PasswordUpdate,
+    ssh_secret: PasswordUpdate,
 ) -> Result<ConnectionConfig> {
     let id = config.id.clone();
     let _gate = inner.open_gate.lock().await;
@@ -865,7 +1062,30 @@ async fn persist_and_invalidate(
             PasswordUpdate::Set(value) => fg_store::ConnectionPassword::Set(value),
             PasswordUpdate::Clear => fg_store::ConnectionPassword::Clear,
         };
-        store.save_connection_with_password(config, password)
+        let saved = store.save_connection_with_password(config, password)?;
+        // The SSH secret lives beside the database password, keyed by what the
+        // auth method needs: the SSH password, or the key passphrase. Agent
+        // auth and connections without SSH have no secret to store.
+        let kind = match &saved.ssh {
+            Some(ssh) => match ssh.auth {
+                fg_core::SshAuth::Password => Some(SecretKind::SshPassword),
+                fg_core::SshAuth::PrivateKey { .. } => Some(SecretKind::SshKeyPassphrase),
+                fg_core::SshAuth::Agent => None,
+            },
+            None => None,
+        };
+        if let Some(kind) = kind {
+            match ssh_secret {
+                PasswordUpdate::Keep => {}
+                PasswordUpdate::Set(value) => {
+                    store.set_secret(&saved.id, kind, &value)?;
+                }
+                PasswordUpdate::Clear => {
+                    store.delete_secret(&saved.id, kind)?;
+                }
+            }
+        }
+        Ok(saved)
     })
     .await?;
     bump_epoch_on(&inner, &id);

@@ -12,6 +12,9 @@ mod stream;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 
+#[cfg(feature = "postgres")]
+pub mod postgres;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -105,6 +108,8 @@ pub fn driver_for(kind: DbKind) -> Result<Arc<dyn Driver>> {
     match kind {
         #[cfg(feature = "sqlite")]
         DbKind::Sqlite => Ok(Arc::new(sqlite::SqliteDriver)),
+        #[cfg(feature = "postgres")]
+        DbKind::Postgres => Ok(Arc::new(postgres::PostgresDriver)),
         other => Err(Error::Unsupported(format!(
             "{} driver is not available in this build",
             other.display_name()

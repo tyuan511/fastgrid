@@ -2,6 +2,7 @@
 
 pub mod changeset;
 pub mod connection_draft;
+pub mod connection_url;
 pub mod filter_draft;
 pub mod fk;
 pub mod format;
@@ -17,9 +18,12 @@ pub use format::{
 
 pub use changeset::{CellState, Changeset, Counts, RowId, RowState};
 pub use connection_draft::{
-    ConnectionDraft, ENVIRONMENTS, SAFE_MODES, TAG_COLORS, color_from_label, color_label,
-    duplicate, environment_from_label, environment_label, safe_mode_from_label, safe_mode_label,
+    ConnectionDraft, ENVIRONMENTS, SAFE_MODES, SSH_AUTHS, SshAuthChoice, TAG_COLORS, TLS_MODES,
+    color_from_label, color_label, duplicate, environment_from_label, environment_label,
+    safe_mode_from_label, safe_mode_label, ssh_auth_from_label, ssh_auth_label,
+    tls_mode_from_label, tls_mode_label,
 };
+pub use connection_url::{ParsedPostgresUrl, parse_postgres_url};
 pub use filter_draft::{
     Applied, DraftRow, FilterDraft, OPERATORS, RowError, op_from_label, op_label, parse_cell_text,
     value_slots,

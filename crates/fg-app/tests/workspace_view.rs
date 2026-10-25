@@ -618,3 +618,83 @@ fn closing_a_dirty_table_tab_asks_first_and_only_then_closes(cx: &mut TestAppCon
     .unwrap();
     assert!(titles(cx, &f).is_empty(), "confirming closes the tab");
 }
+
+// ---- database switching ------------------------------------------------------------------------
+
+fn open_network(cx: &mut TestAppContext) -> Fixture {
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        fg_app::views::bind_keys(cx);
+    });
+    let config = ConnectionConfig::new(
+        "Pg",
+        DbKind::Postgres,
+        ConnectionParams::Network {
+            host: "db.example.com".into(),
+            port: 5432,
+            user: "alice".into(),
+            database: Some("app".into()),
+            socket: None,
+        },
+    );
+    let (window, view) = cx.update(|cx| open_workspace_window(cx, config).unwrap());
+    let opened = Rc::new(Cell::new(0));
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+    })
+    .unwrap();
+    Fixture {
+        window,
+        view,
+        opened,
+    }
+}
+
+fn open_switcher(cx: &mut TestAppContext, f: &Fixture) {
+    cx.update_window(f.window, |_, window, cx| {
+        f.view
+            .update(cx, |v, cx| v.open_database_switcher(window, cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+}
+
+fn switcher_exists(cx: &mut TestAppContext, f: &Fixture, id: &str) -> bool {
+    let id = id.to_owned();
+    cx.update_window(f.window, |_, window, _| window.try_find(id).is_some())
+        .unwrap()
+}
+
+#[gpui_kit::test]
+fn the_database_switcher_on_a_file_connection_explains_itself(cx: &mut TestAppContext) {
+    let f = open(cx);
+    open_switcher(cx, &f);
+    assert!(switcher_exists(cx, &f, "database-switcher-note"));
+}
+
+#[gpui_kit::test]
+fn the_database_switcher_on_a_network_connection_asks_for_databases(cx: &mut TestAppContext) {
+    let f = open_network(cx);
+    let requested = Rc::new(Cell::new(false));
+    let flag = Rc::clone(&requested);
+    cx.update(|cx| {
+        cx.subscribe(&f.view, move |_, e: &WorkspaceEvent, _| {
+            if matches!(e, WorkspaceEvent::SwitchDatabaseRequested) {
+                flag.set(true);
+            }
+        })
+        .detach();
+    });
+    open_switcher(cx, &f);
+    assert!(requested.get(), "opening asks the controller for the list");
+    assert!(switcher_exists(cx, &f, "database-switcher-loading"));
+    cx.update_window(f.window, |_, window, cx| {
+        f.view.update(cx, |v, cx| {
+            v.set_database_list(vec!["app".into(), "other".into()], cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert!(!switcher_exists(cx, &f, "database-switcher-loading"));
+    assert!(switcher_exists(cx, &f, "database-switcher"));
+}

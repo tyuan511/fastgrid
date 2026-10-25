@@ -8,8 +8,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use fg_core::{
-    ConnectionConfig, ObjectInfo, ObjectKind, ObjectPath, Outcome, QueryHistoryEntry, SafeMode,
-    TabId, TabKind, TableViewMode, TableViewState, WorkspaceState,
+    ConnectionConfig, ConnectionParams, ObjectInfo, ObjectKind, ObjectPath, Outcome,
+    QueryHistoryEntry, SafeMode, TabId, TabKind, TableViewMode, TableViewState, WorkspaceState,
 };
 use fg_service::{OpenConnection, Service};
 use gpui_kit::component::Disableable as _;
@@ -27,7 +27,8 @@ use gpui_kit::*;
 use super::actions::{
     CloseTab, HISTORY_CONTEXT, HistoryDismiss, HistoryNext, HistoryOpen, HistoryPrev, NewQuery,
     NextTab, PrevTab, QuickOpen, RefreshSchema, SNIPPETS_CONTEXT, SaveSnippet, SnippetDismiss,
-    SnippetOpen, ToggleFilters, ToggleHistory, ToggleSidebar, ToggleSnippets, WORKSPACE_CONTEXT,
+    SnippetOpen, SwitchDatabase, ToggleFilters, ToggleHistory, ToggleSidebar, ToggleSnippets,
+    WORKSPACE_CONTEXT,
 };
 use super::grid::{TableTab, TableTabEvent};
 use super::icons::{Hugeicon, hugeicon};
@@ -69,6 +70,10 @@ pub enum WorkspaceEvent {
     },
     /// Reload the schema (the refresh button).
     RefreshSchema,
+    /// `⌘K`: the controller loads the server's databases into the switcher.
+    SwitchDatabaseRequested,
+    /// The user picked a database: the controller reconnects to it.
+    SwitchDatabase { database: String },
     /// A query tab was created: the controller supplies its draft and streams its runs.
     QueryOpened { tab: Entity<QueryTab> },
     /// `⌘T`: the controller creates the draft (it owns ids and timestamps) and opens the tab.
@@ -160,6 +165,8 @@ pub struct WorkspaceView {
     details_visible: bool,
     focus: FocusHandle,
     quick: Option<QuickOpenState>,
+    /// The `⌘K` panel: databases on this server, for switching without reopening.
+    switcher: Option<SwitchDatabaseState>,
     /// The `⌘Y` panel: recent statements of this connection, newest first.
     history: Option<HistoryPanel>,
     /// The snippets panel (`⌘⇧S`): saved fragments, per connection plus global ones.
@@ -198,6 +205,28 @@ struct QuickOpenState {
 
 /// How many matches the palette lists.
 const QUICK_RESULTS: usize = 50;
+
+/// The open `⌘K` palette: its search state, the databases the controller
+/// loaded, and any error from loading or switching.
+struct SwitchDatabaseState {
+    palette: Entity<CommandState>,
+    all: Vec<String>,
+    query: String,
+    loading: bool,
+    /// A switch is in flight: Enter is ignored until it resolves.
+    switching: bool,
+    error: Option<SharedString>,
+}
+
+impl SwitchDatabaseState {
+    /// Best matches first, using our fuzzy ranking.
+    fn shown(&self) -> Vec<String> {
+        crate::model::rank(&self.query, &self.all)
+            .into_iter()
+            .map(|(i, _)| self.all[i].clone())
+            .collect()
+    }
+}
 
 impl QuickOpenState {
     /// Best matches first, using our fuzzy ranking (the palette's own filter is substring-only).
@@ -254,6 +283,7 @@ impl WorkspaceView {
             details_visible: true,
             focus: cx.focus_handle(),
             quick: None,
+            switcher: None,
             history: None,
             snippets: None,
             safe_mode: config_safe_mode,
@@ -641,6 +671,127 @@ impl WorkspaceView {
         if let Some(path) = target {
             self.open_table(&path, window, cx);
         }
+    }
+
+    // ---- database switching ---------------------------------------------------------------
+
+    pub fn database_switcher_visible(&self) -> bool {
+        self.switcher.is_some()
+    }
+
+    /// The database this window is currently connected to, if it is a network connection.
+    fn current_database(&self) -> Option<String> {
+        match &self.config.params {
+            ConnectionParams::Network { database, .. } => database.clone(),
+            ConnectionParams::File { .. } => None,
+        }
+    }
+
+    /// Open the `⌘K` switcher. File connections have no databases to switch
+    /// between, so they get the note instead of a list.
+    pub fn open_database_switcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.switcher.is_some() {
+            self.close_database_switcher(window, cx);
+            return;
+        }
+        let palette = cx.new(|cx| CommandState::new(window, cx));
+        palette.update(cx, |p, cx| p.focus(window, cx));
+        let network = matches!(self.config.params, ConnectionParams::Network { .. });
+        self.switcher = Some(SwitchDatabaseState {
+            palette,
+            all: Vec::new(),
+            query: String::new(),
+            loading: network,
+            switching: false,
+            error: None,
+        });
+        if network {
+            cx.emit(WorkspaceEvent::SwitchDatabaseRequested);
+        }
+        cx.notify();
+    }
+
+    pub fn close_database_switcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.switcher.take().is_some() {
+            window.focus(&self.focus, cx);
+            cx.notify();
+        }
+    }
+
+    /// Fill the switcher's list (called by the controller).
+    pub fn set_database_list(&mut self, databases: Vec<String>, cx: &mut Context<Self>) {
+        if let Some(s) = self.switcher.as_mut() {
+            s.all = databases;
+            s.loading = false;
+            s.error = None;
+        }
+        cx.notify();
+    }
+
+    /// Report a load or switch failure back into the switcher. The switcher
+    /// stays open across a switch attempt, so the error lands where the user
+    /// is looking; success closes it through [`Self::apply_switched_connection`].
+    pub fn set_database_error(&mut self, message: String, cx: &mut Context<Self>) {
+        if let Some(s) = self.switcher.as_mut() {
+            s.loading = false;
+            s.switching = false;
+            s.error = Some(message.into());
+        }
+        cx.notify();
+    }
+
+    fn confirm_database_switch(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = self
+            .switcher
+            .as_ref()
+            .and_then(|s| s.shown().get(index).cloned());
+        let Some(database) = target else {
+            return;
+        };
+        // Picking the database we are already on changes nothing.
+        if self.current_database().as_deref() == Some(database.as_str()) {
+            self.close_database_switcher(window, cx);
+            return;
+        }
+        if let Some(s) = self.switcher.as_mut() {
+            if s.switching {
+                return;
+            }
+            s.switching = true;
+            s.error = None;
+        }
+        cx.emit(WorkspaceEvent::SwitchDatabase { database });
+        cx.notify();
+    }
+
+    /// Apply a successful switch: the window now shows the new database's
+    /// schema, and every open tab is closed — tabs belong to the old database.
+    /// Callers check for staged edits first (see [`Self::has_pending_changes`]).
+    pub fn apply_switched_connection(&mut self, config: ConnectionConfig, cx: &mut Context<Self>) {
+        self.config = config;
+        self.tabs = TabSet::new();
+        self.tab_views.clear();
+        self.confirm_close = None;
+        self.switcher = None;
+        self.schema = SchemaState::Loading;
+        self.namespaces = Vec::new();
+        self.objects = std::collections::BTreeMap::new();
+        cx.emit(WorkspaceEvent::SessionChanged);
+        cx.notify();
+    }
+
+    /// Any table tab with staged edits. Switching closes tabs, so the
+    /// controller refuses while this is true rather than discarding edits.
+    pub fn has_pending_changes(&self, cx: &App) -> bool {
+        self.tab_views.keys().any(|id| {
+            self.tab_view(id)
+                .is_some_and(|tab| tab.read(cx).pending(cx).total() > 0)
+        })
     }
 
     pub fn toggle_filters_of_active_tab(&mut self, cx: &mut Context<Self>) {
@@ -1277,6 +1428,9 @@ impl Render for WorkspaceView {
             .on_action(
                 cx.listener(|this, _: &QuickOpen, window, cx| this.open_quick_open(window, cx)),
             )
+            .on_action(cx.listener(|this, _: &SwitchDatabase, window, cx| {
+                this.open_database_switcher(window, cx)
+            }))
             .on_action(cx.listener(|this, _: &CloseTab, _, cx| this.close_active_tab(cx)))
             .on_action(
                 cx.listener(|_, _: &NewQuery, _, cx| cx.emit(WorkspaceEvent::NewQueryRequested)),
@@ -1337,6 +1491,7 @@ impl Render for WorkspaceView {
             .children(history)
             .children(snippets)
             .children(overlay)
+            .children(self.render_database_switcher(window, cx))
     }
 }
 
@@ -1408,6 +1563,141 @@ impl WorkspaceView {
                 )
                 .into_any_element(),
         )
+    }
+
+    /// The `⌘K` palette, drawn over the window like Quick Open. File
+    /// connections get a note: there is no server to switch databases on.
+    fn render_database_switcher(
+        &self,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let switcher = self.switcher.as_ref()?;
+        let theme = cx.theme().clone();
+        let view = cx.entity().downgrade();
+        let is_file = matches!(self.config.params, ConnectionParams::File { .. });
+        let current = self.current_database();
+        let shell = |inner: AnyElement| {
+            div()
+                .id("database-switcher")
+                .test_support()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .flex()
+                .justify_center()
+                .items_start()
+                .pt(px(80.))
+                .child(
+                    div()
+                        .w(px(560.))
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.popover)
+                        .shadow_lg()
+                        .child(inner),
+                )
+                .into_any_element()
+        };
+        if is_file {
+            let close_view = view.clone();
+            return Some(shell(
+                v_flex()
+                    .gap_2()
+                    .p_3()
+                    .child(
+                        div()
+                            .id("database-switcher-note")
+                            .test_support()
+                            .aria_label(
+                                "Database switching is only available for server connections.",
+                            )
+                            .text_sm()
+                            .child("Database switching is only available for server connections."),
+                    )
+                    .child(
+                        Button::new("database-switcher-close")
+                            .small()
+                            .label("Close")
+                            .on_click(cx.listener(move |_, _, window, cx| {
+                                let _ = close_view.update(cx, |this, cx| {
+                                    this.close_database_switcher(window, cx);
+                                });
+                            })),
+                    )
+                    .into_any_element(),
+            ));
+        }
+        if switcher.loading {
+            return Some(shell(
+                div()
+                    .id("database-switcher-loading")
+                    .test_support()
+                    .p_3()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child("Loading databases…")
+                    .into_any_element(),
+            ));
+        }
+        let (confirm_view, cancel_view, query_view) = (view.clone(), view.clone(), view);
+        let items = switcher.shown().into_iter().map(|name| {
+            let label = if current.as_deref() == Some(name.as_str()) {
+                SharedString::from(format!("{name} (current)"))
+            } else {
+                SharedString::from(name)
+            };
+            CommandItem::new()
+                .label(label)
+                .icon(hugeicon(Hugeicon::Database))
+        });
+        let mut body = v_flex();
+        if let Some(error) = &switcher.error {
+            body = body.child(
+                div()
+                    .id("database-switcher-error")
+                    .test_support()
+                    .aria_label(error.clone())
+                    .p_3()
+                    .text_sm()
+                    .text_color(theme.danger)
+                    .child(error.clone()),
+            );
+        }
+        if switcher.switching {
+            body = body.child(
+                div()
+                    .p_3()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child("Switching…"),
+            );
+        }
+        let palette = Command::new(&switcher.palette)
+            .items(items)
+            .filterable(false)
+            .on_query(move |query, _, cx| {
+                let _ = query_view.update(cx, |this, cx| {
+                    if let Some(s) = this.switcher.as_mut() {
+                        s.query = query.to_owned();
+                        cx.notify();
+                    }
+                });
+            })
+            .placeholder("Switch database…")
+            .max_h(px(320.))
+            .on_confirm(move |ix, window, cx| {
+                let _ = confirm_view.update(cx, |this, cx| {
+                    this.confirm_database_switch(ix.row, window, cx);
+                });
+            })
+            .on_cancel(move |window, cx| {
+                let _ = cancel_view.update(cx, |this, cx| this.close_database_switcher(window, cx));
+            });
+        body = body.child(palette);
+        Some(shell(body.into_any_element()))
     }
 
     /// The `⌘Y` panel: recent statements, newest first, with their outcome. Drawn as an overlay

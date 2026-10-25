@@ -23,7 +23,7 @@ pub use cells::CellMark;
 pub use filter_drawer::{FilterDrawer, FilterDrawerEvent};
 pub use grid::{GridDelegate, PrefetchedPage, TableTab, TableTabEvent};
 pub use icons::{FastgridAssets, Hugeicon, hugeicon};
-pub use launcher::{Launcher, LauncherEvent, Row, rows_from};
+pub use launcher::{Launcher, LauncherEvent, Row, SaveRequest, TestConnectionRequest, rows_from};
 pub use query_tab::{
     CompletionCatalog, PendingConfirmation, QueryTab, QueryTabEvent, ResultDelegate,
 };

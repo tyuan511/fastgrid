@@ -6,14 +6,14 @@
 
 约定：⌘=Cmd，⌃=Control，⌥=Option，⇧=Shift。Win/Linux 列只写与「⌘→Ctrl」不同的项。
 
-> **实现状态**：数据网格的 `⌘S`（提交）、`⌘⇧P`（预览 SQL）、`⌘Z` / `⌘⇧Z`、`⌘I`（插入行）、`⌘D`（克隆行）、`⌘⌫`（标记删除 / 恢复）、`Enter`（开始编辑）、直接键入（开始编辑）与单元格编辑框内的 `Tab` / `⇧Tab` / `Enter` / `Esc` 已实现。已实现 `⌘P`、`⌘W`、`⌘B`、`⌘R`（刷新对象树）、`⌘F`（过滤抽屉）、`⌘C`（复制选区）、`⌘[` / `⌘]` / `Ctrl+Tab`，启动页 `⌘N`（新建连接）与上下 / 回车；查询标签的 `⌘T`（新建查询）、`⌘Y`（查询历史）与编辑器焦点内的 `⌘Return` / `⌘⇧Return` / `⌘.`；网格的 `Space`（行详情检查器，Text / JSON 模式）；查询结果网格的 `Enter`（开始编辑，仅单表且有主键的结果集）与 `⌘S`（提交结果暂存）。其余为规划。绑定集中在 `crates/fg-app/src/views/actions.rs`，编辑器上下文常量是 `EDITOR_CONTEXT`（GPUI Kit 在编辑器元素上压入 `Input mode=editor`，绑定谓词写作 `Input && mode == editor`）。
+> **实现状态**：数据网格的 `⌘S`（提交）、`⌘⇧P`（预览 SQL）、`⌘Z` / `⌘⇧Z`、`⌘I`（插入行）、`⌘D`（克隆行）、`⌘⌫`（标记删除 / 恢复）、`Enter`（开始编辑）、直接键入（开始编辑）与单元格编辑框内的 `Tab` / `⇧Tab` / `Enter` / `Esc` 已实现。已实现 `⌘P`、`⌘K`（网络型连接切换数据库）、`⌘W`、`⌘B`、`⌘R`（刷新对象树）、`⌘F`（过滤抽屉）、`⌘C`（复制选区）、`⌘[` / `⌘]` / `Ctrl+Tab`，启动页 `⌘N`（新建连接）与上下 / 回车；查询标签的 `⌘T`（新建查询）、`⌘Y`（查询历史）与编辑器焦点内的 `⌘Return` / `⌘⇧Return` / `⌘.`；网格的 `Space`（行详情检查器，Text / JSON 模式）；查询结果网格的 `Enter`（开始编辑，仅单表且有主键的结果集）与 `⌘S`（提交结果暂存）。其余为规划。绑定集中在 `crates/fg-app/src/views/actions.rs`，编辑器上下文常量是 `EDITOR_CONTEXT`（GPUI Kit 在编辑器元素上压入 `Input mode=editor`，绑定谓词写作 `Input && mode == editor`）。
 
 ## 全局（任何焦点）
 
 | 操作 | macOS | Win / Linux |
 |---|---|---|
 | Quick Open（跳转到表 / 视图） | `⌘P` | `Ctrl+P` |
-| 切换数据库 / 命名空间 | `⌘K` | `Ctrl+K` |
+| 切换数据库（网络型连接，通过重连实现） | `⌘K` | `Ctrl+K` |
 | 切换连接 | `⌘⇧K` | `Ctrl+Shift+K` |
 | 新建查询标签 | `⌘T` | `Ctrl+T` |
 | 关闭标签 | `⌘W` | `Ctrl+W` |

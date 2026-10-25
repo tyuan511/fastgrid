@@ -1,12 +1,17 @@
 //! The connection form's fields, and their conversion to and from a saved connection.
 //!
-//! Only SQLite is editable for now (a file path); network engines get host / port / user / TLS /
-//! SSH fields together with their drivers (M4, M5). Everything the form does not show is carried
-//! over untouched, so editing a connection never drops settings it cannot display.
+//! SQLite shows a file path; network engines (PostgreSQL for now) show host / port / user /
+//! database / TLS / SSH fields. Passwords are form-only: they are never read back from a saved
+//! connection, and a blank password field means "keep the saved secret". Everything the form
+//! does not show is carried over untouched, so editing a connection never drops settings it
+//! cannot display.
 
 use fg_core::{
-    ConnectionConfig, ConnectionId, ConnectionParams, DbKind, Environment, SafeMode, TagColor,
+    ConnectionConfig, ConnectionId, ConnectionParams, DbKind, Environment, SafeMode, SshAuth,
+    SshConfig, TagColor, TlsConfig, TlsMode,
 };
+
+use super::connection_url::ParsedPostgresUrl;
 
 /// Colour choices in menu order; `None` = follow the environment.
 pub const TAG_COLORS: &[(Option<TagColor>, &str)] = &[
@@ -77,6 +82,57 @@ pub fn safe_mode_from_label(label: &str) -> Option<SafeMode> {
         .and_then(|(m, _)| *m)
 }
 
+/// TLS choices in menu order.
+pub const TLS_MODES: &[(TlsMode, &str)] = &[
+    (TlsMode::Prefer, "Prefer"),
+    (TlsMode::Disable, "Disable"),
+    (TlsMode::Require, "Require"),
+    (TlsMode::VerifyCa, "Verify CA"),
+    (TlsMode::VerifyFull, "Verify full"),
+];
+
+pub fn tls_mode_label(m: TlsMode) -> &'static str {
+    TLS_MODES
+        .iter()
+        .find(|(v, _)| *v == m)
+        .map_or("Prefer", |(_, l)| l)
+}
+
+pub fn tls_mode_from_label(label: &str) -> TlsMode {
+    TLS_MODES
+        .iter()
+        .find(|(_, l)| *l == label)
+        .map_or(TlsMode::Prefer, |(m, _)| *m)
+}
+
+/// SSH authentication choices in menu order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SshAuthChoice {
+    Password,
+    PrivateKey,
+    Agent,
+}
+
+pub const SSH_AUTHS: &[(SshAuthChoice, &str)] = &[
+    (SshAuthChoice::Password, "Password"),
+    (SshAuthChoice::PrivateKey, "Private key"),
+    (SshAuthChoice::Agent, "SSH agent"),
+];
+
+pub fn ssh_auth_label(a: SshAuthChoice) -> &'static str {
+    SSH_AUTHS
+        .iter()
+        .find(|(v, _)| *v == a)
+        .map_or("Password", |(_, l)| l)
+}
+
+pub fn ssh_auth_from_label(label: &str) -> SshAuthChoice {
+    SSH_AUTHS
+        .iter()
+        .find(|(_, l)| *l == label)
+        .map_or(SshAuthChoice::Password, |(a, _)| *a)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConnectionDraft {
     /// `Some` when editing an existing connection.
@@ -84,10 +140,37 @@ pub struct ConnectionDraft {
     pub name: String,
     pub environment: Environment,
     pub color: Option<TagColor>,
+    pub kind: DbKind,
+    /// The URL box content; form-only, never saved. Kept so parsing a URL
+    /// does not clear the box the URL came from.
+    pub url: String,
     pub path: String,
     /// Create the file if it does not exist (otherwise a typo'd path fails instead of making an
     /// empty database).
     pub create_if_missing: bool,
+    /// Network host; empty means the form has not filled it yet.
+    pub host: String,
+    /// Network port as typed; empty means the engine default.
+    pub port: String,
+    pub user: String,
+    /// Database to open; empty means the server default (usually the user name).
+    pub database: String,
+    /// Typed database password; blank keeps the saved one.
+    pub password: String,
+    pub tls_mode: TlsMode,
+    pub tls_ca_path: String,
+    pub tls_cert_path: String,
+    pub tls_key_path: String,
+    pub tls_server_name: String,
+    pub use_ssh: bool,
+    pub ssh_host: String,
+    /// SSH port as typed; empty means 22.
+    pub ssh_port: String,
+    pub ssh_user: String,
+    pub ssh_auth: SshAuthChoice,
+    pub ssh_key_path: String,
+    /// Typed SSH password or key passphrase; blank keeps the saved one.
+    pub ssh_secret: String,
     /// The group the connection belongs to, if any.
     pub group_id: Option<fg_core::GroupId>,
     /// Explicit safe mode; `None` follows the environment's default.
@@ -101,26 +184,101 @@ impl ConnectionDraft {
             name: String::new(),
             environment: Environment::Development,
             color: None,
+            kind: DbKind::Sqlite,
+            url: String::new(),
             path: String::new(),
             create_if_missing: false,
+            host: String::new(),
+            port: String::new(),
+            user: String::new(),
+            database: String::new(),
+            password: String::new(),
+            tls_mode: TlsMode::Prefer,
+            tls_ca_path: String::new(),
+            tls_cert_path: String::new(),
+            tls_key_path: String::new(),
+            tls_server_name: String::new(),
+            use_ssh: false,
+            ssh_host: String::new(),
+            ssh_port: String::new(),
+            ssh_user: String::new(),
+            ssh_auth: SshAuthChoice::Password,
+            ssh_key_path: String::new(),
+            ssh_secret: String::new(),
             group_id: None,
             safe_mode: None,
         }
     }
 
     pub fn from_config(c: &ConnectionConfig) -> Self {
-        Self {
-            id: Some(c.id.clone()),
-            name: c.name.clone(),
-            environment: c.environment,
-            color: c.color,
-            path: match &c.params {
-                ConnectionParams::File { path } => path.clone(),
-                ConnectionParams::Network { .. } => String::new(),
-            },
-            create_if_missing: c.option_enabled("create"),
-            group_id: c.group_id.clone(),
-            safe_mode: c.safe_mode,
+        let mut draft = Self::blank();
+        draft.id = Some(c.id.clone());
+        draft.name = c.name.clone();
+        draft.environment = c.environment;
+        draft.color = c.color;
+        draft.kind = c.kind;
+        draft.create_if_missing = c.option_enabled("create");
+        // Passwords are never read back; the URL box starts empty.
+        draft.group_id = c.group_id.clone();
+        draft.safe_mode = c.safe_mode;
+        match &c.params {
+            ConnectionParams::File { path } => {
+                draft.path = path.clone();
+            }
+            ConnectionParams::Network {
+                host,
+                port,
+                user,
+                database,
+                ..
+            } => {
+                draft.host = host.clone();
+                draft.port = port.to_string();
+                draft.user = user.clone();
+                draft.database = database.clone().unwrap_or_default();
+            }
+        }
+        if let Some(tls) = &c.tls {
+            draft.tls_mode = tls.mode;
+            draft.tls_ca_path = tls.ca_cert_path.clone().unwrap_or_default();
+            draft.tls_cert_path = tls.client_cert_path.clone().unwrap_or_default();
+            draft.tls_key_path = tls.client_key_path.clone().unwrap_or_default();
+            draft.tls_server_name = tls.server_name.clone().unwrap_or_default();
+        }
+        if let Some(ssh) = &c.ssh {
+            draft.use_ssh = true;
+            draft.ssh_host = ssh.host.clone();
+            draft.ssh_port = ssh.port.to_string();
+            draft.ssh_user = ssh.user.clone();
+            match &ssh.auth {
+                SshAuth::Password => draft.ssh_auth = SshAuthChoice::Password,
+                SshAuth::PrivateKey { key_path } => {
+                    draft.ssh_auth = SshAuthChoice::PrivateKey;
+                    draft.ssh_key_path = key_path.clone();
+                }
+                SshAuth::Agent => draft.ssh_auth = SshAuthChoice::Agent,
+            }
+        }
+        draft
+    }
+
+    /// Fill the network fields from a parsed URL. Fields the URL does not
+    /// carry (an absent port, an absent sslmode) are left alone.
+    pub fn apply_url(&mut self, parsed: &ParsedPostgresUrl) {
+        self.kind = DbKind::Postgres;
+        self.host = parsed.host.clone();
+        if let Some(port) = parsed.port {
+            self.port = port.to_string();
+        }
+        self.user = parsed.user.clone();
+        if let Some(password) = &parsed.password {
+            self.password = password.clone();
+        }
+        if let Some(database) = &parsed.database {
+            self.database = database.clone();
+        }
+        if let Some(mode) = parsed.tls_mode {
+            self.tls_mode = mode;
         }
     }
 
@@ -134,46 +292,165 @@ impl ConnectionDraft {
     }
 
     /// Build the connection to save. `base` is the connection being edited (its other settings
-    /// are kept); `None` makes a new one.
+    /// are kept); `None` makes a new one. Passwords are not part of the config: the caller
+    /// saves them separately from [`ConnectionDraft::password`] and
+    /// [`ConnectionDraft::ssh_secret`].
     pub fn to_config(&self, base: Option<&ConnectionConfig>) -> Result<ConnectionConfig, String> {
-        let name = self.name.trim();
-        let path = self.path.trim();
-        if path.is_empty() {
-            return Err("Choose a database file.".into());
-        }
-        let name = if name.is_empty() {
-            Self::default_name_for(path)
-        } else {
-            name.to_owned()
+        let name = self.name.trim().to_owned();
+        let (params, default_name) = match self.kind {
+            DbKind::Sqlite => {
+                let path = self.path.trim();
+                if path.is_empty() {
+                    return Err("Choose a database file.".into());
+                }
+                (
+                    ConnectionParams::File {
+                        path: path.to_owned(),
+                    },
+                    Self::default_name_for(path),
+                )
+            }
+            DbKind::Postgres => {
+                let host = self.host.trim();
+                if host.is_empty() {
+                    return Err("Enter a host.".into());
+                }
+                let port = parse_port_field(&self.port, 5432)?;
+                let user = self.user.trim();
+                if user.is_empty() {
+                    return Err("Enter a user.".into());
+                }
+                let database = self.database.trim();
+                (
+                    ConnectionParams::Network {
+                        host: host.to_owned(),
+                        port,
+                        user: user.to_owned(),
+                        database: if database.is_empty() {
+                            None
+                        } else {
+                            Some(database.to_owned())
+                        },
+                        socket: None,
+                    },
+                    match database {
+                        "" => host.to_owned(),
+                        db => format!("{host}/{db}"),
+                    },
+                )
+            }
+            // The form only offers SQLite and PostgreSQL; anything else keeps
+            // the base params untouched (this arm is unreachable from the UI).
+            _ => match base {
+                Some(b) => (b.params.clone(), b.name.clone()),
+                None => return Err("Choose a database engine.".into()),
+            },
         };
+        let name = if name.is_empty() { default_name } else { name };
 
         let mut config = match base {
             Some(b) => b.clone(),
-            None => ConnectionConfig::new(
-                name.clone(),
-                DbKind::Sqlite,
-                ConnectionParams::File {
-                    path: path.to_owned(),
-                },
-            ),
+            None => ConnectionConfig::new(name.clone(), self.kind, params.clone()),
         };
         if let Some(id) = &self.id {
             config.id = id.clone();
         }
         config.name = name;
+        config.kind = self.kind;
         config.environment = self.environment;
         config.color = self.color;
         config.group_id = self.group_id.clone();
         config.safe_mode = self.safe_mode;
-        config.params = ConnectionParams::File {
-            path: path.to_owned(),
-        };
-        if self.create_if_missing {
-            config.options.insert("create".into(), "true".into());
-        } else {
-            config.options.remove("create");
+        config.params = params;
+        match self.kind {
+            DbKind::Sqlite => {
+                config.ssh = None;
+                config.tls = None;
+                if self.create_if_missing {
+                    config.options.insert("create".into(), "true".into());
+                } else {
+                    config.options.remove("create");
+                }
+            }
+            DbKind::Postgres => {
+                config.options.remove("create");
+                let tls = TlsConfig {
+                    mode: self.tls_mode,
+                    ca_cert_path: some_trimmed(&self.tls_ca_path),
+                    client_cert_path: some_trimmed(&self.tls_cert_path),
+                    client_key_path: some_trimmed(&self.tls_key_path),
+                    server_name: some_trimmed(&self.tls_server_name),
+                };
+                // Prefer with no paths is the driver's default: store no TLS
+                // block at all so an edited connection can drop back to it.
+                config.tls = if tls.mode == TlsMode::Prefer
+                    && tls.ca_cert_path.is_none()
+                    && tls.client_cert_path.is_none()
+                    && tls.client_key_path.is_none()
+                    && tls.server_name.is_none()
+                {
+                    None
+                } else {
+                    Some(tls)
+                };
+                config.ssh = if self.use_ssh {
+                    let ssh_host = self.ssh_host.trim();
+                    if ssh_host.is_empty() {
+                        return Err("Enter an SSH host.".into());
+                    }
+                    let ssh_port = parse_port_field(&self.ssh_port, 22)?;
+                    let ssh_user = self.ssh_user.trim();
+                    if ssh_user.is_empty() {
+                        return Err("Enter an SSH user.".into());
+                    }
+                    let auth = match self.ssh_auth {
+                        SshAuthChoice::Password => SshAuth::Password,
+                        SshAuthChoice::Agent => SshAuth::Agent,
+                        SshAuthChoice::PrivateKey => {
+                            let key_path = self.ssh_key_path.trim();
+                            if key_path.is_empty() {
+                                return Err("Choose an SSH private key.".into());
+                            }
+                            SshAuth::PrivateKey {
+                                key_path: key_path.to_owned(),
+                            }
+                        }
+                    };
+                    Some(SshConfig {
+                        host: ssh_host.to_owned(),
+                        port: ssh_port,
+                        user: ssh_user.to_owned(),
+                        auth,
+                        keepalive_secs: None,
+                    })
+                } else {
+                    None
+                };
+            }
+            _ => {}
         }
         Ok(config)
+    }
+}
+
+/// A port field as typed: blank means `default`, anything else must be a port number.
+fn parse_port_field(field: &str, default: u16) -> Result<u16, String> {
+    let trimmed = field.trim();
+    if trimmed.is_empty() {
+        return Ok(default);
+    }
+    trimmed
+        .parse::<u16>()
+        .map_err(|_| format!("'{trimmed}' is not a valid port"))
+}
+
+/// A trimmed field, or `None` when blank.
+fn some_trimmed(field: &str) -> Option<String> {
+    let trimmed = field.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
     }
 }
 
@@ -330,6 +607,91 @@ mod tests {
         assert_eq!(copy.name, "shop copy");
         assert_eq!(copy.params, src.params);
         assert!(copy.last_used_at.is_none() && copy.created_at.is_none());
+    }
+
+    fn network_draft() -> ConnectionDraft {
+        ConnectionDraft {
+            kind: DbKind::Postgres,
+            host: "db.example.com".into(),
+            port: "5433".into(),
+            user: "alice".into(),
+            database: "app".into(),
+            ..ConnectionDraft::blank()
+        }
+    }
+
+    #[test]
+    fn network_draft_builds_network_params_with_defaults() {
+        let mut d = network_draft();
+        d.port = String::new();
+        let c = d.to_config(None).unwrap();
+        assert_eq!(c.kind, DbKind::Postgres);
+        assert_eq!(
+            c.params,
+            ConnectionParams::Network {
+                host: "db.example.com".into(),
+                port: 5432,
+                user: "alice".into(),
+                database: Some("app".into()),
+                socket: None,
+            }
+        );
+        // Prefer with no paths stores no TLS block.
+        assert!(c.tls.is_none());
+        assert!(c.ssh.is_none());
+        assert_eq!(c.name, "db.example.com/app");
+    }
+
+    #[test]
+    fn network_draft_validates_its_fields() {
+        let mut d = network_draft();
+        d.host = "  ".into();
+        assert!(d.to_config(None).is_err());
+        let mut d = network_draft();
+        d.port = "nope".into();
+        assert!(d.to_config(None).is_err());
+        let mut d = network_draft();
+        d.user = String::new();
+        assert!(d.to_config(None).is_err());
+    }
+
+    #[test]
+    fn network_draft_round_trips_tls_and_ssh() {
+        let mut d = network_draft();
+        d.tls_mode = TlsMode::VerifyFull;
+        d.tls_server_name = "db.example.com".into();
+        d.use_ssh = true;
+        d.ssh_host = "bastion.example.com".into();
+        d.ssh_user = "ops".into();
+        d.ssh_auth = SshAuthChoice::PrivateKey;
+        d.ssh_key_path = "~/.ssh/id_ed25519".into();
+        let c = d.to_config(None).unwrap();
+        let back = ConnectionDraft::from_config(&c);
+        assert_eq!(back.tls_mode, TlsMode::VerifyFull);
+        assert_eq!(back.tls_server_name, "db.example.com");
+        assert!(back.use_ssh);
+        assert_eq!(back.ssh_host, "bastion.example.com");
+        assert_eq!(back.ssh_port, "22");
+        assert_eq!(back.ssh_auth, SshAuthChoice::PrivateKey);
+        assert_eq!(back.ssh_key_path, "~/.ssh/id_ed25519");
+        // Passwords are never read back.
+        assert!(back.password.is_empty() && back.ssh_secret.is_empty());
+    }
+
+    #[test]
+    fn url_fills_network_fields() {
+        let mut d = ConnectionDraft::blank();
+        let parsed =
+            crate::model::parse_postgres_url("postgres://bob:pw@h:5432/db?sslmode=disable")
+                .unwrap();
+        d.apply_url(&parsed);
+        assert_eq!(d.kind, DbKind::Postgres);
+        assert_eq!(d.host, "h");
+        assert_eq!(d.port, "5432");
+        assert_eq!(d.user, "bob");
+        assert_eq!(d.password, "pw");
+        assert_eq!(d.database, "db");
+        assert_eq!(d.tls_mode, TlsMode::Disable);
     }
 
     #[test]

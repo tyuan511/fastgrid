@@ -194,7 +194,7 @@ async fn startup_sql_cannot_write_on_open_or_test() {
         .unwrap();
     let err = must_err(svc.open(&id).await);
     assert!(matches!(err, Error::PolicyDenied(_)), "{err:?}");
-    let err = svc.test_connection(cfg, None).await.unwrap_err();
+    let err = svc.test_connection(cfg, None, None).await.unwrap_err();
     assert!(matches!(err, Error::PolicyDenied(_)), "{err:?}");
 
     let mut cfg = stored(svc.connections().await.unwrap(), &id);
@@ -717,7 +717,7 @@ async fn startup_sql_cannot_change_persistent_header_state() {
         .unwrap();
     let err = must_err(svc.open(&saved.id).await);
     assert!(matches!(err, Error::PolicyDenied(_)), "{err:?}");
-    let err = svc.test_connection(cfg, None).await.unwrap_err();
+    let err = svc.test_connection(cfg, None, None).await.unwrap_err();
     assert!(matches!(err, Error::PolicyDenied(_)), "{err:?}");
 
     let mut plain = env.sqlite("db");
@@ -738,7 +738,10 @@ async fn startup_query_only_cannot_be_disabled() {
         "PRAGMA query_only(0)",
     ] {
         cfg.startup_sql = vec![sql.into()];
-        let err = svc.test_connection(cfg.clone(), None).await.unwrap_err();
+        let err = svc
+            .test_connection(cfg.clone(), None, None)
+            .await
+            .unwrap_err();
         assert!(matches!(err, Error::PolicyDenied(_)), "{sql}: {err:?}");
     }
 }

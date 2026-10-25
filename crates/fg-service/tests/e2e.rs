@@ -199,14 +199,14 @@ async fn test_connection_reports_version_and_failures() {
     let env = Env::new("test");
     let svc = env.service();
     let ok = svc
-        .test_connection(env.sqlite("fresh"), None)
+        .test_connection(env.sqlite("fresh"), None, None)
         .await
         .unwrap();
     assert!(ok.server_version.starts_with("SQLite 3"));
 
     let mut missing = env.sqlite("missing");
     missing.options.clear(); // no create=true: a typo'd path must fail, not create a file
-    assert!(svc.test_connection(missing, None).await.is_err());
+    assert!(svc.test_connection(missing, None, None).await.is_err());
 }
 
 #[tokio::test]

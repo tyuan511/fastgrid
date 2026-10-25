@@ -97,6 +97,10 @@ pub struct OpenConnection {
     pub(crate) config: ConnectionConfig,
     driver: Arc<dyn Driver>,
     pub(crate) pool: Arc<SessionPool>,
+    /// SSH tunnel, when the connection uses one. Held here so it outlives
+    /// every pooled session and closes with the connection.
+    #[allow(dead_code)]
+    ssh_tunnel: Option<crate::ssh::SshTunnel>,
     /// History, audit and exec settings. A refusal records here without leasing a session.
     pub(crate) store: Arc<Mutex<Store>>,
     namespaces: TtlCache<(), Vec<String>>,
@@ -116,6 +120,7 @@ impl OpenConnection {
         config: ConnectionConfig,
         driver: Arc<dyn Driver>,
         pool: Arc<SessionPool>,
+        ssh_tunnel: Option<crate::ssh::SshTunnel>,
         store: Arc<Mutex<Store>>,
         ttl: Duration,
         max_cell_bytes: Arc<AtomicUsize>,
@@ -127,6 +132,7 @@ impl OpenConnection {
             config,
             driver,
             pool,
+            ssh_tunnel,
             store,
             namespaces: TtlCache::new(ttl),
             objects: TtlCache::new(ttl),
@@ -171,6 +177,18 @@ impl OpenConnection {
             .run(async move {
                 let lease = this.pool.acquire().await?;
                 lease.session()?.server_version().await
+            })
+            .await
+    }
+
+    /// Databases on this server. Engines without the concept (SQLite)
+    /// report none; the list is not cached, so a just-created database shows up.
+    pub async fn databases(self: &Arc<Self>) -> Result<Vec<String>> {
+        let this = Arc::clone(self);
+        self.rt
+            .run(async move {
+                let lease = this.pool.acquire().await?;
+                lease.session()?.list_databases().await
             })
             .await
     }

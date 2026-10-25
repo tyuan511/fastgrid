@@ -42,6 +42,7 @@ gpui_kit::actions!(
         NewConnection,
         NewQuery,
         ToggleHistory,
+        SwitchDatabase,
         HistoryOpen,
         HistoryNext,
         HistoryPrev,
@@ -77,6 +78,7 @@ gpui_kit::actions!(
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("secondary-p", QuickOpen, Some(WORKSPACE_CONTEXT)),
+        KeyBinding::new("secondary-k", SwitchDatabase, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("secondary-w", CloseTab, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("secondary-b", ToggleSidebar, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("secondary-r", RefreshSchema, Some(WORKSPACE_CONTEXT)),

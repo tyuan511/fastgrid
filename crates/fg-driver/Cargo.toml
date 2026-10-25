@@ -11,6 +11,23 @@ workspace = true
 [features]
 default = ["sqlite"]
 sqlite = ["dep:rusqlite", "dep:fallible-iterator"]
+postgres = [
+    "dep:tokio-postgres",
+    "dep:postgres-types",
+    "dep:postgres-protocol",
+    "dep:rustls-webpki",
+    "dep:bytes",
+    "dep:byteorder",
+    "dep:futures",
+    "dep:fallible-iterator02",
+    "dep:fg-sql",
+    "dep:tokio-rustls",
+    "dep:rustls",
+    "dep:rustls-pemfile",
+    "dep:rustls-native-certs",
+    "dep:chrono",
+    "dep:bit-vec",
+]
 
 [dependencies]
 fg-core.workspace = true
@@ -18,3 +35,22 @@ async-trait.workspace = true
 tokio.workspace = true
 rusqlite = { workspace = true, optional = true }
 fallible-iterator = { version = "0.3", optional = true }
+tokio-postgres = { version = "0.7", features = [
+    "with-chrono-0_4",
+    "with-serde_json-1",
+    "with-bit-vec-0_6",
+], optional = true }
+postgres-types = { version = "0.2", optional = true }
+postgres-protocol = { version = "0.6", optional = true }
+rustls-webpki = { version = "0.103", optional = true }
+bytes = { version = "1", optional = true }
+byteorder = { version = "1", optional = true }
+futures = { version = "0.3", optional = true }
+fallible-iterator02 = { package = "fallible-iterator", version = "0.2", optional = true }
+fg-sql = { workspace = true, optional = true }
+tokio-rustls = { version = "0.26", optional = true }
+rustls = { version = "0.23", features = ["ring"], optional = true }
+rustls-pemfile = { version = "2", optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
+chrono = { version = "0.4", default-features = false, features = ["clock"], optional = true }
+bit-vec = { version = "0.6", optional = true }

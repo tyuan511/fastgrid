@@ -14,19 +14,25 @@ test-seams = ["fg-store/test-seams"]
 
 [dependencies]
 fg-core.workspace = true
-fg-driver.workspace = true
+# The service owns connections of every engine, so it enables the network
+# drivers too; feature unification carries them into the app and CLI builds.
+fg-driver = { workspace = true, features = ["postgres"] }
 fg-store.workspace = true
 fg-crypto.workspace = true
 keyring.workspace = true
 fg-sql.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "macros", "fs"] }
 tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+russh = "0.64"
+tokio-stream = "0.1"
+
 
 [dev-dependencies]
 # Integration tests are separate crates and do not set cfg(test) on this library. Depending on
 # ourselves with the feature on is how `cargo test` compiles the seams they call.
 fg-service = { path = ".", features = ["test-seams"] }
+russh = "0.64"
 
 rusqlite.workspace = true

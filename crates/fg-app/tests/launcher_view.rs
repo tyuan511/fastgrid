@@ -10,6 +10,7 @@ use fg_core::{
     ConnectionConfig, ConnectionGroup, ConnectionId, ConnectionParams, DbKind, Environment,
     GroupId, SafeMode, TagColor,
 };
+use fg_service::PasswordUpdate;
 use gpui_kit::test::TestWindowExt as _;
 // No `use gpui_kit::*`: it would import `gpui_kit::test`, which then shadows the built-in
 // `#[test]` that `#[gpui_kit::test]` expands to.
@@ -364,11 +365,15 @@ fn enter_in_the_search_box_opens_the_best_match(cx: &mut TestAppContext) {
 // ---- new / edit / duplicate / delete -------------------------------------------------------------
 
 fn saved(f: &Fixture) -> Vec<ConnectionConfig> {
+    saved_requests(f).into_iter().map(|r| r.config).collect()
+}
+
+fn saved_requests(f: &Fixture) -> Vec<fg_app::views::SaveRequest> {
     f.events
         .borrow()
         .iter()
         .filter_map(|e| match e {
-            LauncherEvent::Save(c) => Some((**c).clone()),
+            LauncherEvent::Save(r) => Some(r.clone()),
             _ => None,
         })
         .collect()
@@ -408,6 +413,48 @@ fn a_new_connection_is_created_from_the_form(cx: &mut TestAppContext) {
         Some(c.id.clone()),
         "and selects the new connection"
     );
+}
+
+#[gpui_kit::test]
+fn a_postgres_connection_is_created_from_the_form_and_a_url_prefills_it(cx: &mut TestAppContext) {
+    let f = open(cx, vec![]);
+    click(cx, &f, "new-connection");
+    click(cx, &f, "engine-postgresql");
+    assert!(exists(cx, &f, "editor-url"));
+    assert!(exists(cx, &f, "editor-host"));
+    assert!(!exists(cx, &f, "editor-path"));
+
+    cx.update_window(f.window, |_, window, cx| window.click("editor-url", cx))
+        .unwrap();
+    type_text(
+        cx,
+        &f,
+        "postgres://alice:pw@db.example.com:5433/app?sslmode=require",
+    );
+    click(cx, &f, "editor-parse-url");
+    scroll_editor_to_save(cx, &f);
+    click(cx, &f, "editor-save");
+
+    let requests = saved_requests(&f);
+    assert_eq!(requests.len(), 1);
+    let req = &requests[0];
+    assert_eq!(req.config.kind, DbKind::Postgres);
+    assert!(matches!(
+        &req.config.params,
+        ConnectionParams::Network {
+            host,
+            port,
+            user,
+            database,
+            ..
+        } if host == "db.example.com" && *port == 5433 && user == "alice" && database.as_deref() == Some("app")
+    ));
+    assert!(matches!(
+        &req.config.tls,
+        Some(t) if t.mode == fg_core::TlsMode::Require
+    ));
+    assert_eq!(req.password, PasswordUpdate::Set("pw".into()));
+    assert_eq!(req.ssh_secret, PasswordUpdate::Keep);
 }
 
 #[gpui_kit::test]

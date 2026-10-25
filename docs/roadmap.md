@@ -85,8 +85,8 @@
 
 - [x] 主窗口布局：顶栏（按钮分组 + TablePlus 式等宽连接行 `ENV | 引擎 : 连接 : 库 : 表`）、标签栏（‹ › 切换，标签等分宽度、标题居中）、左侧栏、主工作区、底部状态栏。视觉按 TablePlus 对齐：13px 字号，网格 / 侧栏对象名 / 详情值用等宽字体，网格斑马纹、列分隔线、无行线。侧栏默认 220px，可拖拽调整（140–450，随会话保存）。*双击分隔条复位待做（分栏组件不支持）*
 - [~] 连接启动页：列出已保存连接、环境色点、SQLite 文件选择器、双击 / 按钮打开、连接失败提示。
-      已支持搜索、编辑 / 复制 / 删除（带确认）、键盘上下 / 回车、`⌘N` 新建、分组界面（分组折叠、搜索时忽略折叠、新建 / 重命名 / 两步删除分组、连接编辑器里选分组；删除分组时其连接回到顶层，由存储层保证）。*网络型连接表单随 M4*
-- [~] 顶栏环境胶囊：显示连接名、引擎与环境色。*`⌘K` 数据库 / 命名空间切换待做（SQLite 只有 `main`，PG 在 M4 才有意义）*
+      已支持搜索、编辑 / 复制 / 删除（带确认）、键盘上下 / 回车、`⌘N` 新建、分组界面（分组折叠、搜索时忽略折叠、新建 / 重命名 / 两步删除分组、连接编辑器里选分组；删除分组时其连接回到顶层，由存储层保证）。*网络型连接表单已随 M4 做（PostgreSQL：URL 粘贴解析、测试连接）*
+- [~] 顶栏环境胶囊：显示连接名、引擎与环境色。*`⌘K` 数据库切换已随 M4 做（PG 通过重连；命名空间切换待做）*
 - [~] 左侧对象树：按类型分组（Tables / Views…）、顶部模糊过滤框、双击打开。
       行数估算后缀已接入（SQLite 取自 `sqlite_stat1`）。匹配字符已高亮：对象名按模糊匹配位置加粗，组标题与命名空间标题在过滤词本身匹配标题时同样高亮、仅因子项匹配时保持原样。*键盘导航需实机确认（树组件自带）*
 - [x] 多标签（32px 自绘标签条，图标 + 标题 + 关闭，拖拽重排已有无头测试）：打开（同一张表复用标签）、关闭、`⌘W`、`⌘[` / `⌘]` / `Ctrl+Tab` 切换、关闭最后一个显示提示、会话保存（防抖）与恢复（跳过已不存在的表）。
@@ -189,7 +189,7 @@
 - [x] 标为生产（含未知环境）的连接默认不暴露；隐藏的连接与不存在的连接回复完全一样，agent 无法探测
 - [x] 行数上限：默认 200，连接的 `mcp.max_rows` 与硬上限 5000 取最小，agent 只能调低不能调高；超时默认 30s，取连接的 `mcp.statement_timeout_secs`
 - [x] 审计：`run_query` 由 `run` 自己记一行（含被拒绝的）；其余工具和在 `run` 之前被拒绝的调用由工具层记一行；审计写不进去时调用失败而不是放行
-- [ ] 与 Claude Desktop / Claude Code 联调并记录配置示例（**还没有真实客户端跑过**，目前验证的是协议层的进程测试和 `fg-mcp` 的集成测试）
+- [x] 与 Claude Desktop / Claude Code 联调并记录配置示例：配置示例已写入 `docs/mcp-security.md`（Claude Code 的 `claude mcp add` 命令，Claude Desktop / Cursor 的 `mcpServers` JSON）。真实客户端一侧用官方 MCP TypeScript SDK 客户端（`@modelcontextprotocol/sdk` 1.32.2，Claude Desktop / Claude Code 所讲的同一协议）对 debug 版 `fastgrid-cli mcp --stdio` 跑通：建表查表查结构查数据、写操作被策略拒绝、未知连接与隐藏连接同文拒绝，事后表内 100 行完好。**未竟**：Claude Desktop / Claude Code 本体仍未跑过——本机 Linux VM 上没有这两个客户端，留待有它们的机器上补最后一步。
 
 **验收**：外部 agent 能完成「列出表 → 查看结构 → 查询」（`fg-mcp/tests/mcp.rs::an_agent_can_list_describe_and_query`）；
 写入被拒绝，8 种写法（含多语句、可写 CTE、`PRAGMA`、`ATTACH`）逐条测试，表内容不变；
@@ -229,17 +229,17 @@
 
 在已验证的抽象与界面上新增驱动。
 
-- [ ] `fg-driver/src/postgres/`：`tokio-postgres` + rustls；连接池由 `fg-service` 统一管理
-- [ ] 异步流式发送辅助函数（补齐 M0 遗留的「已知缺口」），复用 `Batcher`
-- [ ] 取消：cancel token；只读：`SET TRANSACTION READ ONLY` / `default_transaction_read_only`
-- [ ] 元数据：`pg_catalog`（schema、表、视图、物化视图、列、主键、索引、外键、注释、行数估算 `reltuples`）；`pg_get_*` 生成 DDL
-- [ ] 类型解码矩阵：整数 / 浮点 / `numeric`（保持精度）/ `text` / `bytea` / `bool` / `date` / `time` / `timestamp(tz)` / `interval` /
+- [x] `fg-driver/src/postgres/`：`tokio-postgres` + rustls；连接池由 `fg-service` 统一管理
+- [x] 异步流式发送辅助函数（补齐 M0 遗留的「已知缺口」），复用 `Batcher`
+- [x] 取消：cancel token；只读：`SET TRANSACTION READ ONLY` / `default_transaction_read_only`
+- [x] 元数据：`pg_catalog`（schema、表、视图、物化视图、列、主键、索引、外键、注释、行数估算 `reltuples`）；`pg_get_*` 生成 DDL
+- [x] 类型解码矩阵：整数 / 浮点 / `numeric`（保持精度）/ `text` / `bytea` / `bool` / `date` / `time` / `timestamp(tz)` / `interval` /
       `uuid` / `json(b)` / 数组 / 枚举 / 范围 / `inet` / `bit` / 几何 / 未知类型（走 `Value::Other`）
-- [ ] `fg-service`：SSH 隧道（`russh`，密码 / 私钥 / agent）与 TLS（Disable ~ Verify-Full、客户端证书）—— 驱动无感知
-- [ ] 连接配置界面（网络型）：host / port / user / password / database、环境色标、SSL、SSH、连接 URL 粘贴自动解析、测试连接（显示延迟与精确错误）
-- [ ] 数据库切换（`⌘K`）：PG 通过重连实现
-- [ ] 方言细节：`$n` 占位符、`RETURNING`、事务性 DDL、`EXPLAIN`
-- [ ] 共享的行为测试（与 SQLite 同一组场景）通过 testcontainers 在 PG 12–17 上运行
+- [x] `fg-service`：SSH 隧道（`russh`，密码 / 私钥 / agent）与 TLS（Disable ~ Verify-Full、客户端证书）—— 驱动无感知
+- [x] 连接配置界面（网络型）：host / port / user / password / database、环境色标、SSL、SSH、连接 URL 粘贴自动解析、测试连接（显示延迟与精确错误）
+- [x] 数据库切换（`⌘K`）：PG 通过重连实现；切换关闭全部标签页，有暂存修改时拒绝，失败回滚到原数据库
+- [x] 方言细节：`$n` 占位符、`RETURNING`、事务性 DDL、`EXPLAIN`
+- [ ] 共享的行为测试（与 SQLite 同一组场景）通过 testcontainers 在 PG 12–17 上运行。*需真实 PG 服务器；开发机无 PG / testcontainers，待装机验证*
 
 **验收**
 

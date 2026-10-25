@@ -27,8 +27,9 @@ use super::actions::{LAUNCHER_CONTEXT, LauncherNext, LauncherOpen, LauncherPrev,
 use super::icons::{Hugeicon, hugeicon};
 use super::style::environment_color;
 use crate::model::{
-    ConnectionDraft, ENVIRONMENTS, SAFE_MODES, TAG_COLORS, color_from_label, duplicate,
-    environment_from_label, environment_label, rank, safe_mode_from_label, safe_mode_label,
+    ConnectionDraft, ENVIRONMENTS, SAFE_MODES, SSH_AUTHS, SshAuthChoice, TAG_COLORS, TLS_MODES,
+    color_from_label, duplicate, environment_from_label, environment_label, parse_postgres_url,
+    rank, safe_mode_from_label, safe_mode_label, ssh_auth_from_label, tls_mode_from_label,
 };
 
 /// One entry of the rendered launcher list.
@@ -104,12 +105,32 @@ fn describe(c: &ConnectionConfig) -> String {
     }
 }
 
+/// A save request: the config plus the secrets the form typed. A blank
+/// password field means "keep the saved secret", so typed secrets arrive as
+/// `Set` and untouched ones as `Keep`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SaveRequest {
+    pub config: ConnectionConfig,
+    pub password: fg_service::PasswordUpdate,
+    pub ssh_secret: fg_service::PasswordUpdate,
+}
+
+/// A test-connection request: the unsaved config plus the typed secrets.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TestConnectionRequest {
+    pub config: ConnectionConfig,
+    pub password: Option<String>,
+    pub ssh_secret: Option<String>,
+}
+
 /// What the user asked the launcher to do.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LauncherEvent {
     Open(ConnectionId),
     /// Save a new or edited connection (also used for duplicates).
-    Save(Box<ConnectionConfig>),
+    Save(SaveRequest),
+    /// Try an unsaved connection and report the result back into the form.
+    TestConnection(TestConnectionRequest),
     Delete(ConnectionId),
     CycleTheme,
     /// The first-launch keychain-backup banner was closed; persist the dismissal.
@@ -128,6 +149,24 @@ struct Editor {
     base: Option<ConnectionConfig>,
     name: Entity<InputState>,
     path: Entity<InputState>,
+    url: Entity<InputState>,
+    host: Entity<InputState>,
+    port: Entity<InputState>,
+    user: Entity<InputState>,
+    database: Entity<InputState>,
+    password: Entity<InputState>,
+    tls_mode: Choice,
+    tls_ca_path: Entity<InputState>,
+    tls_cert_path: Entity<InputState>,
+    tls_key_path: Entity<InputState>,
+    tls_server_name: Entity<InputState>,
+    use_ssh: bool,
+    ssh_host: Entity<InputState>,
+    ssh_port: Entity<InputState>,
+    ssh_user: Entity<InputState>,
+    ssh_auth: Choice,
+    ssh_key_path: Entity<InputState>,
+    ssh_secret: Entity<InputState>,
     environment: Choice,
     color: Choice,
     group: Choice,
@@ -136,6 +175,9 @@ struct Editor {
     group_ids: Vec<GroupId>,
     create_if_missing: bool,
     error: Option<SharedString>,
+    /// Last test-connection result, or the in-progress marker while testing.
+    test_result: Option<SharedString>,
+    test_running: bool,
     selected_engine: DbKind,
 }
 
@@ -179,6 +221,25 @@ fn choice(
             window,
             cx,
         )
+    })
+}
+
+/// One text field of the connection form, prefilled and optionally masked
+/// (passwords start masked; the eye toggle still lets the user peek).
+fn editor_input(
+    placeholder: &str,
+    value: &str,
+    masked: bool,
+    window: &mut Window,
+    cx: &mut Context<Launcher>,
+) -> Entity<InputState> {
+    cx.new(|cx| {
+        let mut s = InputState::new(window, cx).placeholder(placeholder);
+        s.set_value(value.to_owned(), window, cx);
+        if masked {
+            s.set_masked(true, window, cx);
+        }
+        s
     })
 }
 
@@ -515,6 +576,88 @@ impl Launcher {
             s.set_value(draft.path.clone(), window, cx);
             s
         });
+        let url = editor_input(
+            "postgres://user:password@host:port/database",
+            &draft.url,
+            false,
+            window,
+            cx,
+        );
+        let host = editor_input("localhost", &draft.host, false, window, cx);
+        let port = editor_input("5432", &draft.port, false, window, cx);
+        let user = editor_input("User", &draft.user, false, window, cx);
+        let database = editor_input(
+            "Database (blank = server default)",
+            &draft.database,
+            false,
+            window,
+            cx,
+        );
+        let password = editor_input(
+            "Password (blank keeps the saved one)",
+            &draft.password,
+            true,
+            window,
+            cx,
+        );
+        let tls_items: Vec<SharedString> = TLS_MODES
+            .iter()
+            .map(|(_, l)| SharedString::from(*l))
+            .collect();
+        let tls_ix = TLS_MODES
+            .iter()
+            .position(|(m, _)| *m == draft.tls_mode)
+            .unwrap_or(0);
+        let tls_mode = choice(tls_items, tls_ix, window, cx);
+        let tls_ca_path = editor_input(
+            "CA certificate (optional)",
+            &draft.tls_ca_path,
+            false,
+            window,
+            cx,
+        );
+        let tls_cert_path = editor_input(
+            "Client certificate (optional)",
+            &draft.tls_cert_path,
+            false,
+            window,
+            cx,
+        );
+        let tls_key_path = editor_input(
+            "Client key (optional)",
+            &draft.tls_key_path,
+            false,
+            window,
+            cx,
+        );
+        let tls_server_name = editor_input(
+            "Server name override (optional)",
+            &draft.tls_server_name,
+            false,
+            window,
+            cx,
+        );
+        let ssh_host = editor_input("SSH host", &draft.ssh_host, false, window, cx);
+        let ssh_port = editor_input("22", &draft.ssh_port, false, window, cx);
+        let ssh_user = editor_input("SSH user", &draft.ssh_user, false, window, cx);
+        let ssh_items: Vec<SharedString> = SSH_AUTHS
+            .iter()
+            .map(|(_, l)| SharedString::from(*l))
+            .collect();
+        let ssh_ix = SSH_AUTHS
+            .iter()
+            .position(|(a, _)| *a == draft.ssh_auth)
+            .unwrap_or(0);
+        let ssh_auth = choice(ssh_items, ssh_ix, window, cx);
+        let ssh_key_path = editor_input("Private key path", &draft.ssh_key_path, false, window, cx);
+        let ssh_secret = editor_input(
+            "SSH password or key passphrase (blank keeps the saved one)",
+            &draft.ssh_secret,
+            true,
+            window,
+            cx,
+        );
+        let use_ssh = draft.use_ssh;
         let envs: Vec<SharedString> = ENVIRONMENTS
             .iter()
             .map(|(_, l)| SharedString::from(*l))
@@ -561,12 +704,32 @@ impl Launcher {
             .unwrap_or(0);
         let safe_mode = choice(safe_items, safe_ix, window, cx);
         let create_if_missing = draft.create_if_missing;
-        let selected_engine = base.as_ref().map_or(DbKind::Sqlite, |c| c.kind);
+        // The draft's kind wins over the base: pasting a URL into a new form
+        // switches the engine to PostgreSQL even though there is no base.
+        let selected_engine = draft.kind;
         self.editor = Some(Editor {
             draft,
             base,
             name,
             path,
+            url,
+            host,
+            port,
+            user,
+            database,
+            password,
+            tls_mode,
+            tls_ca_path,
+            tls_cert_path,
+            tls_key_path,
+            tls_server_name,
+            use_ssh,
+            ssh_host,
+            ssh_port,
+            ssh_user,
+            ssh_auth,
+            ssh_key_path,
+            ssh_secret,
             environment,
             color,
             group,
@@ -574,6 +737,8 @@ impl Launcher {
             safe_mode,
             create_if_missing,
             error: None,
+            test_result: None,
+            test_running: false,
             selected_engine,
         });
         self.confirm_delete = None;
@@ -640,6 +805,16 @@ impl Launcher {
             Some(label) => safe_mode_from_label(label),
             None => e.draft.safe_mode,
         };
+        let tls_mode = e
+            .tls_mode
+            .read(cx)
+            .selected_value()
+            .map_or(e.draft.tls_mode, |l| tls_mode_from_label(l));
+        let ssh_auth = e
+            .ssh_auth
+            .read(cx)
+            .selected_value()
+            .map_or(e.draft.ssh_auth, |l| ssh_auth_from_label(l));
         Some(ConnectionDraft {
             id: e.draft.id.clone(),
             name: e.name.read(cx).value().to_string(),
@@ -647,8 +822,27 @@ impl Launcher {
                 .as_deref()
                 .map_or(e.draft.environment, environment_from_label),
             color: color_name.as_deref().and_then(color_from_label),
+            kind: e.selected_engine,
+            url: e.url.read(cx).value().to_string(),
             path: e.path.read(cx).value().to_string(),
             create_if_missing: e.create_if_missing,
+            host: e.host.read(cx).value().to_string(),
+            port: e.port.read(cx).value().to_string(),
+            user: e.user.read(cx).value().to_string(),
+            database: e.database.read(cx).value().to_string(),
+            password: e.password.read(cx).value().to_string(),
+            tls_mode,
+            tls_ca_path: e.tls_ca_path.read(cx).value().to_string(),
+            tls_cert_path: e.tls_cert_path.read(cx).value().to_string(),
+            tls_key_path: e.tls_key_path.read(cx).value().to_string(),
+            tls_server_name: e.tls_server_name.read(cx).value().to_string(),
+            use_ssh: e.use_ssh,
+            ssh_host: e.ssh_host.read(cx).value().to_string(),
+            ssh_port: e.ssh_port.read(cx).value().to_string(),
+            ssh_user: e.ssh_user.read(cx).value().to_string(),
+            ssh_auth,
+            ssh_key_path: e.ssh_key_path.read(cx).value().to_string(),
+            ssh_secret: e.ssh_secret.read(cx).value().to_string(),
             group_id,
             safe_mode,
         })
@@ -661,9 +855,26 @@ impl Launcher {
         let base = self.editor.as_ref().and_then(|e| e.base.clone());
         match draft.to_config(base.as_ref()) {
             Ok(config) => {
+                // Blank means "keep the saved secret"; only a typed value
+                // overwrites it. Passwords are never trimmed: a leading or
+                // trailing space can be part of the secret.
+                let password = if draft.password.is_empty() {
+                    fg_service::PasswordUpdate::Keep
+                } else {
+                    fg_service::PasswordUpdate::Set(draft.password.clone())
+                };
+                let ssh_secret = if draft.use_ssh && !draft.ssh_secret.is_empty() {
+                    fg_service::PasswordUpdate::Set(draft.ssh_secret.clone())
+                } else {
+                    fg_service::PasswordUpdate::Keep
+                };
                 self.selected = Some(config.id.clone());
                 self.close_editor(window, cx);
-                cx.emit(LauncherEvent::Save(Box::new(config)));
+                cx.emit(LauncherEvent::Save(SaveRequest {
+                    config,
+                    password,
+                    ssh_secret,
+                }));
             }
             Err(message) => {
                 if let Some(e) = self.editor.as_mut() {
@@ -674,11 +885,90 @@ impl Launcher {
         }
     }
 
+    /// Fill the network fields from the URL box, then rebuild the form so
+    /// every field shows the parsed value. A bad URL lands in the error line.
+    pub fn parse_editor_url(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(mut draft) = self.read_draft(cx) else {
+            return;
+        };
+        let base = self.editor.as_ref().and_then(|e| e.base.clone());
+        let url = self
+            .editor
+            .as_ref()
+            .map(|e| e.url.read(cx).value().to_string())
+            .unwrap_or_default();
+        match parse_postgres_url(&url) {
+            Ok(parsed) => {
+                draft.apply_url(&parsed);
+                self.open_editor(draft, base, window, cx);
+            }
+            Err(message) => {
+                if let Some(e) = self.editor.as_mut() {
+                    e.error = Some(message.into());
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    /// Try the draft without saving it; the controller reports the outcome
+    /// back through [`Self::set_editor_test_result`].
+    pub fn test_editor_connection(&mut self, cx: &mut Context<Self>) {
+        let Some(draft) = self.read_draft(cx) else {
+            return;
+        };
+        let base = self.editor.as_ref().and_then(|e| e.base.clone());
+        match draft.to_config(base.as_ref()) {
+            Ok(config) => {
+                let password = if draft.password.is_empty() {
+                    None
+                } else {
+                    Some(draft.password.clone())
+                };
+                let ssh_secret = if draft.use_ssh && !draft.ssh_secret.is_empty() {
+                    Some(draft.ssh_secret.clone())
+                } else {
+                    None
+                };
+                if let Some(e) = self.editor.as_mut() {
+                    e.error = None;
+                    e.test_result = None;
+                    e.test_running = true;
+                }
+                cx.notify();
+                cx.emit(LauncherEvent::TestConnection(TestConnectionRequest {
+                    config,
+                    password,
+                    ssh_secret,
+                }));
+            }
+            Err(message) => {
+                if let Some(e) = self.editor.as_mut() {
+                    e.error = Some(message.into());
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    /// Report a test-connection outcome into the form (called by the controller).
+    pub fn set_editor_test_result(&mut self, result: String, cx: &mut Context<Self>) {
+        if let Some(e) = self.editor.as_mut() {
+            e.test_running = false;
+            e.test_result = Some(result.into());
+        }
+        cx.notify();
+    }
+
     // ---- duplicate and delete -----------------------------------------------------------------
 
     fn duplicate_selected(&mut self, cx: &mut Context<Self>) {
         if let Some(config) = self.selected_row().and_then(|r| r.config.clone()) {
-            cx.emit(LauncherEvent::Save(Box::new(duplicate(&config))));
+            cx.emit(LauncherEvent::Save(SaveRequest {
+                config: duplicate(&config),
+                password: fg_service::PasswordUpdate::Keep,
+                ssh_secret: fg_service::PasswordUpdate::Keep,
+            }));
         }
     }
 
@@ -701,8 +991,17 @@ fn fastgrid_logo() -> impl IntoElement {
     img("fastgrid/logo.png").size(px(64.))
 }
 
-const ENGINES: &[(DbKind, &str, &str, f32, f32, f32)] =
-    &[(DbKind::Sqlite, "SQLite", "Sl", 262.0 / 360.0, 0.83, 0.58)];
+const ENGINES: &[(DbKind, &str, &str, f32, f32, f32)] = &[
+    (DbKind::Sqlite, "SQLite", "Sl", 262.0 / 360.0, 0.83, 0.58),
+    (
+        DbKind::Postgres,
+        "PostgreSQL",
+        "Pg",
+        216.0 / 360.0,
+        0.56,
+        0.40,
+    ),
+];
 
 pub fn is_chinese_locale() -> bool {
     super::style::is_zh_locale()
@@ -1526,6 +1825,14 @@ impl Launcher {
         };
         let error = e.error.clone();
         let active_engine = e.selected_engine;
+        let is_postgres = active_engine == DbKind::Postgres;
+        let ssh_auth_now = e
+            .ssh_auth
+            .read(cx)
+            .selected_value()
+            .map_or(e.draft.ssh_auth, |l| ssh_auth_from_label(l));
+        let test_running = e.test_running;
+        let test_result = e.test_result.clone();
 
         // The hint follows both dropdowns as they stand right now: the mode's own explanation,
         // or, for Default, the mode the currently chosen environment suggests.
@@ -1573,6 +1880,7 @@ impl Launcher {
                         "engine-{}",
                         name.to_lowercase().replace(' ', "-")
                     )))
+                    .test_support()
                     .items_center()
                     .gap_1()
                     .p_2()
@@ -1679,26 +1987,267 @@ impl Launcher {
                             },
                             Input::new(&e.name).id("editor-name").into_any_element(),
                         ))
-                        .child(field(
-                            if is_zh {
-                                "数据库文件".into()
-                            } else {
-                                "Database file".into()
-                            },
-                            h_flex()
-                                .gap_2()
-                                .child(div().flex_1().child(Input::new(&e.path).id("editor-path")))
-                                .child(
-                                    Button::new("editor-browse")
-                                        .label(if is_zh { "浏览…" } else { "Browse…" })
-                                        .small()
-                                        .rounded(px(14.))
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.browse_file(window, cx)
-                                        })),
+                        .when(!is_postgres, |d| {
+                            d.child(field(
+                                if is_zh {
+                                    "数据库文件".into()
+                                } else {
+                                    "Database file".into()
+                                },
+                                h_flex()
+                                    .gap_2()
+                                    .child(
+                                        div().flex_1().child(Input::new(&e.path).id("editor-path")),
+                                    )
+                                    .child(
+                                        Button::new("editor-browse")
+                                            .label(if is_zh { "浏览…" } else { "Browse…" })
+                                            .small()
+                                            .rounded(px(14.))
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.browse_file(window, cx)
+                                            })),
+                                    )
+                                    .into_any_element(),
+                            ))
+                        })
+                        .when(is_postgres, |d| {
+                            d.child(field(
+                                if is_zh {
+                                    "连接 URL（粘贴后点解析）".into()
+                                } else {
+                                    "Connection URL (paste, then parse)".into()
+                                },
+                                h_flex()
+                                    .gap_2()
+                                    .child(
+                                        div().flex_1().child(Input::new(&e.url).id("editor-url")),
+                                    )
+                                    .child(
+                                        Button::new("editor-parse-url")
+                                            .label(if is_zh { "解析" } else { "Parse" })
+                                            .small()
+                                            .rounded(px(14.))
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.parse_editor_url(window, cx);
+                                            })),
+                                    )
+                                    .into_any_element(),
+                            ))
+                            .child(
+                                h_flex()
+                                    .gap_3()
+                                    .child(div().flex_1().child(field(
+                                        if is_zh {
+                                            "主机".into()
+                                        } else {
+                                            "Host".into()
+                                        },
+                                        Input::new(&e.host).id("editor-host").into_any_element(),
+                                    )))
+                                    .child(div().w(px(90.)).child(field(
+                                        if is_zh {
+                                            "端口".into()
+                                        } else {
+                                            "Port".into()
+                                        },
+                                        Input::new(&e.port).id("editor-port").into_any_element(),
+                                    ))),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_3()
+                                    .child(div().flex_1().child(field(
+                                        if is_zh {
+                                            "用户".into()
+                                        } else {
+                                            "User".into()
+                                        },
+                                        Input::new(&e.user).id("editor-user").into_any_element(),
+                                    )))
+                                    .child(
+                                        div().flex_1().child(field(
+                                            if is_zh {
+                                                "数据库".into()
+                                            } else {
+                                                "Database".into()
+                                            },
+                                            Input::new(&e.database)
+                                                .id("editor-database")
+                                                .into_any_element(),
+                                        )),
+                                    ),
+                            )
+                            .child(field(
+                                if is_zh {
+                                    "密码".into()
+                                } else {
+                                    "Password".into()
+                                },
+                                Input::new(&e.password)
+                                    .mask_toggle()
+                                    .id("editor-password")
+                                    .into_any_element(),
+                            ))
+                            .child(field(
+                                "TLS".into(),
+                                Select::new(&e.tls_mode)
+                                    .id("editor-tls-mode")
+                                    .into_any_element(),
+                            ))
+                            .child(
+                                h_flex()
+                                    .gap_3()
+                                    .child(
+                                        div().flex_1().child(field(
+                                            if is_zh {
+                                                "CA 证书".into()
+                                            } else {
+                                                "CA certificate".into()
+                                            },
+                                            Input::new(&e.tls_ca_path)
+                                                .id("editor-tls-ca")
+                                                .into_any_element(),
+                                        )),
+                                    )
+                                    .child(
+                                        div().flex_1().child(field(
+                                            if is_zh {
+                                                "服务器名".into()
+                                            } else {
+                                                "Server name".into()
+                                            },
+                                            Input::new(&e.tls_server_name)
+                                                .id("editor-tls-server-name")
+                                                .into_any_element(),
+                                        )),
+                                    ),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_3()
+                                    .child(
+                                        div().flex_1().child(field(
+                                            if is_zh {
+                                                "客户端证书".into()
+                                            } else {
+                                                "Client certificate".into()
+                                            },
+                                            Input::new(&e.tls_cert_path)
+                                                .id("editor-tls-cert")
+                                                .into_any_element(),
+                                        )),
+                                    )
+                                    .child(
+                                        div().flex_1().child(field(
+                                            if is_zh {
+                                                "客户端密钥".into()
+                                            } else {
+                                                "Client key".into()
+                                            },
+                                            Input::new(&e.tls_key_path)
+                                                .id("editor-tls-key")
+                                                .into_any_element(),
+                                        )),
+                                    ),
+                            )
+                            .child(
+                                Checkbox::new("editor-use-ssh")
+                                    .label(if is_zh {
+                                        "通过 SSH 隧道连接"
+                                    } else {
+                                        "Connect through an SSH tunnel"
+                                    })
+                                    .checked(e.use_ssh)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some(e) = this.editor.as_mut() {
+                                            e.use_ssh = !e.use_ssh;
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
+                            .when(e.use_ssh, |d| {
+                                d.child(
+                                    h_flex()
+                                        .gap_3()
+                                        .child(
+                                            div().flex_1().child(field(
+                                                if is_zh {
+                                                    "SSH 主机".into()
+                                                } else {
+                                                    "SSH host".into()
+                                                },
+                                                Input::new(&e.ssh_host)
+                                                    .id("editor-ssh-host")
+                                                    .into_any_element(),
+                                            )),
+                                        )
+                                        .child(
+                                            div().w(px(90.)).child(field(
+                                                if is_zh {
+                                                    "SSH 端口".into()
+                                                } else {
+                                                    "SSH port".into()
+                                                },
+                                                Input::new(&e.ssh_port)
+                                                    .id("editor-ssh-port")
+                                                    .into_any_element(),
+                                            )),
+                                        ),
                                 )
-                                .into_any_element(),
-                        ))
+                                .child(
+                                    h_flex()
+                                        .gap_3()
+                                        .child(
+                                            div().flex_1().child(field(
+                                                if is_zh {
+                                                    "SSH 用户".into()
+                                                } else {
+                                                    "SSH user".into()
+                                                },
+                                                Input::new(&e.ssh_user)
+                                                    .id("editor-ssh-user")
+                                                    .into_any_element(),
+                                            )),
+                                        )
+                                        .child(
+                                            div().flex_1().child(field(
+                                                if is_zh {
+                                                    "SSH 认证".into()
+                                                } else {
+                                                    "SSH auth".into()
+                                                },
+                                                Select::new(&e.ssh_auth)
+                                                    .id("editor-ssh-auth")
+                                                    .into_any_element(),
+                                            )),
+                                        ),
+                                )
+                                .when(ssh_auth_now == SshAuthChoice::PrivateKey, |d| {
+                                    d.child(field(
+                                        if is_zh {
+                                            "私钥路径".into()
+                                        } else {
+                                            "Private key path".into()
+                                        },
+                                        Input::new(&e.ssh_key_path)
+                                            .id("editor-ssh-key-path")
+                                            .into_any_element(),
+                                    ))
+                                })
+                                .child(field(
+                                    if is_zh {
+                                        "SSH 密码或密钥口令".into()
+                                    } else {
+                                        "SSH password or key passphrase".into()
+                                    },
+                                    Input::new(&e.ssh_secret)
+                                        .mask_toggle()
+                                        .id("editor-ssh-secret")
+                                        .into_any_element(),
+                                ))
+                            })
+                        })
                         .child(
                             h_flex()
                                 .gap_3()
@@ -1755,21 +2304,23 @@ impl Launcher {
                                 )
                                 .into_any_element(),
                         ))
-                        .child(
-                            Checkbox::new("editor-create")
-                                .label(if is_zh {
-                                    "如果文件不存在则自动创建"
-                                } else {
-                                    "Create the file if it does not exist"
-                                })
-                                .checked(e.create_if_missing)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    if let Some(e) = this.editor.as_mut() {
-                                        e.create_if_missing = !e.create_if_missing;
-                                    }
-                                    cx.notify();
-                                })),
-                        )
+                        .when(!is_postgres, |d| {
+                            d.child(
+                                Checkbox::new("editor-create")
+                                    .label(if is_zh {
+                                        "如果文件不存在则自动创建"
+                                    } else {
+                                        "Create the file if it does not exist"
+                                    })
+                                    .checked(e.create_if_missing)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some(e) = this.editor.as_mut() {
+                                            e.create_if_missing = !e.create_if_missing;
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
+                        })
                         .when_some(error, |d, message| {
                             d.child(
                                 div()
@@ -1781,10 +2332,37 @@ impl Launcher {
                                     .child(message),
                             )
                         })
+                        .when_some(test_result, |d, message| {
+                            d.child(
+                                div()
+                                    .id("editor-test-result")
+                                    .test_support()
+                                    .aria_label(message.clone())
+                                    .text_sm()
+                                    .text_color(theme.muted_foreground)
+                                    .child(message),
+                            )
+                        })
                         .child(
                             h_flex()
                                 .gap_2()
                                 .justify_end()
+                                .child(
+                                    Button::new("editor-test")
+                                        .small()
+                                        .label(if test_running {
+                                            if is_zh { "测试中…" } else { "Testing…" }
+                                        } else if is_zh {
+                                            "测试连接"
+                                        } else {
+                                            "Test connection"
+                                        })
+                                        .rounded(px(18.))
+                                        .when(test_running, |b| b.disabled(true))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.test_editor_connection(cx);
+                                        })),
+                                )
                                 .child(
                                     Button::new("editor-cancel")
                                         .small()
