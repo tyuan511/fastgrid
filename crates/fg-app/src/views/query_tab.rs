@@ -31,8 +31,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::model::{
-    self, Changeset, DEFAULT_RESULT_PAGE_SIZE, PageState, QueryDocumentState, QueryResults,
-    RESULT_PAGE_SIZES, RunMode, RunStatus, RunTarget, align_for, run_target,
+    self, CellKind, Changeset, DEFAULT_RESULT_PAGE_SIZE, PageState, QueryDocumentState,
+    QueryResults, RESULT_PAGE_SIZES, RunMode, RunStatus, RunTarget, align_for, display, run_target,
 };
 
 /// What the tab asks its owner to do.
@@ -288,6 +288,45 @@ impl TableDelegate for ResultDelegate {
             )
             .into_any_element();
         super::cells::th_frame(header, cx)
+    }
+
+    fn fit_column(
+        &mut self,
+        col_ix: usize,
+        window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> Option<Pixels> {
+        // Same rule as the table grid: the drawn text plus the frame's own padding, the table
+        // adding the column padding this grid also sets to zero. A result header is just its
+        // name, and its cells draw no foreign-key arrow.
+        let meta = self.metas.get(col_ix)?;
+        let theme = cx.theme().clone();
+        let mono = Font {
+            family: theme.mono_font_family.clone(),
+            ..Default::default()
+        };
+        let mut widest = px(0.);
+        for row_ix in 0..self.rows.len() {
+            let shown = display(&self.shown_value(row_ix, col_ix));
+            let mut width =
+                super::cells::text_width(window, &shown.text, super::cells::GRID_TEXT_SIZE, &mono)
+                    + super::cells::FRAME_PADDING;
+            if shown.kind == CellKind::Pill {
+                width += px(8.); // the chip's own px_1 on each side
+            }
+            widest = widest.max(width);
+        }
+        let header = super::cells::text_width(
+            window,
+            &meta.name,
+            super::cells::GRID_TEXT_SIZE,
+            &Font {
+                family: theme.mono_font_family.clone(),
+                weight: FontWeight::MEDIUM,
+                ..Default::default()
+            },
+        ) + super::cells::FRAME_PADDING;
+        Some(widest.max(header))
     }
 
     fn render_td(

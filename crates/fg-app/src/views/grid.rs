@@ -35,8 +35,9 @@ use super::cells::{CellMark, CellSelection};
 use super::filter_drawer::{FilterDrawer, FilterDrawerEvent};
 use super::icons::{Hugeicon, hugeicon};
 use crate::model::{
-    Align, CellState, Changeset, Counts, DEFAULT_PAGE_SIZE, FilterDraft, GridQuery, JumpTarget,
-    PAGE_SIZES, RowId, RowState, SortState, align_for, copy_text, parse_cell_text, to_tsv,
+    Align, CellKind, CellState, Changeset, Counts, DEFAULT_PAGE_SIZE, FilterDraft, GridQuery,
+    JumpTarget, PAGE_SIZES, RowId, RowState, SortState, align_for, copy_text, display,
+    parse_cell_text, to_tsv,
 };
 
 /// Screen columns before the data: the row-number gutter.
@@ -44,7 +45,9 @@ const GUTTER: usize = 1;
 const GUTTER_WIDTH: f32 = 44.;
 
 /// A click on a column header, handed from the table delegate to the owning view.
-type SortRequest = Rc<RefCell<Option<String>>>;
+/// A header click waiting to be applied: the column, and whether Shift was held, which keeps
+/// the existing keys and adds this one instead of replacing them.
+type SortRequest = Rc<RefCell<Option<(String, bool)>>>;
 /// A click on a foreign-key arrow: (row, column) of the cell.
 type JumpRequest = Rc<RefCell<Option<(usize, usize)>>>;
 /// A Tab / Shift+Tab pressed in the cell editor: the (columns, rows) to move after confirming.
@@ -304,13 +307,13 @@ impl TableDelegate for GridDelegate {
         &mut self,
         col_ix: usize,
         _sort: ColumnSort,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) {
         // Our own `SortState` decides the cycle (asc, desc, off) and supports several keys;
         // the table only tells us which header was clicked.
         if let Some(meta) = self.data_index(col_ix).and_then(|i| self.metas.get(i)) {
-            *self.pending_sort.borrow_mut() = Some(meta.name.clone());
+            *self.pending_sort.borrow_mut() = Some((meta.name.clone(), window.modifiers().shift));
             cx.notify();
         }
     }
@@ -369,12 +372,89 @@ impl TableDelegate for GridDelegate {
             .flex()
             .cursor_pointer()
             .child(super::cells::th_frame(header, cx))
-            .on_click(cx.listener(move |this, _, _, cx| {
+            .on_click(cx.listener(move |this, _, window, cx| {
                 cx.stop_propagation();
-                *this.delegate().pending_sort.borrow_mut() = Some(name.clone());
+                *this.delegate().pending_sort.borrow_mut() =
+                    Some((name.clone(), window.modifiers().shift));
                 cx.notify();
             }))
             .into_any_element()
+    }
+
+    fn fit_column(
+        &mut self,
+        col_ix: usize,
+        window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> Option<Pixels> {
+        // The table adds the column padding, which this grid sets to zero, so the width returned
+        // here is the full inner width: the drawn text plus the frame's own padding, plus the
+        // extras of the chip and foreign-key arrow where the cell draws them. The header counts
+        // the same way: its name and badges plus the frame padding, the negative margin exactly
+        // cancelling the sort-arrow space the table reserves. Called from inside the table's own
+        // update, so this only measures; it never touches the table entity.
+        let data_col = self.data_index(col_ix)?;
+        let meta = self.metas.get(data_col)?;
+        let theme = cx.theme().clone();
+        let mono = Font {
+            family: theme.mono_font_family.clone(),
+            ..Default::default()
+        };
+        let mut widest = px(0.);
+        for row_ix in 0..self.total_rows() {
+            let value = self.shown_value(row_ix, data_col);
+            let shown = display(&value);
+            let mut width =
+                super::cells::text_width(window, &shown.text, super::cells::GRID_TEXT_SIZE, &mono)
+                    + super::cells::FRAME_PADDING;
+            if shown.kind == CellKind::Pill {
+                width += px(8.); // the chip's own px_1 on each side
+            }
+            let followable = !value.is_null()
+                && !matches!(self.mark_for(row_ix, data_col), CellMark::Deleted)
+                && self.jumps.contains_key(&meta.name);
+            if followable {
+                // gap_1, then the arrow's own px_1 padding and glyph.
+                width += px(4.)
+                    + px(8.)
+                    + super::cells::text_width(window, "↗", super::cells::GRID_TEXT_SIZE, &mono);
+            }
+            widest = widest.max(width);
+        }
+        let multiple_keys = self.sort.keys().len() > 1;
+        let indicator = self.sort.indicator(&meta.name);
+        let mut header = super::cells::text_width(
+            window,
+            &meta.name,
+            super::cells::GRID_TEXT_SIZE,
+            &Font {
+                family: theme.mono_font_family.clone(),
+                weight: FontWeight::MEDIUM,
+                ..Default::default()
+            },
+        );
+        let mut children = 1;
+        if self.jumps.contains_key(&meta.name) {
+            header += super::cells::text_width(window, "↗", super::cells::GRID_TEXT_SIZE, &mono);
+            children += 1;
+        }
+        if let Some((_, descending)) = indicator {
+            header +=
+                super::cells::text_width(window, if descending { "▼" } else { "▲" }, px(9.), &mono);
+            children += 1;
+        }
+        if multiple_keys && let Some((priority, _)) = indicator {
+            header += super::cells::text_width(
+                window,
+                &priority.to_string(),
+                super::cells::GRID_TEXT_SIZE,
+                &mono,
+            );
+            children += 1;
+        }
+        header += px(6. * (children - 1) as f32); // gap_1p5 between header children
+        header += super::cells::FRAME_PADDING;
+        Some(widest.max(header))
     }
 
     fn render_td(
@@ -675,8 +755,8 @@ impl TableTab {
                 });
             }
             let clicked = pending.borrow_mut().take();
-            if let Some(column) = clicked {
-                this.toggle_sort(&column, cx);
+            if let Some((column, additive)) = clicked {
+                this.toggle_sort(&column, additive, cx);
             }
             // Selecting another cell (a click, an arrow key) while a box is open keeps what was
             // typed, the way clicking away from a spreadsheet cell does.
@@ -1793,8 +1873,10 @@ impl TableTab {
         }
     }
 
-    pub fn toggle_sort(&mut self, column: &str, cx: &mut Context<Self>) {
-        self.query.toggle_sort(column, false);
+    /// Sort by `column`; with `additive` (Shift-click) it joins the existing keys instead of
+    /// replacing them. The header already shows each key's priority once there are several.
+    pub fn toggle_sort(&mut self, column: &str, additive: bool, cx: &mut Context<Self>) {
+        self.query.toggle_sort(column, additive);
         self.sync_sort(cx);
         cx.emit(TableTabEvent::Reload);
     }

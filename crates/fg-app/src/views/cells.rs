@@ -172,6 +172,31 @@ pub enum CellMark {
 /// The size both grids use for headers and cells, in the monospace face, as TablePlus draws them.
 pub const GRID_TEXT_SIZE: Pixels = px(13.);
 
+/// Width of `text` as drawn in `font` at `size`, for column fitting: the same shaping the cells
+/// use, so a fitted column neither clips nor wastes space. Colour does not affect the width.
+pub fn text_width(window: &mut Window, text: &str, size: Pixels, font: &Font) -> Pixels {
+    window
+        .text_system()
+        .shape_line(
+            SharedString::from(text),
+            size,
+            &[TextRun {
+                len: text.len(),
+                font: font.clone(),
+                color: Hsla::default(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            }],
+            None,
+        )
+        .width
+}
+
+/// Horizontal padding the cell and header frames draw around their text (`px(6)` on each side).
+/// The columns themselves carry no padding, so a fitted width is the drawn content plus this.
+pub const FRAME_PADDING: Pixels = px(12.);
+
 /// The right padding the table library keeps in a header cell for its sort arrow (the default
 /// size's cell padding). Neither grid uses the library's arrow, so the header frame reaches over it
 /// and its column line lands on the same x as the body's.

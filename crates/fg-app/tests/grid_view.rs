@@ -94,6 +94,95 @@ fn load(cx: &mut TestAppContext, f: &Fixture, n: i64, total: Option<u64>) {
     .unwrap();
 }
 
+/// Rendered width of the `sort-{name}` header, which fills its column.
+fn header_width(cx: &mut TestAppContext, f: &Fixture, id: &'static str) -> f32 {
+    cx.update_window(f.window, |_, window, cx| {
+        window.render_frame(cx);
+        f32::from(window.find(id).bounds().size.width)
+    })
+    .unwrap()
+}
+
+/// Load exactly `rows` instead of the generated ones, as the controller would.
+fn load_rows(cx: &mut TestAppContext, f: &Fixture, rows: Vec<Vec<Value>>) {
+    cx.update_window(f.window, |_, window, cx| {
+        f.view.update(cx, |v, cx| {
+            let g = v.begin_load(cx);
+            v.set_columns(g, columns(), cx);
+            v.append_rows(g, rows, cx);
+            v.finish(g, 7, cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+}
+
+/// Double-click the resize handle of screen column `col_ix`: the handle band itself carries no
+/// test id, so click 2 px inside the column header's right edge, where the trailing band sits.
+fn double_click_handle(cx: &mut TestAppContext, f: &Fixture, col_ix: usize) {
+    use gpui_kit::test::ClickOptions;
+    use gpui_kit::{Point, px};
+    cx.update_window(f.window, |_, window, cx| {
+        window.render_frame(cx);
+        let bounds = window.find(("col-header", col_ix)).bounds();
+        window.click_with_options(
+            ("col-header", col_ix),
+            ClickOptions::new().with_count(2).with_offset(Point::new(
+                bounds.size.width - px(2.),
+                bounds.size.height / 2.,
+            )),
+            cx,
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn double_clicking_a_resize_handle_fits_the_column_to_its_content(cx: &mut TestAppContext) {
+    let f = open(cx);
+    load_rows(
+        cx,
+        &f,
+        vec![vec![
+            Value::Int(1),
+            Value::Text("a very long item name that should widen the column".into()),
+        ]],
+    );
+    let before = header_width(cx, &f, "sort-name");
+    double_click_handle(cx, &f, 2);
+    let after = header_width(cx, &f, "sort-name");
+    assert!(
+        after > before,
+        "fitted {after} should exceed the default {before}"
+    );
+}
+
+#[gpui_kit::test]
+fn double_clicking_a_resize_handle_shrinks_a_column_to_short_content(cx: &mut TestAppContext) {
+    let f = open(cx);
+    load(cx, &f, 3, None);
+    let before = header_width(cx, &f, "sort-name");
+    double_click_handle(cx, &f, 2);
+    let after = header_width(cx, &f, "sort-name");
+    assert!(
+        after < before,
+        "fitted {after} should shrink below the default {before}"
+    );
+}
+
+#[gpui_kit::test]
+fn double_clicking_a_resize_handle_with_no_rows_fits_the_header(cx: &mut TestAppContext) {
+    let f = open(cx);
+    load_rows(cx, &f, vec![]);
+    let before = header_width(cx, &f, "sort-name");
+    double_click_handle(cx, &f, 2);
+    let after = header_width(cx, &f, "sort-name");
+    assert!(
+        after < before,
+        "fitted {after} should shrink to the header below {before}"
+    );
+}
+
 fn status(cx: &mut TestAppContext, f: &Fixture) -> String {
     cx.update_window(f.window, |_, window, _| {
         window.find("grid-status").label().unwrap().to_owned()
@@ -231,7 +320,7 @@ fn sorting_resets_to_the_first_page_and_reloads(cx: &mut TestAppContext) {
     cx.update_window(f.window, |_, window, cx| window.click("grid-page-next", cx))
         .unwrap();
     cx.update_window(f.window, |_, window, cx| {
-        f.view.update(cx, |v, cx| v.toggle_sort("name", cx));
+        f.view.update(cx, |v, cx| v.toggle_sort("name", false, cx));
         window.render_frame(cx);
     })
     .unwrap();
@@ -896,6 +985,49 @@ fn copying_a_row_leaves_hidden_columns_out(cx: &mut TestAppContext) {
         assert_eq!(
             f.view.read(cx).selection_text(cx).as_deref(),
             Some("item 1")
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn shift_clicking_a_second_header_adds_it_to_the_sort(cx: &mut TestAppContext) {
+    let f = open(cx);
+    load(cx, &f, 3, Some(3));
+    cx.update_window(f.window, |_, window, cx| {
+        window.click("sort-name", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update_window(f.window, |_, window, cx| {
+        window.click_with_modifiers(
+            "sort-id",
+            gpui_kit::Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+            cx,
+        );
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update_window(f.window, |_, _, cx| {
+        let tab = f.view.read(cx);
+        assert_eq!(
+            tab.query().to_table_query().sort,
+            vec![
+                SortKey {
+                    column: "name".into(),
+                    descending: false,
+                    nulls: None
+                },
+                SortKey {
+                    column: "id".into(),
+                    descending: false,
+                    nulls: None
+                },
+            ],
+            "Shift-click keeps the first key and appends the second"
         );
     })
     .unwrap();

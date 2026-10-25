@@ -666,7 +666,10 @@ fn spawn_prefetch(
             match event {
                 Ok(Event::ResultStart { columns: c, .. }) => columns = Some(c),
                 Ok(Event::Rows(rs)) => rows.extend(rs),
-                Ok(Event::ResultEnd { .. }) => break,
+                // Do not break here: dropping the stream before it yields None
+                // marks it abandoned, which cancels the session and poisons the
+                // next statement leased from it (the page load that follows).
+                Ok(Event::ResultEnd { .. }) => {}
                 Ok(_) => {}
                 Err(_) => return,
             }

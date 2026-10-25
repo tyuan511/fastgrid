@@ -194,7 +194,7 @@ fn paging_and_sorting_fetch_the_right_rows(cx: &mut TestAppContext) {
 
     // Sorting returns to page 1 and orders by score then by the primary key.
     cx.update_window(app.window, |_, _, cx| {
-        tab.update(cx, |t, cx| t.toggle_sort("score", cx))
+        tab.update(cx, |t, cx| t.toggle_sort("score", false, cx))
     })
     .unwrap();
     settle(cx, "sorted page 1", |cx| {
@@ -293,7 +293,7 @@ fn the_session_is_saved_and_restored_with_table_view_state(cx: &mut TestAppConte
         status(cx, &app).starts_with("Showing 1–300 of 1,000")
     });
     cx.update_window(app.window, |_, _, cx| {
-        tab.update(cx, |t, cx| t.toggle_sort("name", cx))
+        tab.update(cx, |t, cx| t.toggle_sort("name", false, cx))
     })
     .unwrap();
     // The page sizes sit in the paging panel behind the ⚙ in the status bar.
