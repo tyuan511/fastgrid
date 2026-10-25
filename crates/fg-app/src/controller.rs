@@ -40,6 +40,17 @@ pub fn apply_saved_appearance(service: Service, cx: &mut App) {
 }
 
 /// Switch to the next theme choice and remember it.
+fn dismiss_backup_nudge(view: &Entity<Launcher>, service: &Service, cx: &mut App) {
+    view.update(cx, |v, cx| v.set_backup_nudge(false, cx));
+    let service = service.clone();
+    cx.spawn(async move |_| {
+        let _ = service
+            .set_setting(fg_core::BackupNudge { dismissed: true })
+            .await;
+    })
+    .detach();
+}
+
 fn cycle_theme(service: &Service, cx: &mut App) {
     let next = crate::theme_control::next(crate::theme_control::chosen(cx));
     crate::theme_control::set_and_apply(next, cx);
@@ -66,6 +77,21 @@ pub fn launcher(service: Service, window: &mut Window, cx: &mut App) -> Entity<L
         LauncherEvent::Save(config) => save(&view, &events_service, (**config).clone(), cx),
         LauncherEvent::Delete(id) => delete(&view, &events_service, id.clone(), cx),
         LauncherEvent::CycleTheme => cycle_theme(&events_service, cx),
+        LauncherEvent::DismissBackupNudge => dismiss_backup_nudge(&view, &events_service, cx),
+        LauncherEvent::SaveGroup(group) => save_group(&view, &events_service, group.clone(), cx),
+        LauncherEvent::DeleteGroup(id) => delete_group(&view, &events_service, id.clone(), cx),
+    })
+    .detach();
+
+    // The first-launch banner: shown until the user closes it once.
+    let (nudge_view, nudge_service) = (view.downgrade(), service.clone());
+    cx.spawn(async move |cx| {
+        let dismissed = nudge_service
+            .setting::<fg_core::BackupNudge>()
+            .await
+            .map(|n| n.dismissed)
+            .unwrap_or(false);
+        let _ = nudge_view.update(cx, |view, cx| view.set_backup_nudge(!dismissed, cx));
     })
     .detach();
 
@@ -93,6 +119,57 @@ fn reload(view: &Entity<Launcher>, service: &Service, cx: &mut App) {
         let _ = view.update(cx, |view, cx| match result {
             Ok(list) => view.set_rows(rows_from(list), cx),
             Err(e) => view.set_message(Some(format!("Could not load connections: {e}")), cx),
+        });
+        let groups = service.groups().await;
+        let _ = view.update(cx, |view, cx| match groups {
+            Ok(groups) => view.set_groups(groups, cx),
+            Err(e) => view.set_message(Some(format!("Could not load groups: {e}")), cx),
+        });
+    })
+    .detach();
+}
+
+fn save_group(
+    view: &Entity<Launcher>,
+    service: &Service,
+    group: fg_core::ConnectionGroup,
+    cx: &mut App,
+) {
+    let (view, service) = (view.downgrade(), service.clone());
+    cx.spawn(async move |cx| {
+        let outcome = service.save_group(group).await;
+        cx.update(|cx| {
+            if let Some(view) = view.upgrade() {
+                match outcome {
+                    Ok(_) => reload(&view, &service, cx),
+                    Err(e) => {
+                        view.update(cx, |v, cx| {
+                            v.set_message(Some(format!("Could not save the group: {e}")), cx)
+                        });
+                    }
+                }
+            }
+        });
+    })
+    .detach();
+}
+
+fn delete_group(view: &Entity<Launcher>, service: &Service, id: fg_core::GroupId, cx: &mut App) {
+    let (view, service) = (view.downgrade(), service.clone());
+    cx.spawn(async move |cx| {
+        // The store moves the group's connections to the top level on delete.
+        let outcome = service.delete_group(id).await;
+        cx.update(|cx| {
+            if let Some(view) = view.upgrade() {
+                match outcome {
+                    Ok(_) => reload(&view, &service, cx),
+                    Err(e) => {
+                        view.update(cx, |v, cx| {
+                            v.set_message(Some(format!("Could not delete the group: {e}")), cx)
+                        });
+                    }
+                }
+            }
         });
     })
     .detach();
@@ -359,6 +436,7 @@ fn describe_into_completion(
 struct Loads {
     page: Option<Task<()>>,
     count: Option<Task<()>>,
+    prefetch: Option<Task<()>>,
 }
 
 /// Connect a table tab to the database: restore its saved sorting and filters, load the first
@@ -388,6 +466,8 @@ fn attach_table(
                 cx,
             );
         }
+        // (Prefetching is triggered from run_load, not from an event, so the tab's public
+        // event stream stays exactly the intents its owner acts on.)
         // The workspace window opens the referenced table; nothing to load for this tab.
         TableTabEvent::FollowForeignKey { .. } => {}
         TableTabEvent::ViewChanged => save_view(&reload_service, &reload_conn, &reload_tab, cx),
@@ -461,51 +541,79 @@ fn run_load(
     let table_query = query.to_table_query();
     let need_total = query.page.total().is_none();
 
-    let (page_tab, page_conn, page_service, page_query) = (
+    // A page fetched ahead is served at once, with no new query: the columns and rows were
+    // collected for exactly this query and page number, and anything else was dropped.
+    let mut prefetch_key = table_query.clone();
+    prefetch_key.offset = 0;
+    let page_number = query.page.number();
+    let hit = tab.update(cx, |t, _| t.take_prefetch(&prefetch_key, page_number));
+    let served_from_prefetch = hit.is_some();
+    if let Some(hit) = hit {
+        tab.update(cx, |t, cx| {
+            t.set_columns(generation, hit.columns, cx);
+            t.append_rows(generation, hit.rows, cx);
+            t.finish(generation, 0, cx);
+        });
+        // The page on screen is settled; fetch the next one before the user asks for it.
+        spawn_prefetch(conn, tab, loads, cx);
+    }
+
+    let (page_tab, page_conn, page_service, page_query, page_loads) = (
         tab.downgrade(),
         Arc::clone(conn),
         service.clone(),
         table_query.clone(),
+        Rc::clone(loads),
     );
-    let page = cx.spawn(async move |cx| {
-        let mut stream = match page_conn
-            .browse(&page_query, BrowseOptions::default())
-            .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = page_tab.update(cx, |t, cx| t.fail(generation, e.to_string(), cx));
-                return;
-            }
-        };
-        while let Some(event) = stream.next().await {
-            let keep_going = match event {
-                Ok(Event::ResultStart { columns, .. }) => page_tab
-                    .update(cx, |t, cx| t.set_columns(generation, columns, cx))
-                    .is_ok(),
-                Ok(Event::Rows(rows)) => page_tab
-                    .update(cx, |t, cx| t.append_rows(generation, rows, cx))
-                    .is_ok(),
-                Ok(Event::ResultEnd { elapsed_ms, .. }) => page_tab
-                    .update(cx, |t, cx| t.finish(generation, elapsed_ms, cx))
-                    .is_ok(),
-                Ok(_) => true,
+    let page = if served_from_prefetch {
+        None
+    } else {
+        Some(cx.spawn(async move |cx| {
+            let mut stream = match page_conn
+                .browse(&page_query, BrowseOptions::default())
+                .await
+            {
+                Ok(s) => s,
                 Err(e) => {
                     let _ = page_tab.update(cx, |t, cx| t.fail(generation, e.to_string(), cx));
                     return;
                 }
             };
-            if !keep_going {
-                return; // the tab was closed
+            while let Some(event) = stream.next().await {
+                let keep_going = match event {
+                    Ok(Event::ResultStart { columns, .. }) => page_tab
+                        .update(cx, |t, cx| t.set_columns(generation, columns, cx))
+                        .is_ok(),
+                    Ok(Event::Rows(rows)) => page_tab
+                        .update(cx, |t, cx| t.append_rows(generation, rows, cx))
+                        .is_ok(),
+                    Ok(Event::ResultEnd { elapsed_ms, .. }) => page_tab
+                        .update(cx, |t, cx| t.finish(generation, elapsed_ms, cx))
+                        .is_ok(),
+                    Ok(_) => true,
+                    Err(e) => {
+                        let _ = page_tab.update(cx, |t, cx| t.fail(generation, e.to_string(), cx));
+                        return;
+                    }
+                };
+                if !keep_going {
+                    return; // the tab was closed
+                }
             }
-        }
-        // Remember how this table was being viewed.
-        if let Ok(state) = page_tab.read_with(cx, |t, cx| t.view_state(cx)) {
-            let _ = page_service
-                .save_table_view(page_conn.id(), &page_query.path, state)
-                .await;
-        }
-    });
+            // Remember how this table was being viewed.
+            if let Ok(state) = page_tab.read_with(cx, |t, cx| t.view_state(cx)) {
+                let _ = page_service
+                    .save_table_view(page_conn.id(), &page_query.path, state)
+                    .await;
+            }
+            // The page on screen is settled; fetch the next one before the user asks for it.
+            cx.update(|cx| {
+                if let Some(tab) = page_tab.upgrade() {
+                    spawn_prefetch(&page_conn, &tab, &page_loads, cx);
+                }
+            });
+        }))
+    };
 
     let count = need_total.then(|| {
         let (count_tab, count_conn, count_query) = (tab.downgrade(), Arc::clone(conn), table_query);
@@ -520,8 +628,64 @@ fn run_load(
     });
 
     let mut loads = loads.borrow_mut();
-    loads.page = Some(page);
+    loads.page = page;
     loads.count = count;
+}
+
+/// Fetch the page after the one on screen into the tab's prefetch slot, so stepping forward
+/// is instant. A no-op when there is no next page. If the tab moved on before the fetch
+/// finished, the result is dropped instead of parked: parking it would overwrite the slot
+/// the current page's own prefetch is about to fill.
+fn spawn_prefetch(
+    conn: &Arc<OpenConnection>,
+    tab: &Entity<TableTab>,
+    loads: &Rc<RefCell<Loads>>,
+    cx: &mut App,
+) {
+    let (key, next, query) = {
+        let q = tab.read(cx).query();
+        if !q.page.has_next() {
+            return;
+        }
+        let mut key = q.to_table_query();
+        key.offset = 0;
+        let next = q.page.number() + 1;
+        let mut query = q.to_table_query();
+        query.offset = next * query.limit;
+        (key, next, query)
+    };
+    let (prefetch_tab, prefetch_conn) = (tab.downgrade(), Arc::clone(conn));
+    let task = cx.spawn(async move |cx| {
+        let mut stream = match prefetch_conn.browse(&query, BrowseOptions::default()).await {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let mut columns = None;
+        let mut rows = Vec::new();
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(Event::ResultStart { columns: c, .. }) => columns = Some(c),
+                Ok(Event::Rows(rs)) => rows.extend(rs),
+                Ok(Event::ResultEnd { .. }) => break,
+                Ok(_) => {}
+                Err(_) => return,
+            }
+        }
+        let Some(columns) = columns else { return };
+        let _ = prefetch_tab.update(cx, |t, _| {
+            let mut current = t.query().to_table_query();
+            current.offset = 0;
+            if current == key && t.query().page.number() + 1 == next {
+                t.set_prefetch(crate::views::PrefetchedPage {
+                    key,
+                    page: next,
+                    columns,
+                    rows,
+                });
+            }
+        });
+    });
+    loads.borrow_mut().prefetch = Some(task);
 }
 
 /// Which columns of `path` can be followed to another table. A failure just means no arrows.

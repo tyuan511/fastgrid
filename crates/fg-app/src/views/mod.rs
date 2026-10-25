@@ -7,6 +7,7 @@ mod grid;
 pub mod icons;
 mod launcher;
 mod query_tab;
+mod recovery;
 mod style;
 mod workspace;
 
@@ -20,12 +21,13 @@ pub use actions::{
 };
 pub use cells::CellMark;
 pub use filter_drawer::{FilterDrawer, FilterDrawerEvent};
-pub use grid::{GridDelegate, TableTab, TableTabEvent};
+pub use grid::{GridDelegate, PrefetchedPage, TableTab, TableTabEvent};
 pub use icons::{FastgridAssets, Hugeicon, hugeicon};
 pub use launcher::{Launcher, LauncherEvent, Row, rows_from};
 pub use query_tab::{
     CompletionCatalog, PendingConfirmation, QueryTab, QueryTabEvent, ResultDelegate,
 };
+pub use recovery::{Recovery, RecoveryEvent, move_store_aside};
 pub use workspace::{
     TabContent, WorkspaceEvent, WorkspaceView, next_safe_mode, open_workspace_window,
     restore_query, safe_mode_label,

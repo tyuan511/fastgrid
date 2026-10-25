@@ -1105,3 +1105,64 @@ fn right_click_menu_sets_a_cell_to_null_and_reverts_it(cx: &mut TestAppContext) 
     assert_eq!(shown(cx, &f, 0, 1), Some(Value::Text("item 1".into())));
     assert_eq!(pending(cx, &f).total(), 0);
 }
+
+#[gpui_kit::test]
+fn the_prefetch_slot_serves_only_its_own_query_and_page(cx: &mut TestAppContext) {
+    let f = open(cx, &["id"]);
+    let (key, page) = cx
+        .update_window(f.window, |_, _, cx| {
+            f.view.update(cx, |v, _| {
+                let mut key = v.query().to_table_query();
+                key.offset = 0;
+                (key, v.query().page.number())
+            })
+        })
+        .unwrap();
+    let parked = fg_app::views::PrefetchedPage {
+        key: key.clone(),
+        page: page + 1,
+        columns: columns(),
+        rows: vec![vec![Value::Int(9), Value::Text("next".into())]],
+    };
+    cx.update_window(f.window, |_, _, cx| {
+        f.view.update(cx, |v, _| v.set_prefetch(parked));
+    })
+    .unwrap();
+    // The current page is not the prefetched one, and another query is not either.
+    let wrong_page = cx
+        .update_window(f.window, |_, _, cx| {
+            f.view.update(cx, |v, _| v.take_prefetch(&key, page))
+        })
+        .unwrap();
+    assert!(
+        wrong_page.is_none(),
+        "a stale slot is dropped, never served"
+    );
+    // Re-park, then take it for exactly the page it was fetched for.
+    cx.update_window(f.window, |_, _, cx| {
+        f.view.update(cx, |v, _| {
+            v.set_prefetch(fg_app::views::PrefetchedPage {
+                key: key.clone(),
+                page: page + 1,
+                columns: columns(),
+                rows: vec![vec![Value::Int(9), Value::Text("next".into())]],
+            });
+        });
+    })
+    .unwrap();
+    let served = cx
+        .update_window(f.window, |_, _, cx| {
+            f.view.update(cx, |v, _| v.take_prefetch(&key, page + 1))
+        })
+        .unwrap();
+    let served = served.expect("the prefetched page is served for its own page");
+    assert_eq!(served.rows.len(), 1);
+    assert_eq!(served.rows[0][1], Value::Text("next".into()));
+    // Taking twice serves nothing: the slot is consumed.
+    let again = cx
+        .update_window(f.window, |_, _, cx| {
+            f.view.update(cx, |v, _| v.take_prefetch(&key, page + 1))
+        })
+        .unwrap();
+    assert!(again.is_none());
+}

@@ -45,6 +45,18 @@ fn group_label(kind: ObjectKind) -> Option<&'static str> {
     GROUPS.iter().find(|(k, _)| *k == kind).map(|(_, l)| *l)
 }
 
+/// Matched character positions of `filter` in a header label, for highlighting. Empty when
+/// there is no filter or no match: a header is normally shown because its children match, not
+/// because its own name does, so a non-match must stay plain rather than invent a highlight.
+fn header_matched(filter: &str, label: &str) -> Vec<usize> {
+    if filter.is_empty() {
+        return Vec::new();
+    }
+    fuzzy_match(filter, label)
+        .map(|m| m.positions)
+        .unwrap_or_default()
+}
+
 /// Build the tree from what the service listed.
 ///
 /// With `show_namespaces` off (SQLite, or a single schema) the groups sit at the top level;
@@ -74,7 +86,7 @@ pub fn build_tree(
                 path: None,
                 count: Some(groups.iter().filter_map(|g| g.count).sum()),
                 row_estimate: None,
-                matched: Vec::new(),
+                matched: header_matched(filter, ns),
                 children: groups,
             });
         } else {
@@ -132,7 +144,7 @@ fn groups_for(ns: &str, list: &[ObjectInfo], filter: &str) -> Vec<TreeNode> {
             path: None,
             count: Some(children.len()),
             row_estimate: None,
-            matched: Vec::new(),
+            matched: header_matched(filter, label),
             children,
         });
     }
@@ -286,6 +298,25 @@ mod tests {
         assert_eq!(tree[0].children[0].matched, vec![0, 1, 2]);
         assert_eq!(tree[0].count, Some(2));
         assert!(build_tree(&ns, &objs, "zzz", false).is_empty());
+    }
+
+    #[test]
+    fn headers_highlight_their_own_match_and_stay_plain_otherwise() {
+        let (ns, objs) = sample();
+        // "es" matches the Tables header (e=4, s=5) and the Views header (e=2, s=4), as well
+        // as children under both, so both groups survive with their own highlights.
+        let tree = build_tree(&ns, &objs, "es", false);
+        assert_eq!(labels(&tree), ["Tables", "Views"]);
+        assert_eq!(tree[0].matched, vec![4, 5]);
+        assert_eq!(tree[1].matched, vec![2, 4]);
+        // "ord" matches children but neither header label, so headers stay plain.
+        let tree = build_tree(&ns, &objs, "ord", false);
+        assert_eq!(labels(&tree), ["Tables"]);
+        assert!(tree[0].matched.is_empty());
+        // Namespaces highlight the same way when they are a level.
+        let tree = build_tree(&ns, &objs, "ai", true);
+        assert_eq!(labels(&tree), ["main"]);
+        assert_eq!(tree[0].matched, vec![1, 2]);
     }
 
     #[test]

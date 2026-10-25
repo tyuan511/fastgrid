@@ -63,6 +63,8 @@ pub struct ConnectionDraft {
     /// Create the file if it does not exist (otherwise a typo'd path fails instead of making an
     /// empty database).
     pub create_if_missing: bool,
+    /// The group the connection belongs to, if any.
+    pub group_id: Option<fg_core::GroupId>,
 }
 
 impl ConnectionDraft {
@@ -74,6 +76,7 @@ impl ConnectionDraft {
             color: None,
             path: String::new(),
             create_if_missing: false,
+            group_id: None,
         }
     }
 
@@ -88,6 +91,7 @@ impl ConnectionDraft {
                 ConnectionParams::Network { .. } => String::new(),
             },
             create_if_missing: c.option_enabled("create"),
+            group_id: c.group_id.clone(),
         }
     }
 
@@ -130,6 +134,7 @@ impl ConnectionDraft {
         config.name = name;
         config.environment = self.environment;
         config.color = self.color;
+        config.group_id = self.group_id.clone();
         config.params = ConnectionParams::File {
             path: path.to_owned(),
         };
@@ -163,6 +168,17 @@ mod tests {
             path: path.into(),
             ..ConnectionDraft::blank()
         }
+    }
+
+    #[test]
+    fn the_group_survives_a_draft_round_trip() {
+        let mut c = draft("x", "/data/x.db").to_config(None).unwrap();
+        assert_eq!(c.group_id, None);
+        c.group_id = Some(fg_core::GroupId::from_string("g1"));
+        let back = ConnectionDraft::from_config(&c);
+        assert_eq!(back.group_id, c.group_id);
+        let saved = back.to_config(Some(&c)).unwrap();
+        assert_eq!(saved.group_id, c.group_id);
     }
 
     #[test]

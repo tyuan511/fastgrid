@@ -228,6 +228,18 @@ impl SettingGroup for McpSettings {
     const KEY: &'static str = "mcp";
 }
 
+/// Whether the first-launch keychain-backup banner has been dismissed. It is a setting, not
+/// session state, so a fresh install sees the guidance exactly once — until the user closes it.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct BackupNudge {
+    #[serde(default)]
+    pub dismissed: bool,
+}
+
+impl SettingGroup for BackupNudge {
+    const KEY: &'static str = "backup_nudge";
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct PrivacySettings {
     /// Off unless the user turns it on.

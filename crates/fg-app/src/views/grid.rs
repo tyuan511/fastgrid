@@ -11,8 +11,8 @@ use std::rc::Rc;
 use std::collections::{HashMap, HashSet};
 
 use fg_core::{
-    ColumnMeta, DbKind, Filter, FilterOp, ObjectPath, SafeMode, TableViewState, TypeCategory,
-    Value, dialect_for,
+    ColumnMeta, DbKind, Filter, FilterOp, ObjectPath, SafeMode, TableQuery, TableViewState,
+    TypeCategory, Value, dialect_for,
 };
 use fg_sql::{CellChange, RowChange, compile_changes};
 use gpui_kit::base::actions::{SelectNextColumn, SelectPrevColumn};
@@ -466,7 +466,6 @@ impl TableDelegate for GridDelegate {
                 // "select next / previous column"; taking those actions here, on the box, keeps the
                 // table from moving the selection out from under a pending edit.
                 .on_action(cx.listener(|this, _: &SelectNextColumn, _, cx| {
-                    eprintln!("DBG next action");
                     *this.delegate().pending_move.borrow_mut() = Some((1, 0));
                     cx.notify();
                 }))
@@ -545,6 +544,17 @@ pub enum TableTabEvent {
     CommitRequested,
 }
 
+/// One page fetched ahead of time, waiting for the user to step onto it. The key is the query
+/// without its offset, so a sort, filter or page-size change invalidates it instead of serving
+/// stale rows.
+#[derive(Debug, Clone)]
+pub struct PrefetchedPage {
+    pub key: TableQuery,
+    pub page: u64,
+    pub columns: Vec<ColumnMeta>,
+    pub rows: Vec<Vec<Value>>,
+}
+
 /// A selected row's full field details for the inspector panel.
 #[derive(Debug, Clone)]
 pub struct SelectedRowData {
@@ -610,6 +620,9 @@ pub struct TableTab {
     confirm_commit: bool,
     /// The connection's guard level, as the workspace last told this tab.
     safe_mode: SafeMode,
+    /// The page after the one on screen, fetched ahead by the controller. Served only when the
+    /// tab is still on the page before it under the same query; anything else is dropped.
+    prefetched: Option<PrefetchedPage>,
     _edit_subscription: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
 }
@@ -732,6 +745,7 @@ impl TableTab {
             cell_menu: None,
             confirm_commit: false,
             safe_mode: SafeMode::default(),
+            prefetched: None,
             _edit_subscription: None,
             _subscriptions: vec![observer, on_apply, on_table],
         }
@@ -2069,6 +2083,23 @@ impl TableTab {
             cx.notify();
         });
         cx.notify();
+    }
+
+    /// Hand over the prefetched page for `page` under `key`, if one is waiting. Anything else
+    /// (another query, another page) is stale and dropped, never served.
+    pub fn take_prefetch(&mut self, key: &TableQuery, page: u64) -> Option<PrefetchedPage> {
+        let prefetched = self.prefetched.take()?;
+        if prefetched.key == *key && prefetched.page == page {
+            Some(prefetched)
+        } else {
+            None
+        }
+    }
+
+    /// Park a page fetched ahead. It is only served when the tab is still on the page before
+    /// it under the same query; the controller checks that before storing.
+    pub fn set_prefetch(&mut self, page: PrefetchedPage) {
+        self.prefetched = Some(page);
     }
 
     pub fn fail(&mut self, generation: u64, message: String, cx: &mut Context<Self>) {

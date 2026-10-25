@@ -1790,11 +1790,17 @@ impl WorkspaceView {
 
                     if entry.is_folder() {
                         // Section header: `⌄ Tables`, in the list's own type like TablePlus.
+                        // Headers highlight their own match against the filter, same as objects;
+                        // a header shown only because its children match stays plain.
                         let chevron = if entry.is_expanded() {
                             Hugeicon::ArrowDown
                         } else {
                             Hugeicon::ArrowRight
                         };
+                        let matched = meta
+                            .get(&item.id)
+                            .map(|m| m.matched.clone())
+                            .unwrap_or_default();
                         return ListItem::new(ix).h(px(22.)).py_0().pl(indent).child(
                             h_flex()
                                 .gap_1()
@@ -1809,7 +1815,7 @@ impl WorkspaceView {
                                         .font_family(theme.mono_font_family.clone())
                                         .text_size(px(13.))
                                         .text_color(theme.foreground)
-                                        .child(item.label.clone()),
+                                        .child(highlighted(&item.label, &matched)),
                                 ),
                         );
                     }

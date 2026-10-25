@@ -6,7 +6,10 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use fg_app::views::{Launcher, LauncherEvent, Row, bind_keys};
-use fg_core::{ConnectionConfig, ConnectionId, ConnectionParams, DbKind, Environment, TagColor};
+use fg_core::{
+    ConnectionConfig, ConnectionGroup, ConnectionId, ConnectionParams, DbKind, Environment,
+    GroupId, TagColor,
+};
 use gpui_kit::test::TestWindowExt as _;
 // No `use gpui_kit::*`: it would import `gpui_kit::test`, which then shadows the built-in
 // `#[test]` that `#[gpui_kit::test]` expands to.
@@ -38,6 +41,7 @@ fn row(name: &str, readable: bool) -> Row {
         },
         environment: Environment::Development,
         tag: None,
+        group_id: None,
         config: readable.then_some(c),
     }
 }
@@ -587,4 +591,164 @@ fn window_drag_regions_exist_on_sidebar_and_top_bar(cx: &mut TestAppContext) {
     let f = open(cx, vec![]);
     assert!(exists(cx, &f, "launcher-sidebar"));
     assert!(exists(cx, &f, "launcher-top-bar"));
+}
+
+#[gpui_kit::test]
+fn the_backup_nudge_shows_until_dismissed(cx: &mut TestAppContext) {
+    let f = open(cx, vec![]);
+    assert!(!exists(cx, &f, "backup-nudge"), "hidden by default");
+    cx.update_window(f.window, |_, _, cx| {
+        f.view.update(cx, |v, cx| v.set_backup_nudge(true, cx));
+    })
+    .unwrap();
+    assert!(exists(cx, &f, "backup-nudge"));
+    click(cx, &f, "backup-nudge-dismiss");
+    assert!(
+        !exists(cx, &f, "backup-nudge"),
+        "dismiss hides it immediately"
+    );
+    assert!(
+        f.events
+            .borrow()
+            .iter()
+            .any(|e| matches!(e, fg_app::views::LauncherEvent::DismissBackupNudge)),
+        "dismissal is emitted so the controller can persist it"
+    );
+}
+
+fn grouped_fixture(cx: &mut TestAppContext) -> (Fixture, GroupId, GroupId, Vec<ConnectionId>) {
+    let g1 = GroupId::new();
+    let g2 = GroupId::new();
+    let mut a = row("alpha", true);
+    a.group_id = Some(g1.clone());
+    let mut b = row("beta", true);
+    b.group_id = Some(g1.clone());
+    let mut c = row("gamma", true);
+    c.group_id = Some(g2.clone());
+    let d = row("delta", true);
+    let ids = vec![a.id.clone(), b.id.clone(), c.id.clone(), d.id.clone()];
+    let f = open(cx, vec![a, b, c, d]);
+    let groups = vec![
+        ConnectionGroup {
+            name: "Work".into(),
+            id: g1.clone(),
+            ..ConnectionGroup::new("Work")
+        },
+        ConnectionGroup {
+            name: "Personal".into(),
+            id: g2.clone(),
+            ..ConnectionGroup::new("Personal")
+        },
+    ];
+    cx.update_window(f.window, |_, _, cx| {
+        f.view.update(cx, |v, cx| v.set_groups(groups, cx));
+    })
+    .unwrap();
+    (f, g1, g2, ids)
+}
+
+#[gpui_kit::test]
+fn groups_render_as_collapsible_sections(cx: &mut TestAppContext) {
+    let (f, g1, g2, ids) = grouped_fixture(cx);
+    assert!(exists(cx, &f, &format!("group-header-{g1}")));
+    assert!(exists(cx, &f, &format!("group-header-{g2}")));
+    assert!(exists(cx, &f, "group-header-ungrouped"));
+    let row_id = |i: usize| format!("connection-{}", ids[i]);
+    for i in 0..4 {
+        assert!(exists(cx, &f, &row_id(i)), "row {i} shown");
+    }
+    click(cx, &f, &format!("group-toggle-{g1}"));
+    assert!(!exists(cx, &f, &row_id(0)));
+    assert!(!exists(cx, &f, &row_id(1)));
+    assert!(exists(cx, &f, &row_id(2)));
+    assert!(exists(cx, &f, &row_id(3)));
+    click(cx, &f, &format!("group-toggle-{g1}"));
+    assert!(exists(cx, &f, &row_id(0)));
+    assert!(exists(cx, &f, &row_id(1)));
+}
+
+#[gpui_kit::test]
+fn search_ignores_collapsed_groups(cx: &mut TestAppContext) {
+    let (f, g1, _, ids) = grouped_fixture(cx);
+    click(cx, &f, &format!("group-toggle-{g1}"));
+    assert!(!exists(cx, &f, &format!("connection-{}", ids[0])));
+    cx.update_window(f.window, |_, window, cx| {
+        window.click("launcher-search", cx)
+    })
+    .unwrap();
+    type_text(cx, &f, "alpha");
+    assert!(
+        exists(cx, &f, &format!("connection-{}", ids[0])),
+        "search flattens collapsed groups"
+    );
+}
+
+#[gpui_kit::test]
+fn new_group_editor_emits_save_group(cx: &mut TestAppContext) {
+    let f = open(cx, vec![]);
+    click(cx, &f, "new-group");
+    assert!(exists(cx, &f, "group-editor"));
+    cx.update_window(f.window, |_, window, cx| {
+        window.click("group-editor-name", cx)
+    })
+    .unwrap();
+    type_text(cx, &f, "Work");
+    click(cx, &f, "group-editor-save");
+    assert!(!exists(cx, &f, "group-editor"), "save closes the form");
+    let saved = f.events.borrow().iter().find_map(|e| match e {
+        fg_app::views::LauncherEvent::SaveGroup(g) => Some(g.clone()),
+        _ => None,
+    });
+    let saved = saved.expect("a SaveGroup event");
+    assert_eq!(saved.name, "Work");
+}
+
+#[gpui_kit::test]
+fn rename_and_delete_group_need_their_own_steps(cx: &mut TestAppContext) {
+    let (f, g1, _, _) = grouped_fixture(cx);
+    click(cx, &f, &format!("group-rename-{g1}"));
+    assert!(exists(cx, &f, "group-editor"));
+    cx.update_window(f.window, |_, window, cx| {
+        window.click("group-editor-name", cx)
+    })
+    .unwrap();
+    press(cx, &f, "secondary-a");
+    type_text(cx, &f, "Projects");
+    click(cx, &f, "group-editor-save");
+    let renamed = f.events.borrow().iter().find_map(|e| match e {
+        fg_app::views::LauncherEvent::SaveGroup(g) => Some(g.clone()),
+        _ => None,
+    });
+    let renamed = renamed.expect("a SaveGroup event");
+    assert_eq!(renamed.id, g1, "rename keeps the id");
+    assert_eq!(renamed.name, "Projects");
+
+    // Delete is two-click: the first arms, the second emits.
+    click(cx, &f, &format!("group-delete-{g1}"));
+    assert!(
+        !f.events
+            .borrow()
+            .iter()
+            .any(|e| matches!(e, fg_app::views::LauncherEvent::DeleteGroup(_))),
+        "one click must not delete"
+    );
+    click(cx, &f, &format!("group-delete-{g1}"));
+    assert!(
+        f.events.borrow().iter().any(|e| matches!(
+            e,
+            fg_app::views::LauncherEvent::DeleteGroup(id) if *id == g1
+        )),
+        "second click deletes"
+    );
+}
+
+#[gpui_kit::test]
+fn the_connection_editor_offers_a_group_choice(cx: &mut TestAppContext) {
+    let (f, _, _, _) = grouped_fixture(cx);
+    click(cx, &f, "edit-selected");
+    assert!(exists(cx, &f, "connection-editor"));
+    assert!(
+        exists(cx, &f, "editor-group"),
+        "group assignment lives in the editor"
+    );
 }

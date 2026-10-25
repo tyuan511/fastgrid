@@ -50,7 +50,7 @@ pub use secret::{SecretKind, SecretRecord};
 pub use types::{ColumnMeta, ColumnOrigin, DataType, TypeCategory, TypeParams};
 pub use value::{LargeKind, Truncated, Value};
 pub use workspace::{
-    AppearanceSettings, EditorSettings, ExecSettings, GridSettings, KeybindingOverrides,
-    McpSettings, PrivacySettings, RowHeight, SettingGroup, TabKind, TabState, TableViewMode,
-    TableViewState, ThemeMode, WorkspaceState,
+    AppearanceSettings, BackupNudge, EditorSettings, ExecSettings, GridSettings,
+    KeybindingOverrides, McpSettings, PrivacySettings, RowHeight, SettingGroup, TabKind, TabState,
+    TableViewMode, TableViewState, ThemeMode, WorkspaceState,
 };

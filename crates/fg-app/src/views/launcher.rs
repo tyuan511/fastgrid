@@ -4,7 +4,12 @@
 //! ([`LauncherEvent`]); saving, deleting and opening happen in [`crate::controller`]. That split
 //! keeps the view testable with plain data, without a service or a database.
 
-use fg_core::{ConnectionConfig, ConnectionId, ConnectionParams, DbKind, Environment, TagColor};
+use std::collections::HashSet;
+
+use fg_core::{
+    ConnectionConfig, ConnectionGroup, ConnectionId, ConnectionParams, DbKind, Environment,
+    GroupId, TagColor,
+};
 use fg_store::StoredConnection;
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
@@ -26,6 +31,13 @@ use crate::model::{
     rank,
 };
 
+/// One entry of the rendered launcher list.
+pub enum ListItem<'a> {
+    Row(&'a Row),
+    GroupHeader(&'a ConnectionGroup, usize, bool),
+    UngroupedHeader(usize),
+}
+
 /// One line of the list.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {
@@ -35,6 +47,8 @@ pub struct Row {
     pub kind: DbKind,
     pub environment: Environment,
     pub tag: Option<TagColor>,
+    /// The group the connection belongs to, if any (mirrors `config.group_id` when readable).
+    pub group_id: Option<fg_core::GroupId>,
     /// The saved settings; `None` for a record from a newer version that this build cannot read
     /// (it can be listed and deleted, not edited or opened).
     pub config: Option<ConnectionConfig>,
@@ -57,6 +71,7 @@ pub fn rows_from(stored: Vec<StoredConnection>) -> Vec<Row> {
                 kind: c.kind,
                 environment: c.environment,
                 tag: c.color,
+                group_id: c.group_id.clone(),
                 config: Some(c),
             },
             StoredConnection::Unreadable { id, reason } => Row {
@@ -66,6 +81,7 @@ pub fn rows_from(stored: Vec<StoredConnection>) -> Vec<Row> {
                 kind: DbKind::Unknown,
                 environment: Environment::Unknown,
                 tag: None,
+                group_id: None,
                 config: None,
             },
         })
@@ -96,6 +112,12 @@ pub enum LauncherEvent {
     Save(Box<ConnectionConfig>),
     Delete(ConnectionId),
     CycleTheme,
+    /// The first-launch keychain-backup banner was closed; persist the dismissal.
+    DismissBackupNudge,
+    /// Save a new group, or rename an existing one (its id is kept).
+    SaveGroup(ConnectionGroup),
+    /// Delete a group; its connections move to the top level (done by the store).
+    DeleteGroup(GroupId),
 }
 
 type Choice = Entity<SelectState<SearchableVec<SharedString>>>;
@@ -108,19 +130,34 @@ struct Editor {
     path: Entity<InputState>,
     environment: Choice,
     color: Choice,
+    group: Choice,
+    /// The group ids in the same order as the group choice's items (after "No group").
+    group_ids: Vec<GroupId>,
     create_if_missing: bool,
     error: Option<SharedString>,
     selected_engine: DbKind,
 }
 
+/// The new-group / rename-group form. `id` is `None` for a new group.
+struct GroupEditor {
+    id: Option<GroupId>,
+    name: Entity<InputState>,
+    error: Option<SharedString>,
+}
+
 pub struct Launcher {
     rows: Vec<Row>,
+    groups: Vec<ConnectionGroup>,
+    collapsed: HashSet<GroupId>,
     selected: Option<ConnectionId>,
     message: Option<SharedString>,
     opening: Option<ConnectionId>,
     search: Entity<InputState>,
     editor: Option<Editor>,
+    group_editor: Option<GroupEditor>,
     confirm_delete: Option<ConnectionId>,
+    confirm_delete_group: Option<GroupId>,
+    show_backup_nudge: bool,
     focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
     dragging_window: bool,
@@ -163,12 +200,17 @@ impl Launcher {
         window.focus(&focus, cx);
         Self {
             rows: Vec::new(),
+            groups: Vec::new(),
+            collapsed: HashSet::new(),
             selected: None,
             message: None,
             opening: None,
             search,
             editor: None,
+            group_editor: None,
             confirm_delete: None,
+            confirm_delete_group: None,
+            show_backup_nudge: false,
             focus,
             _subscriptions: vec![on_search],
             dragging_window: false,
@@ -204,6 +246,39 @@ impl Launcher {
             .collect()
     }
 
+    /// One line of the rendered list: a connection row, or a group section header.
+    /// Headers carry their row count and collapsed state so the render step stays dumb.
+    pub fn list_items(&self, cx: &App) -> Vec<ListItem<'_>> {
+        let visible = self.visible_rows(cx);
+        let searching = !self.search.read(cx).value().trim().is_empty();
+        if searching || self.groups.is_empty() {
+            return visible.into_iter().map(ListItem::Row).collect();
+        }
+        let mut items = Vec::new();
+        for group in &self.groups {
+            let rows: Vec<&Row> = visible
+                .iter()
+                .copied()
+                .filter(|r| r.group_id.as_ref() == Some(&group.id))
+                .collect();
+            let collapsed = self.collapsed.contains(&group.id);
+            items.push(ListItem::GroupHeader(group, rows.len(), collapsed));
+            if !collapsed {
+                items.extend(rows.into_iter().map(ListItem::Row));
+            }
+        }
+        let ungrouped: Vec<&Row> = visible
+            .iter()
+            .copied()
+            .filter(|r| r.group_id.is_none())
+            .collect();
+        if !ungrouped.is_empty() {
+            items.push(ListItem::UngroupedHeader(ungrouped.len()));
+            items.extend(ungrouped.into_iter().map(ListItem::Row));
+        }
+        items
+    }
+
     /// Replace the list. The selection survives if the row still exists, else moves to the first.
     pub fn set_rows(&mut self, rows: Vec<Row>, cx: &mut Context<Self>) {
         let keep = self
@@ -230,6 +305,111 @@ impl Launcher {
 
     pub fn set_opening(&mut self, id: Option<ConnectionId>, cx: &mut Context<Self>) {
         self.opening = id;
+        cx.notify();
+    }
+
+    /// Show or hide the first-launch keychain-backup banner.
+    pub fn set_backup_nudge(&mut self, show: bool, cx: &mut Context<Self>) {
+        self.show_backup_nudge = show;
+        cx.notify();
+    }
+
+    pub fn backup_nudge_shown(&self) -> bool {
+        self.show_backup_nudge
+    }
+
+    // ---- groups -------------------------------------------------------------------------------
+
+    /// Replace the group list. Collapsed flags for groups that no longer exist are dropped.
+    pub fn set_groups(&mut self, groups: Vec<ConnectionGroup>, cx: &mut Context<Self>) {
+        let ids: HashSet<GroupId> = groups.iter().map(|g| g.id.clone()).collect();
+        self.collapsed.retain(|id| ids.contains(id));
+        self.groups = groups;
+        cx.notify();
+    }
+
+    pub fn toggle_group(&mut self, id: GroupId, cx: &mut Context<Self>) {
+        if !self.collapsed.remove(&id) {
+            self.collapsed.insert(id);
+        }
+        cx.notify();
+    }
+
+    /// Open the new-group form.
+    pub fn new_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let name = cx.new(|cx| InputState::new(window, cx).placeholder("Group name"));
+        self.group_editor = Some(GroupEditor {
+            id: None,
+            name,
+            error: None,
+        });
+        self.confirm_delete_group = None;
+        cx.notify();
+    }
+
+    /// Open the rename form for a group, prefilled with its current name.
+    pub fn rename_group(&mut self, id: GroupId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(group) = self.groups.iter().find(|g| g.id == id) else {
+            return;
+        };
+        let current = group.name.clone();
+        let name = cx.new(|cx| {
+            let mut s = InputState::new(window, cx).placeholder("Group name");
+            s.set_value(current, window, cx);
+            s
+        });
+        self.group_editor = Some(GroupEditor {
+            id: Some(id),
+            name,
+            error: None,
+        });
+        self.confirm_delete_group = None;
+        cx.notify();
+    }
+
+    fn cancel_group_editor(&mut self, cx: &mut Context<Self>) {
+        self.group_editor = None;
+        cx.notify();
+    }
+
+    /// Save the group form: a blank name is an inline error, not an event.
+    fn save_group_editor(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.group_editor.as_mut() else {
+            return;
+        };
+        let name = editor.name.read(cx).value().trim().to_string();
+        if name.is_empty() {
+            editor.error = Some("Give the group a name.".into());
+            cx.notify();
+            return;
+        }
+        let id = editor.id.clone();
+        self.group_editor = None;
+        let group = match id {
+            Some(id) => {
+                let mut g = self
+                    .groups
+                    .iter()
+                    .find(|g| g.id == id)
+                    .cloned()
+                    .unwrap_or_else(|| ConnectionGroup::new(name.clone()));
+                g.id = id;
+                g.name = name;
+                g
+            }
+            None => ConnectionGroup::new(name),
+        };
+        cx.emit(LauncherEvent::SaveGroup(group));
+        cx.notify();
+    }
+
+    fn ask_delete_group(&mut self, id: GroupId, cx: &mut Context<Self>) {
+        if self.confirm_delete_group.as_ref() == Some(&id) {
+            self.confirm_delete_group = None;
+            cx.emit(LauncherEvent::DeleteGroup(id));
+        } else {
+            self.confirm_delete_group = Some(id);
+        }
         cx.notify();
     }
 
@@ -331,6 +511,24 @@ impl Launcher {
             .unwrap_or(0);
         let environment = choice(envs, env_ix, window, cx);
         let color = choice(colors, color_ix, window, cx);
+        let no_group: SharedString = if is_chinese_locale() {
+            "不分组".into()
+        } else {
+            "No group".into()
+        };
+        let mut group_items = vec![no_group];
+        let mut group_ids = Vec::new();
+        for g in &self.groups {
+            group_items.push(g.name.clone().into());
+            group_ids.push(g.id.clone());
+        }
+        let group_ix = draft
+            .group_id
+            .as_ref()
+            .and_then(|id| group_ids.iter().position(|g| g == id))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let group = choice(group_items, group_ix, window, cx);
         let create_if_missing = draft.create_if_missing;
         let selected_engine = base.as_ref().map_or(DbKind::Sqlite, |c| c.kind);
         self.editor = Some(Editor {
@@ -340,6 +538,8 @@ impl Launcher {
             path,
             environment,
             color,
+            group,
+            group_ids,
             create_if_missing,
             error: None,
             selected_engine,
@@ -395,6 +595,13 @@ impl Launcher {
             .selected_value()
             .map(ToString::to_string);
         let color_name = e.color.read(cx).selected_value().map(ToString::to_string);
+        // Index 0 is "No group"; any other index maps back through the ids captured when the
+        // form opened, so two groups sharing a name still resolve to the right one.
+        let group_id = match e.group.read(cx).selected_index(cx) {
+            Some(p) if p.row > 0 => e.group_ids.get(p.row - 1).cloned(),
+            Some(_) => None,
+            None => e.draft.group_id.clone(),
+        };
         Some(ConnectionDraft {
             id: e.draft.id.clone(),
             name: e.name.read(cx).value().to_string(),
@@ -404,6 +611,7 @@ impl Launcher {
             color: color_name.as_deref().and_then(color_from_label),
             path: e.path.read(cx).value().to_string(),
             create_if_missing: e.create_if_missing,
+            group_id,
         })
     }
 
@@ -557,192 +765,259 @@ fn with_window_drag<E: InteractiveElement>(element: E, cx: &Context<Launcher>) -
 impl Render for Launcher {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let visible: Vec<Row> = self.visible_rows(cx).into_iter().cloned().collect();
+        let items = self.list_items(cx);
         let is_zh = is_chinese_locale();
         let entity = cx.entity().clone();
-        let rows: Vec<AnyElement> = visible
+        let rows: Vec<AnyElement> = items
             .iter()
-            .map(|row| {
-                let selected = self.selected.as_ref() == Some(&row.id);
-                let opening = self.opening.as_ref() == Some(&row.id);
-                let dot = environment_color(cx, row.environment, row.tag);
-                let (select_id, open_id) = (row.id.clone(), row.id.clone());
-                let readable = row.readable();
+            .map(|item| match item {
+                ListItem::Row(row) => {
+                    let selected = self.selected.as_ref() == Some(&row.id);
+                    let opening = self.opening.as_ref() == Some(&row.id);
+                    let dot = environment_color(cx, row.environment, row.tag);
+                    let (select_id, open_id) = (row.id.clone(), row.id.clone());
+                    let readable = row.readable();
 
-                let (badge_text, badge_color) = match row.kind {
-                    DbKind::Postgres => ("Pg", hsla(205.0 / 360.0, 0.90, 0.48, 1.0)),
-                    DbKind::MySql => ("Ms", hsla(28.0 / 360.0, 0.95, 0.52, 1.0)),
-                    DbKind::Sqlite => ("Sl", hsla(262.0 / 360.0, 0.83, 0.58, 1.0)),
-                    _ => ("Db", theme.muted_foreground),
-                };
+                    let (badge_text, badge_color) = match row.kind {
+                        DbKind::Postgres => ("Pg", hsla(205.0 / 360.0, 0.90, 0.48, 1.0)),
+                        DbKind::MySql => ("Ms", hsla(28.0 / 360.0, 0.95, 0.52, 1.0)),
+                        DbKind::Sqlite => ("Sl", hsla(262.0 / 360.0, 0.83, 0.58, 1.0)),
+                        _ => ("Db", theme.muted_foreground),
+                    };
 
-                let env_label = match row.environment {
-                    Environment::Development => "local",
-                    Environment::Staging => "staging",
-                    Environment::Production => "production",
-                    _ => "env",
-                };
-                let (env_bg, env_fg) = match row.environment {
-                    Environment::Development => (
-                        hsla(142.0 / 360.0, 0.70, 0.90, 0.9),
-                        hsla(142.0 / 360.0, 0.75, 0.30, 1.0),
-                    ),
-                    Environment::Staging => (
-                        hsla(38.0 / 360.0, 0.90, 0.88, 0.9),
-                        hsla(38.0 / 360.0, 0.90, 0.32, 1.0),
-                    ),
-                    Environment::Production => (
-                        hsla(0.0 / 360.0, 0.80, 0.90, 0.9),
-                        hsla(0.0 / 360.0, 0.80, 0.38, 1.0),
-                    ),
-                    _ => (theme.muted.opacity(0.8), theme.muted_foreground),
-                };
+                    let env_label = match row.environment {
+                        Environment::Development => "local",
+                        Environment::Staging => "staging",
+                        Environment::Production => "production",
+                        _ => "env",
+                    };
+                    let (env_bg, env_fg) = match row.environment {
+                        Environment::Development => (
+                            hsla(142.0 / 360.0, 0.70, 0.90, 0.9),
+                            hsla(142.0 / 360.0, 0.75, 0.30, 1.0),
+                        ),
+                        Environment::Staging => (
+                            hsla(38.0 / 360.0, 0.90, 0.88, 0.9),
+                            hsla(38.0 / 360.0, 0.90, 0.32, 1.0),
+                        ),
+                        Environment::Production => (
+                            hsla(0.0 / 360.0, 0.80, 0.90, 0.9),
+                            hsla(0.0 / 360.0, 0.80, 0.38, 1.0),
+                        ),
+                        _ => (theme.muted.opacity(0.8), theme.muted_foreground),
+                    };
 
-                let launcher = entity.clone();
-                let menu_row_id = row.id.clone();
-                let can_open_row = readable && !opening && self.editor.is_none();
+                    let launcher = entity.clone();
+                    let menu_row_id = row.id.clone();
+                    let can_open_row = readable && !opening && self.editor.is_none();
 
-                let menu_builder = {
-                    let launcher = launcher.clone();
-                    let menu_row_id = menu_row_id.clone();
-                    move |menu: PopupMenu, _: &mut Window, menu_cx: &mut Context<PopupMenu>| {
-                        launcher.update(menu_cx, |this, cx| {
-                            this.select(menu_row_id.clone(), cx);
-                        });
+                    let menu_builder = {
+                        let launcher = launcher.clone();
+                        let menu_row_id = menu_row_id.clone();
+                        move |menu: PopupMenu, _: &mut Window, menu_cx: &mut Context<PopupMenu>| {
+                            launcher.update(menu_cx, |this, cx| {
+                                this.select(menu_row_id.clone(), cx);
+                            });
 
-                        let l_open = launcher.clone();
-                        let l_edit = launcher.clone();
-                        let l_dup = launcher.clone();
-                        let l_del = launcher.clone();
+                            let l_open = launcher.clone();
+                            let l_edit = launcher.clone();
+                            let l_dup = launcher.clone();
+                            let l_del = launcher.clone();
 
-                        menu.item(
-                            PopupMenuItem::new(if is_zh { "连接" } else { "Connect" })
-                                .icon(hugeicon(Hugeicon::Plug))
-                                .disabled(!can_open_row)
-                                .on_click(move |_, _, cx| {
-                                    l_open.update(cx, |this, cx| this.open_selected(cx));
-                                }),
-                        )
-                        .separator()
-                        .item(
-                            PopupMenuItem::new(if is_zh { "编辑…" } else { "Edit…" })
-                                .icon(hugeicon(Hugeicon::Edit))
-                                .disabled(!readable)
-                                .on_click(move |_, window, cx| {
-                                    l_edit.update(cx, |this, cx| this.edit_selected(window, cx));
-                                }),
-                        )
-                        .item(
-                            PopupMenuItem::new(if is_zh { "复制" } else { "Duplicate" })
-                                .icon(hugeicon(Hugeicon::Copy))
-                                .disabled(!readable)
-                                .on_click(move |_, _, cx| {
-                                    l_dup.update(cx, |this, cx| this.duplicate_selected(cx));
-                                }),
-                        )
-                        .separator()
-                        .item(
-                            PopupMenuItem::new(if is_zh { "删除" } else { "Delete" })
-                                .icon(hugeicon(Hugeicon::Trash))
-                                .on_click(move |_, _, cx| {
-                                    l_del.update(cx, |this, cx| this.ask_delete(cx));
-                                }),
-                        )
-                    }
-                };
-
-                h_flex()
-                    .id(SharedString::from(format!("connection-{}", row.id)))
-                    .test_support()
-                    .role(Role::ListItem)
-                    .aria_label(row.name.clone())
-                    .aria_selected(selected)
-                    .gap_3()
-                    .px_3()
-                    .py_2()
-                    .items_center()
-                    .rounded_lg()
-                    .cursor_pointer()
-                    .when(selected, |d| d.bg(theme.list_active))
-                    .hover(|d| d.bg(theme.list_hover))
-                    .child(
-                        div()
-                            .size_9()
-                            .rounded_full()
-                            .bg(badge_color)
-                            .text_color(gpui::white())
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .font_weight(FontWeight::BOLD)
-                            .text_sm()
-                            .child(badge_text),
-                    )
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .gap_0p5()
-                            .child(
-                                h_flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .child(row.name.clone()),
-                                    )
-                                    .child(
-                                        div()
-                                            .px_2()
-                                            .py(px(0.5))
-                                            .rounded_full()
-                                            .bg(if theme.is_dark() {
-                                                env_fg.opacity(0.2)
-                                            } else {
-                                                env_bg
-                                            })
-                                            .text_color(if theme.is_dark() {
-                                                env_fg.opacity(0.9)
-                                            } else {
-                                                env_fg
-                                            })
-                                            .text_size(px(11.))
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .child(env_label),
-                                    ),
+                            menu.item(
+                                PopupMenuItem::new(if is_zh { "连接" } else { "Connect" })
+                                    .icon(hugeicon(Hugeicon::Plug))
+                                    .disabled(!can_open_row)
+                                    .on_click(move |_, _, cx| {
+                                        l_open.update(cx, |this, cx| this.open_selected(cx));
+                                    }),
                             )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child(row.detail.clone()),
-                            ),
-                    )
-                    .child(h_flex().gap_2().items_center().child(if opening {
-                        div()
-                            .text_xs()
-                            .text_color(theme.info)
-                            .child(if is_zh {
-                                "连接中…"
-                            } else {
-                                "Connecting…"
-                            })
-                            .into_any_element()
-                    } else if row.tag.is_some() {
-                        div().size_2p5().rounded_full().bg(dot).into_any_element()
-                    } else {
-                        div().into_any_element()
-                    }))
-                    .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                        this.select(select_id.clone(), cx);
-                        if event.click_count() >= 2 && readable {
-                            this.open_selected(cx);
+                            .separator()
+                            .item(
+                                PopupMenuItem::new(if is_zh { "编辑…" } else { "Edit…" })
+                                    .icon(hugeicon(Hugeicon::Edit))
+                                    .disabled(!readable)
+                                    .on_click(move |_, window, cx| {
+                                        l_edit
+                                            .update(cx, |this, cx| this.edit_selected(window, cx));
+                                    }),
+                            )
+                            .item(
+                                PopupMenuItem::new(if is_zh { "复制" } else { "Duplicate" })
+                                    .icon(hugeicon(Hugeicon::Copy))
+                                    .disabled(!readable)
+                                    .on_click(move |_, _, cx| {
+                                        l_dup.update(cx, |this, cx| this.duplicate_selected(cx));
+                                    }),
+                            )
+                            .separator()
+                            .item(
+                                PopupMenuItem::new(if is_zh { "删除" } else { "Delete" })
+                                    .icon(hugeicon(Hugeicon::Trash))
+                                    .on_click(move |_, _, cx| {
+                                        l_del.update(cx, |this, cx| this.ask_delete(cx));
+                                    }),
+                            )
                         }
-                        let _ = &open_id;
-                    }))
-                    .context_menu(menu_builder)
-                    .into_any_element()
+                    };
+
+                    h_flex()
+                        .id(SharedString::from(format!("connection-{}", row.id)))
+                        .test_support()
+                        .role(Role::ListItem)
+                        .aria_label(row.name.clone())
+                        .aria_selected(selected)
+                        .gap_3()
+                        .px_3()
+                        .py_2()
+                        .items_center()
+                        .rounded_lg()
+                        .cursor_pointer()
+                        .when(selected, |d| d.bg(theme.list_active))
+                        .hover(|d| d.bg(theme.list_hover))
+                        .child(
+                            div()
+                                .size_9()
+                                .rounded_full()
+                                .bg(badge_color)
+                                .text_color(gpui::white())
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .font_weight(FontWeight::BOLD)
+                                .text_sm()
+                                .child(badge_text),
+                        )
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .gap_0p5()
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .child(row.name.clone()),
+                                        )
+                                        .child(
+                                            div()
+                                                .px_2()
+                                                .py(px(0.5))
+                                                .rounded_full()
+                                                .bg(if theme.is_dark() {
+                                                    env_fg.opacity(0.2)
+                                                } else {
+                                                    env_bg
+                                                })
+                                                .text_color(if theme.is_dark() {
+                                                    env_fg.opacity(0.9)
+                                                } else {
+                                                    env_fg
+                                                })
+                                                .text_size(px(11.))
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .child(env_label),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child(row.detail.clone()),
+                                ),
+                        )
+                        .child(h_flex().gap_2().items_center().child(if opening {
+                            div()
+                                .text_xs()
+                                .text_color(theme.info)
+                                .child(if is_zh {
+                                    "连接中…"
+                                } else {
+                                    "Connecting…"
+                                })
+                                .into_any_element()
+                        } else if row.tag.is_some() {
+                            div().size_2p5().rounded_full().bg(dot).into_any_element()
+                        } else {
+                            div().into_any_element()
+                        }))
+                        .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                            this.select(select_id.clone(), cx);
+                            if event.click_count() >= 2 && readable {
+                                this.open_selected(cx);
+                            }
+                            let _ = &open_id;
+                        }))
+                        .context_menu(menu_builder)
+                        .into_any_element()
+                }
+                ListItem::GroupHeader(group, count, collapsed) => {
+                    let toggle_id = group.id.clone();
+                    let rename_id = group.id.clone();
+                    let delete_id = group.id.clone();
+                    let arming = self.confirm_delete_group.as_ref() == Some(&group.id);
+                    let toggle_label = format!(
+                        "{} {} ({})",
+                        if *collapsed { "▸" } else { "▾" },
+                        group.name,
+                        count
+                    );
+                    h_flex()
+                        .id(SharedString::from(format!("group-header-{}", group.id)))
+                        .test_support()
+                        .items_center()
+                        .gap_2()
+                        .p_1()
+                        .child(
+                            Button::new(SharedString::from(format!("group-toggle-{}", group.id)))
+                                .label(toggle_label)
+                                .ghost()
+                                .small()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.toggle_group(toggle_id.clone(), cx);
+                                })),
+                        )
+                        .child(div().flex_1())
+                        .child(
+                            Button::new(SharedString::from(format!("group-rename-{}", group.id)))
+                                .label(if is_zh { "重命名" } else { "Rename" })
+                                .ghost()
+                                .small()
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.rename_group(rename_id.clone(), window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!("group-delete-{}", group.id)))
+                                .label(if arming {
+                                    if is_zh { "确认删除？" } else { "Delete?" }
+                                } else if is_zh {
+                                    "删除"
+                                } else {
+                                    "Delete"
+                                })
+                                .ghost()
+                                .small()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.ask_delete_group(delete_id.clone(), cx);
+                                })),
+                        )
+                        .into_any_element()
+                }
+                ListItem::UngroupedHeader(count) => div()
+                    .id("group-header-ungrouped")
+                    .test_support()
+                    .p_1()
+                    .text_color(theme.muted_foreground)
+                    .child(if is_zh {
+                        format!("未分组 ({count})")
+                    } else {
+                        format!("Ungrouped ({count})")
+                    })
+                    .into_any_element(),
             })
             .collect();
 
@@ -897,12 +1172,17 @@ impl Render for Launcher {
                                         },
                                     )),
                                 )
-                                .child(tableplus_circle_button(
-                                    "new-group",
-                                    hugeicon(Hugeicon::FolderPlus),
-                                    if is_zh { "新建分组" } else { "New Group" },
-                                    cx,
-                                )),
+                                .child(
+                                    tableplus_circle_button(
+                                        "new-group",
+                                        hugeicon(Hugeicon::FolderPlus),
+                                        if is_zh { "新建分组" } else { "New Group" },
+                                        cx,
+                                    )
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.new_group(window, cx);
+                                    })),
+                                ),
                         )
                         .child(
                             div()
@@ -918,6 +1198,46 @@ impl Render for Launcher {
                                 ),
                         ),
                     )
+                    .when(self.show_backup_nudge, |d| {
+                        d.child(
+                            h_flex()
+                                .id("backup-nudge")
+                                .test_support()
+                                .items_center()
+                                .justify_between()
+                                .gap_2()
+                                .p_2()
+                                // The launcher column sizes to its content, so an unwrapped
+                                // notice would push its button past the window edge; cap the
+                                // strip and let the text wrap inside it.
+                                .max_w(px(560.))
+                                .rounded(px(6.))
+                                .bg(theme.warning.opacity(0.12))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .max_w(px(440.))
+                                        .text_size(px(13.))
+                                        .child(if is_zh {
+                                            "你的连接和密码用系统钥匙串里的设备密钥加密。钥匙串一旦丢失或重置（比如重装系统），这些数据就再也打不开了——请把系统钥匙串纳入备份，或记下连接信息以备恢复。"
+                                        } else {
+                                            "Your connections and passwords are encrypted with a device key in the system keychain. If that keychain is ever lost or reset (for example by reinstalling the system), this data cannot be opened again — keep your system keychain backed up, or note down your connection details for recovery."
+                                        }),
+                                )
+                                .child(
+                                    Button::new("backup-nudge-dismiss")
+                                        .label(if is_zh { "知道了" } else { "Got it" })
+                                        .ghost()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            // Hide at once; the controller persists the
+                                            // dismissal from the emitted event.
+                                            this.set_backup_nudge(false, cx);
+                                            cx.emit(LauncherEvent::DismissBackupNudge);
+                                        })),
+                                ),
+                        )
+                    })
+                    .when_some(self.render_group_editor(cx), |d, editor| d.child(editor))
                     .child(
                         // Headless test-support action triggers.
                         // Visual operations are right-click only (matching TablePlus).
@@ -1070,6 +1390,73 @@ impl Render for Launcher {
 }
 
 impl Launcher {
+    fn render_group_editor(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let e = self.group_editor.as_ref()?;
+        let theme = cx.theme().clone();
+        let is_zh = is_chinese_locale();
+        let title = if e.id.is_some() {
+            if is_zh {
+                "重命名分组"
+            } else {
+                "Rename group"
+            }
+        } else if is_zh {
+            "新建分组"
+        } else {
+            "New group"
+        };
+        Some(
+            v_flex()
+                .id("group-editor")
+                .test_support()
+                .gap_2()
+                .p_2()
+                .rounded(px(6.))
+                .border_1()
+                .border_color(theme.border)
+                .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
+                .child(
+                    Input::new(&e.name)
+                        .id("group-editor-name")
+                        .into_any_element(),
+                )
+                .when_some(e.error.clone(), |d, message| {
+                    d.child(
+                        div()
+                            .id("group-editor-error")
+                            .test_support()
+                            .aria_label(message.clone())
+                            .text_color(theme.danger)
+                            .child(message),
+                    )
+                })
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .justify_end()
+                        .child(
+                            Button::new("group-editor-cancel")
+                                .label(if is_zh { "取消" } else { "Cancel" })
+                                .ghost()
+                                .small()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.cancel_group_editor(cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("group-editor-save")
+                                .label(if is_zh { "保存" } else { "Save" })
+                                .primary()
+                                .small()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.save_group_editor(cx);
+                                })),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_editor(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let e = self.editor.as_ref()?;
         let theme = cx.theme().clone();
@@ -1255,6 +1642,14 @@ impl Launcher {
                                     Select::new(&e.color).id("editor-color").into_any_element(),
                                 ))),
                         )
+                        .child(field(
+                            if is_zh {
+                                "分组".into()
+                            } else {
+                                "Group".into()
+                            },
+                            Select::new(&e.group).id("editor-group").into_any_element(),
+                        ))
                         .child(
                             Checkbox::new("editor-create")
                                 .label(if is_zh {
