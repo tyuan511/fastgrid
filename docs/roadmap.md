@@ -130,7 +130,7 @@
 无界面，已落地：
 
 - [x] 执行策略：`plan(sql, kind, safe_mode)` 给出每条语句的分类、危险原因、是否需要确认，以及原文中的字节偏移。`OpenConnection::run` 在租会话前拒绝。每次尝试恰好一行历史（`Ok` / `Error` / `Cancelled` / `NotRun`）。非编辑器调用另写一行审计，身份是传入的 client id，不是固定标签。`RunOptions` 只能通过 `gui` / `gui_confirmed`（绑定该脚本的摘要）/ `agent(client)` 构造。
-- [x] L1 拒绝逻辑：Alert 对危险语句要求确认；Strict 对每个可能写入的语句要求确认。只读（含未知安全模式）拒绝写，确认不能覆盖。`execute` 走同一分类且没有确认通道。`SafeMode::Strict` 的口令再认证**没有实现**。
+- [x] L1 拒绝逻辑：Alert 对危险语句要求确认；Strict 对每个可能写入的语句要求确认。只读（含未知安全模式）拒绝写，确认不能覆盖。`execute` 走同一分类且没有确认通道。`SafeMode::Strict` 的口令再认证已实现（编辑器运行确认框：存有连接密码时要求输入并由服务验证；无存密码的连接仍为点击确认）。
 - [x] 历史与审计落盘，以及 `Service` 上的 history / audit / documents / snippets、`exec_settings` / `set_exec_settings`、`drain_records`。审计拒绝重复 `AuditId`（含墓碑）。安全相关设置走严格读取，普通设置仍宽松。
 - [x] `max_rows` 与语句超时在 `fg-service::run` 强制：`ExecSettings`、单次选项、连接 `timeouts.statement_secs`（仅超时）取最严；设置不能读或不能解密反序列化时失败关闭。截断会标出。SQLite 由服务按语句计时。
 
@@ -320,7 +320,7 @@
 - 安全测试集：试图绕过只读（多语句、注释、CTE 写入、`SELECT ... INTO`、存储过程）全部被拒绝（`fg-mcp/tests/safety.rs`：9 条绕过 + `execute_write` 全拒，表内 100 行完好，拒绝行与审计一一对应）
 - 写入未经 GUI 确认时一定失败；审计日志与实际执行一一对应（`fg-service/tests/mcp_policy.rs` 8/8：无开关、无监听、批准、拒绝、只读前置、行数上限合并、未知 id、待批列表）
 - [~] 用 Claude Desktop / Cursor / Claude Code 分别完成一次端到端演示：**未竟**——本机 Linux VM 上没有这三个客户端；官方 TS SDK（`@modelcontextprotocol/sdk` 1.32.2，同一协议）已对 stdio 与 HTTP 双路跑通（10 工具、资源读写、写入拒绝原因各就其位、100 行完好），留待有客户端的机器补最后一步
-- [~] 诚实缺口：GUI 审批面板与审计面板、launcher MCP 面板均有视图测试但未经真人视觉验证；HTTP 服务器无 SSE（规范允许纯 JSON 响应）；`SafeMode::Strict` 的密码重认证仍未实现（仍是更强的确认门，不是重认证）
+- [~] 诚实缺口：GUI 审批面板与审计面板、launcher MCP 面板均有视图测试但未经真人视觉验证；HTTP 服务器无 SSE（规范允许纯 JSON 响应）；`SafeMode::Strict` 的密码重认证已实现（编辑器运行路径），网格批量提交确认条与 MCP 审批仍只确认、不要求密码（后续项）
 
 ---
 

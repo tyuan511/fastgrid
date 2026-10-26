@@ -58,10 +58,16 @@ pub enum SafeMode {
     Alert,
     /// Level 2: confirm every statement that may write.
     ///
-    /// Password re-authentication before any write is the intended policy and is not
-    /// implemented yet. Until it is, this mode is strictly stronger than [`SafeMode::Alert`]:
-    /// every statement whose class may write needs confirmation, not only dangerous ones.
-    /// A read-only connection is still stricter, because confirmation cannot authorize a write.
+    /// Password re-authentication before a write is part of this mode for
+    /// editor runs confirmed through the GUI: when a password is stored for
+    /// the connection, the confirmation prompt asks for it and the service
+    /// verifies it before the run proceeds. Connections with no stored
+    /// password keep a plain click confirmation, and grid staged commits
+    /// and agent approvals have their own confirmation paths that do not
+    /// ask for a password yet. This mode is strictly stronger than
+    /// [`SafeMode::Alert`]: every statement whose class may write needs
+    /// confirmation, not only dangerous ones. A read-only connection is
+    /// still stricter, because confirmation cannot authorize a write.
     Strict,
     /// No writes at all.
     ReadOnly,

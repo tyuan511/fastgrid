@@ -60,7 +60,9 @@ The multi-database contracts (Driver / Session / Dialect / Capabilities) are des
     `exec`), and, for the timeout only, the connection's `timeouts.statement_secs`. A caller
     cannot raise a stored cap. If those settings cannot be read or decrypted into `ExecSettings`,
     the call fails closed instead of falling open to the default cap. `SafeMode::Strict` confirms
-    every statement that may write; password re-authentication is not implemented.
+    every statement that may write; password re-authentication applies to editor runs confirmed
+    through the GUI when a connection password is stored (grid batch commits and agent approvals
+    still confirm without a password).
 11. **Recording survives a dropped stream.** History and audit go through one process-lifetime
     writer thread (`fastgrid-record`). Dropping a stream only notifies that thread; it does not
     spawn, and it does not need the tokio runtime to still be alive, so a shutting-down runtime

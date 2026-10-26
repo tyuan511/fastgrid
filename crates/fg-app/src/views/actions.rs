@@ -34,6 +34,15 @@ gpui_kit::actions!(
         CloseTab,
         NextTab,
         PrevTab,
+        ActivateTab1,
+        ActivateTab2,
+        ActivateTab3,
+        ActivateTab4,
+        ActivateTab5,
+        ActivateTab6,
+        ActivateTab7,
+        ActivateTab8,
+        ActivateTab9,
         ToggleSidebar,
         ToggleFilters,
         ToggleAudit,
@@ -112,6 +121,44 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-[", PrevTab, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("ctrl-tab", NextTab, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("ctrl-shift-tab", PrevTab, Some(WORKSPACE_CONTEXT)),
+        // Jump to tabs 1-9 (docs/shortcuts.md). macOS uses `⌘digit`; on
+        // Windows/Linux the documented key is `Alt+digit`.
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("secondary-1", ActivateTab1, Some(WORKSPACE_CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("secondary-2", ActivateTab2, Some(WORKSPACE_CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("secondary-3", ActivateTab3, Some(WORKSPACE_CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("secondary-4", ActivateTab4, Some(WORKSPACE_CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("secondary-5", ActivateTab5, Some(WORKSPACE_CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("secondary-6", ActivateTab6, Some(WORKSPACE_CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("secondary-7", ActivateTab7, Some(WORKSPACE_CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("secondary-8", ActivateTab8, Some(WORKSPACE_CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("secondary-9", ActivateTab9, Some(WORKSPACE_CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("alt-1", ActivateTab1, Some(WORKSPACE_CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("alt-2", ActivateTab2, Some(WORKSPACE_CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("alt-3", ActivateTab3, Some(WORKSPACE_CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("alt-4", ActivateTab4, Some(WORKSPACE_CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("alt-5", ActivateTab5, Some(WORKSPACE_CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("alt-6", ActivateTab6, Some(WORKSPACE_CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("alt-7", ActivateTab7, Some(WORKSPACE_CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("alt-8", ActivateTab8, Some(WORKSPACE_CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("alt-9", ActivateTab9, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("secondary-f", ToggleFilters, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("secondary-c", CopySelection, Some(GRID_CONTEXT)),
         // Staged edits (docs/shortcuts.md, "数据网格"). `⌘Z` inside the cell editor is the input's

@@ -95,8 +95,9 @@ impl RunOptions {
     /// Editor run after a person confirmed this exact script.
     ///
     /// The digest is of the script text and its planned statements. Passing the options to `run`
-    /// with different SQL is refused. Password re-authentication is not part of this value; strict
-    /// mode still only has confirmation until that exists.
+    /// with different SQL is refused. Password re-authentication is not part of this value: the
+    /// controller verifies the password before building these options, so by the time a confirmed
+    /// run is constructed the password step has already passed.
     pub fn gui_confirmed(sql: &str, kind: DbKind) -> Self {
         Self {
             kind: RunKind::Gui {
@@ -189,7 +190,8 @@ pub enum PolicyRefusal {
         class: StatementClass,
     },
     /// Alert (dangerous only) or strict (every write). A confirmed re-run of the same script may
-    /// proceed. Password re-authentication is not implemented yet.
+    /// proceed. In Strict mode the GUI additionally asks for the connection password before that
+    /// re-run when one is stored.
     NeedsConfirmation {
         statement: usize,
         class: StatementClass,

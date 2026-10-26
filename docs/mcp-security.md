@@ -83,10 +83,10 @@ behind a generic `"mcp"` label. A refusal on `execute` writes history only, not 
 has no agent identity). Audit insert rejects a duplicate id, including a tombstone, so a replay
 cannot overwrite the row.
 
-`SafeMode::Strict` means confirm every statement that may write. Password re-authentication is
-the intended policy and is **not implemented**. Until it is, Strict is a stronger confirmation
-gate than Alert, not a re-auth. Read-only is still stricter, because confirmation cannot
-authorize a write.
+`SafeMode::Strict` means confirm every statement that may write. Password re-authentication
+applies to editor runs confirmed through the GUI when a connection password is stored; agent
+approvals still go through the plain GUI approval gate without a password step. Read-only is
+still stricter, because confirmation cannot authorize a write.
 
 ## The stdio transport (M2.5)
 
@@ -213,7 +213,8 @@ approve with). The table still held all 100 rows afterwards.
   valid JSON, with a `truncated` flag when it is cut. Hidden connections are indistinguishable
   from missing ones here too.
 
-Still not shipped: `SafeMode::Strict` password re-authentication (Strict is a stronger
-confirmation gate, not a re-auth), and end-to-end demos against Claude Desktop / Cursor /
+Still not shipped: password re-authentication for agent approvals and grid batch commits
+(editor runs in Strict mode already ask for the connection password when one is stored), and
+end-to-end demos against Claude Desktop / Cursor /
 Claude Code themselves (no such client exists on the Linux VM where this was checked; the
 official TypeScript SDK speaks the same protocol — see below).

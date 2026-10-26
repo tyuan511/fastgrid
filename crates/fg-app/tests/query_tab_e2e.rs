@@ -67,7 +67,14 @@ struct App {
 }
 
 /// Open a workspace window on a seeded database under the given safe mode.
-fn start(cx: &mut TestAppContext, env: &Env, safe_mode: SafeMode) -> (Service, App) {
+/// `password`, when given, is stored on the connection (for Strict-mode
+/// re-authentication tests); the second save keeps it.
+fn start(
+    cx: &mut TestAppContext,
+    env: &Env,
+    safe_mode: SafeMode,
+    password: Option<&str>,
+) -> (Service, App) {
     cx.executor().allow_parking();
     cx.update(|cx| {
         gpui_kit::init(cx);
@@ -96,7 +103,12 @@ fn start(cx: &mut TestAppContext, env: &Env, safe_mode: SafeMode) -> (Service, A
         let mut permissive = config.clone();
         permissive.safe_mode = Some(SafeMode::Normal);
         let saved = svc
-            .save_connection(permissive, PasswordUpdate::Keep)
+            .save_connection(
+                permissive,
+                password
+                    .map(|p| PasswordUpdate::Set(p.to_owned()))
+                    .unwrap_or(PasswordUpdate::Keep),
+            )
             .await
             .unwrap();
         let conn = svc.open(&saved.id).await.unwrap();
@@ -167,6 +179,16 @@ fn click(cx: &mut TestAppContext, app: &App, id: &'static str) {
     .unwrap();
 }
 
+/// Focus the input behind `id` and type into it.
+fn type_into(cx: &mut TestAppContext, app: &App, id: &'static str, text: &str) {
+    cx.update_window(app.window, |_, window, cx| {
+        window.click(id, cx);
+        window.input(text, cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+}
+
 fn result_label(cx: &mut TestAppContext, app: &App, index: usize) -> String {
     cx.update_window(app.window, |_, window, _| {
         window
@@ -205,7 +227,7 @@ fn run_and_wait(cx: &mut TestAppContext, service: &Service, app: &App) {
 #[gpui_kit::test]
 fn running_a_query_paints_the_result_and_records_history(cx: &mut TestAppContext) {
     let env = Env::new("paint");
-    let (service, app) = start(cx, &env, SafeMode::Normal);
+    let (service, app) = start(cx, &env, SafeMode::Normal, None);
     let tab = query_tab(cx, &app, "SELECT id, name FROM items;");
 
     run_and_wait(cx, &service, &app);
@@ -235,7 +257,7 @@ fn running_a_query_paints_the_result_and_records_history(cx: &mut TestAppContext
 #[gpui_kit::test]
 fn creating_a_table_refreshes_the_sidebar_without_a_manual_reload(cx: &mut TestAppContext) {
     let env = Env::new("ddl-refresh");
-    let (service, app) = start(cx, &env, SafeMode::Normal);
+    let (service, app) = start(cx, &env, SafeMode::Normal, None);
     let path = ObjectPath::new(Some("main"), "fresh");
     assert!(
         !cx.read_entity(&app.view, |v, _| v.object_exists(&path)),
@@ -254,7 +276,7 @@ fn creating_a_table_refreshes_the_sidebar_without_a_manual_reload(cx: &mut TestA
 #[gpui_kit::test]
 fn a_delete_without_where_waits_for_a_click_and_then_runs(cx: &mut TestAppContext) {
     let env = Env::new("confirm");
-    let (service, app) = start(cx, &env, SafeMode::Alert);
+    let (service, app) = start(cx, &env, SafeMode::Alert, None);
     query_tab(cx, &app, "DELETE FROM items;");
 
     click(cx, &app, "run-statement");
@@ -321,9 +343,63 @@ fn a_delete_without_where_waits_for_a_click_and_then_runs(cx: &mut TestAppContex
 }
 
 #[gpui_kit::test]
+fn strict_mode_password_prompt_blocks_a_wrong_password_and_runs_on_the_right_one(
+    cx: &mut TestAppContext,
+) {
+    let env = Env::new("strict-password");
+    let (service, app) = start(cx, &env, SafeMode::Strict, Some("s3cret"));
+    query_tab(cx, &app, "DELETE FROM items;");
+
+    click(cx, &app, "run-statement");
+    settle(cx, "the password prompt to appear", |cx| {
+        cx.run_until_parked();
+        cx.read_entity(&app.view, |v, cx| {
+            v.tabs().tabs().iter().any(|t| {
+                v.query_view(&t.id).is_some_and(|tab| {
+                    tab.read(cx)
+                        .pending_confirmation()
+                        .is_some_and(|p| p.require_password)
+                })
+            })
+        })
+    });
+    paint(cx, &app);
+
+    // A wrong password refuses, runs nothing, and leaves the prompt up.
+    type_into(cx, &app, "confirm-password", "wrong");
+    click(cx, &app, "confirm-run-yes");
+    settle(cx, "the password refusal to appear", |cx| {
+        cx.run_until_parked();
+        cx.read_entity(&app.view, |v, cx| {
+            v.tabs().tabs().iter().any(|t| {
+                v.query_view(&t.id)
+                    .is_some_and(|tab| tab.read(cx).confirm_password_error().is_some())
+            })
+        })
+    });
+    let count = block_on_count(&service, &app.connection_id, "SELECT count(*) FROM items;");
+    assert_eq!(count, 3, "a wrong password runs nothing");
+
+    // The right password runs the statement for real.
+    type_into(cx, &app, "confirm-password", "s3cret");
+    click(cx, &app, "confirm-run-yes");
+    settle(cx, "the confirmed delete to finish", |cx| {
+        cx.run_until_parked();
+        cx.read_entity(&app.view, |v, cx| {
+            v.tabs().tabs().iter().any(|t| {
+                v.query_view(&t.id)
+                    .is_some_and(|tab| tab.read(cx).results().status() == RunStatus::Finished)
+            })
+        })
+    });
+    let left = block_on_count(&service, &app.connection_id, "SELECT count(*) FROM items;");
+    assert_eq!(left, 0, "and after the right password it really ran");
+}
+
+#[gpui_kit::test]
 fn a_read_only_connection_refuses_the_write_and_changes_nothing(cx: &mut TestAppContext) {
     let env = Env::new("readonly");
-    let (service, app) = start(cx, &env, SafeMode::ReadOnly);
+    let (service, app) = start(cx, &env, SafeMode::ReadOnly, None);
     query_tab(cx, &app, "UPDATE items SET name = 'zz';");
 
     // The refusal is recorded by the service and painted by the tab; wait for both.
@@ -357,7 +433,7 @@ fn a_read_only_connection_refuses_the_write_and_changes_nothing(cx: &mut TestApp
 #[gpui_kit::test]
 fn typing_saves_the_draft_and_a_reopen_reads_it_back(cx: &mut TestAppContext) {
     let env = Env::new("draft");
-    let (service, app) = start(cx, &env, SafeMode::Normal);
+    let (service, app) = start(cx, &env, SafeMode::Normal, None);
     let tab = query_tab(cx, &app, "");
 
     let editor = cx.read_entity(&tab, |t, _| t.editor_state().clone());
@@ -409,7 +485,7 @@ fn typing_saves_the_draft_and_a_reopen_reads_it_back(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn a_journal_newer_than_the_saved_draft_is_restored_on_reopen(cx: &mut TestAppContext) {
     let env = Env::new("journal-restore");
-    let (service, app) = start(cx, &env, SafeMode::Normal);
+    let (service, app) = start(cx, &env, SafeMode::Normal, None);
     let tab = query_tab(cx, &app, "");
     let state = cx.read_entity(&tab, |t, _| t.document().clone());
 
@@ -436,7 +512,7 @@ fn a_journal_newer_than_the_saved_draft_is_restored_on_reopen(cx: &mut TestAppCo
 #[gpui_kit::test]
 fn typing_writes_the_journal_and_a_save_clears_it(cx: &mut TestAppContext) {
     let env = Env::new("journal-write");
-    let (service, app) = start(cx, &env, SafeMode::Normal);
+    let (service, app) = start(cx, &env, SafeMode::Normal, None);
     let tab = query_tab(cx, &app, "");
 
     let editor = cx.read_entity(&tab, |t, _| t.editor_state().clone());
@@ -464,7 +540,7 @@ fn typing_writes_the_journal_and_a_save_clears_it(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn the_query_editor_wires_hover_and_definition_providers(cx: &mut TestAppContext) {
     let env = Env::new("inspect-wiring");
-    let (_service, app) = start(cx, &env, SafeMode::Normal);
+    let (_service, app) = start(cx, &env, SafeMode::Normal, None);
     let tab = query_tab(cx, &app, "");
     let editor = cx.read_entity(&tab, |t, _| t.editor_state().clone());
     let (hover, definition) = cx.read_entity(&editor, |e, _| {

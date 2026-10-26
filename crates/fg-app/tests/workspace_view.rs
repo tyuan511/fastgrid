@@ -398,6 +398,33 @@ fn tab_shortcuts_close_cycle_and_toggle(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn tab_number_shortcuts_jump_to_tabs(cx: &mut TestAppContext) {
+    let f = open(cx);
+    open_table(cx, &f, "users");
+    open_table(cx, &f, "orders");
+    open_table(cx, &f, "products");
+    let active = |cx: &mut TestAppContext| {
+        cx.read_entity(&f.view, |v, _| match &v.tabs().active().unwrap().kind {
+            TabKind::Table { path, .. } => path.name.clone(),
+            _ => String::new(),
+        })
+    };
+    assert_eq!(active(cx), "products");
+
+    // macOS binds `⌘digit`; Windows/Linux bind `Alt+digit`.
+    #[cfg(target_os = "macos")]
+    let (first, third, ninth) = ("secondary-1", "secondary-3", "secondary-9");
+    #[cfg(not(target_os = "macos"))]
+    let (first, third, ninth) = ("alt-1", "alt-3", "alt-9");
+    press(cx, &f, first);
+    assert_eq!(active(cx), "users");
+    press(cx, &f, third);
+    assert_eq!(active(cx), "products");
+    press(cx, &f, ninth);
+    assert_eq!(active(cx), "products", "out of range is a no-op");
+}
+
+#[gpui_kit::test]
 fn the_filter_shortcut_toggles_the_active_tabs_drawer(cx: &mut TestAppContext) {
     let f = open(cx);
     press(cx, &f, "secondary-f"); // no tab open: nothing happens, no panic

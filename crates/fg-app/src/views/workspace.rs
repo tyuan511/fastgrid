@@ -30,11 +30,12 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::actions::{
-    CloseTab, CommandPalette, CycleSafeMode, CycleTheme, DismissTopmost, ExportWizard,
-    HISTORY_CONTEXT, HistoryDismiss, HistoryNext, HistoryOpen, HistoryPrev, ImportWizard, NewQuery,
-    NextTab, PrevTab, QuickOpen, RefreshSchema, SNIPPETS_CONTEXT, SaveSnippet, SnippetDismiss,
-    SnippetOpen, SwitchDatabase, ToggleAudit, ToggleDetails, ToggleFilters, ToggleHistory,
-    ToggleSidebar, ToggleSnippets, WORKSPACE_CONTEXT,
+    ActivateTab1, ActivateTab2, ActivateTab3, ActivateTab4, ActivateTab5, ActivateTab6,
+    ActivateTab7, ActivateTab8, ActivateTab9, CloseTab, CommandPalette, CycleSafeMode, CycleTheme,
+    DismissTopmost, ExportWizard, HISTORY_CONTEXT, HistoryDismiss, HistoryNext, HistoryOpen,
+    HistoryPrev, ImportWizard, NewQuery, NextTab, PrevTab, QuickOpen, RefreshSchema,
+    SNIPPETS_CONTEXT, SaveSnippet, SnippetDismiss, SnippetOpen, SwitchDatabase, ToggleAudit,
+    ToggleDetails, ToggleFilters, ToggleHistory, ToggleSidebar, ToggleSnippets, WORKSPACE_CONTEXT,
 };
 use super::grid::{TableTab, TableTabEvent};
 use super::icons::{Hugeicon, hugeicon};
@@ -121,6 +122,14 @@ pub enum WorkspaceEvent {
     QueryConfirmed {
         tab: Entity<QueryTab>,
         script: String,
+    },
+    /// The user confirmed a Strict-mode prompt that asks for the
+    /// connection password. The controller verifies `password` first; on a
+    /// mismatch the prompt stays up with an error instead of running.
+    QueryConfirmedWithPassword {
+        tab: Entity<QueryTab>,
+        script: String,
+        password: String,
     },
     /// `⌘⇧S` / the snippets button: load the saved fragments.
     SnippetsRequested,
@@ -1515,6 +1524,13 @@ impl WorkspaceView {
                 tab: tab.clone(),
                 script: script.clone(),
             }),
+            QueryTabEvent::ConfirmedRunWithPassword { script, password } => {
+                cx.emit(WorkspaceEvent::QueryConfirmedWithPassword {
+                    tab: tab.clone(),
+                    script: script.clone(),
+                    password: password.clone(),
+                })
+            }
             QueryTabEvent::Explain => cx.emit(WorkspaceEvent::QueryExplain { tab: tab.clone() }),
             QueryTabEvent::CommitResultEdits => {
                 cx.emit(WorkspaceEvent::QueryResultCommit { tab: tab.clone() })
@@ -1589,6 +1605,15 @@ impl WorkspaceView {
         self.tabs.prev();
         cx.emit(WorkspaceEvent::SessionChanged);
         cx.notify();
+    }
+
+    /// Jump to the `n`th tab (0-based, so `⌘1` is 0). Out of range is a
+    /// no-op: pressing `⌘9` with three tabs open must not move anything.
+    pub fn activate_tab_index(&mut self, n: usize, cx: &mut Context<Self>) {
+        if self.tabs.activate_index(n) {
+            cx.emit(WorkspaceEvent::SessionChanged);
+            cx.notify();
+        }
     }
 
     pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
@@ -2045,6 +2070,15 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|this, _: &SaveSnippet, _, cx| this.save_current_as_snippet(cx)))
             .on_action(cx.listener(|this, _: &NextTab, _, cx| this.next_tab(cx)))
             .on_action(cx.listener(|this, _: &PrevTab, _, cx| this.prev_tab(cx)))
+            .on_action(cx.listener(|this, _: &ActivateTab1, _, cx| this.activate_tab_index(0, cx)))
+            .on_action(cx.listener(|this, _: &ActivateTab2, _, cx| this.activate_tab_index(1, cx)))
+            .on_action(cx.listener(|this, _: &ActivateTab3, _, cx| this.activate_tab_index(2, cx)))
+            .on_action(cx.listener(|this, _: &ActivateTab4, _, cx| this.activate_tab_index(3, cx)))
+            .on_action(cx.listener(|this, _: &ActivateTab5, _, cx| this.activate_tab_index(4, cx)))
+            .on_action(cx.listener(|this, _: &ActivateTab6, _, cx| this.activate_tab_index(5, cx)))
+            .on_action(cx.listener(|this, _: &ActivateTab7, _, cx| this.activate_tab_index(6, cx)))
+            .on_action(cx.listener(|this, _: &ActivateTab8, _, cx| this.activate_tab_index(7, cx)))
+            .on_action(cx.listener(|this, _: &ActivateTab9, _, cx| this.activate_tab_index(8, cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
             .on_action(cx.listener(|this, _: &ToggleAudit, window, cx| this.open_audit(window, cx)))
             .on_action(cx.listener(|this, _: &CycleSafeMode, _, cx| {

@@ -349,6 +349,7 @@ fn a_dangerous_statement_asks_before_it_runs(cx: &mut TestAppContext) {
                     target,
                     reason: Some(danger),
                     production: true,
+                    require_password: false,
                 },
                 cx,
             );
@@ -406,6 +407,7 @@ fn declining_the_prompt_runs_nothing(cx: &mut TestAppContext) {
                     target,
                     reason: Some(DangerReason::DropObject),
                     production: false,
+                    require_password: false,
                 },
                 cx,
             );
@@ -424,6 +426,91 @@ fn declining_the_prompt_runs_nothing(cx: &mut TestAppContext) {
     assert!(
         cx.read_entity(&f.view, |t, _| t.pending_confirmation().is_none()),
         "the prompt is gone once declined"
+    );
+}
+
+#[gpui_kit::test]
+fn password_prompt_hands_back_the_typed_password(cx: &mut TestAppContext) {
+    let f = open(cx, "DELETE FROM items;");
+    let script = cx.read_entity(&f.view, |t, cx| t.script(cx));
+    cx.update_window(f.window, |_, window, cx| {
+        f.view.update(cx, |t, cx| {
+            let target = t.target(RunMode::All, cx).expect("a target");
+            t.begin_run(target.clone(), script.clone(), cx);
+            t.ask_confirmation(
+                fg_app::views::PendingConfirmation {
+                    script: script.clone(),
+                    statement: script.clone(),
+                    target,
+                    reason: Some(DangerReason::DeleteWithoutWhere),
+                    production: false,
+                    require_password: true,
+                },
+                cx,
+            );
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+
+    // The view's own state, not the snapshot registry, for both directions:
+    // a removed element can stay registered.
+    assert!(
+        cx.read_entity(&f.view, |t, cx| t.confirm_password_input(cx).is_some()),
+        "a password prompt shows its input"
+    );
+    // Clicking the input itself focuses it, exactly as a user would.
+    cx.update_window(f.window, |_, window, cx| {
+        window.click("confirm-password", cx);
+        window.input("s3cret", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+
+    cx.update_window(f.window, |_, window, cx| {
+        window.click("confirm-run-yes", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(
+        drain(cx, &f),
+        vec![QueryTabEvent::ConfirmedRunWithPassword {
+            script: script.clone(),
+            password: "s3cret".into(),
+        }],
+        "confirming hands back the typed password with the exact script"
+    );
+    assert_eq!(
+        cx.read_entity(&f.view, |t, cx| t
+            .confirm_password_input(cx)
+            .map(|input| input.read(cx).value().to_string())),
+        Some(String::new()),
+        "the password is cleared at click time, not kept in the view"
+    );
+
+    // A plain prompt has no password field at all.
+    cx.update_window(f.window, |_, window, cx| {
+        f.view.update(cx, |t, cx| {
+            let target = t.target(RunMode::All, cx).expect("a target");
+            t.begin_run(target.clone(), script.clone(), cx);
+            t.ask_confirmation(
+                fg_app::views::PendingConfirmation {
+                    script: script.clone(),
+                    statement: script.clone(),
+                    target,
+                    reason: Some(DangerReason::DeleteWithoutWhere),
+                    production: false,
+                    require_password: false,
+                },
+                cx,
+            );
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert!(
+        cx.read_entity(&f.view, |t, cx| t.confirm_password_input(cx).is_none()),
+        "a plain prompt shows no password input"
     );
 }
 

@@ -847,13 +847,83 @@ fn wire_workspace(
                 new_query(&service, &conn, &view, window, cx);
             }
             WorkspaceEvent::QueryRun { tab, mode } => {
-                run_from_editor(&view, &conn, &runs, tab, RunSubject::Mode(*mode), cx);
+                run_from_editor(
+                    &view,
+                    &service,
+                    &conn,
+                    &runs,
+                    tab,
+                    RunSubject::Mode(*mode),
+                    cx,
+                );
             }
             WorkspaceEvent::QueryConfirmed { tab, script } => {
                 // `script` is the buffer text the prompt was built from; the tab hands the same string
                 // back through `confirmation_target`, so the digest and the SQL cannot disagree.
                 let _ = script;
-                run_from_editor(&view, &conn, &runs, tab, RunSubject::Confirmed, cx);
+                run_from_editor(
+                    &view,
+                    &service,
+                    &conn,
+                    &runs,
+                    tab,
+                    RunSubject::Confirmed,
+                    cx,
+                );
+            }
+            WorkspaceEvent::QueryConfirmedWithPassword {
+                tab,
+                script,
+                password,
+            } => {
+                // `script` is the buffer text the prompt was built from; the run
+                // itself reads it back through `confirmation_target`, same as
+                // the plain confirmation path.
+                let _ = script;
+                let (service, view, conn, runs, tab) = (
+                    service.clone(),
+                    view.clone(),
+                    conn.clone(),
+                    Rc::clone(&runs),
+                    tab.clone(),
+                );
+                let password = password.clone();
+                cx.spawn(async move |cx| {
+                    let verified = service
+                        .verify_connection_password(conn.id(), &password)
+                        .await;
+                    match verified {
+                        Ok(Some(true)) | Ok(None) => {
+                            // No stored password means there was nothing to
+                            // check against; the prompt was already shown.
+                            cx.update(|cx| {
+                                run_from_editor(
+                                    &view,
+                                    &service,
+                                    &conn,
+                                    &runs,
+                                    &tab,
+                                    RunSubject::Confirmed,
+                                    cx,
+                                );
+                            });
+                        }
+                        Ok(Some(false)) => {
+                            tab.update(cx, |t, cx| {
+                                t.set_confirm_password_error("Incorrect password.", cx);
+                            });
+                        }
+                        Err(_) => {
+                            tab.update(cx, |t, cx| {
+                                t.set_confirm_password_error(
+                                    "Could not check the password. Try again.",
+                                    cx,
+                                );
+                            });
+                        }
+                    }
+                })
+                .detach();
             }
             WorkspaceEvent::QueryCancel { tab } => cancel_run(&runs, tab, cx),
             WorkspaceEvent::QueryDraftChanged { tab } => {
@@ -1716,6 +1786,7 @@ fn load_draft(
 /// string the confirmation digest was taken over.
 fn run_from_editor(
     view: &Entity<WorkspaceView>,
+    service: &Service,
     conn: &Arc<OpenConnection>,
     runs: &Rc<RefCell<HashMap<EntityId, QueryRun>>>,
     tab: &Entity<QueryTab>,
@@ -1754,6 +1825,31 @@ fn run_from_editor(
             .map(|s| s.sql.clone())
             .unwrap_or_else(|| sql.clone());
         let production = conn.config().environment.is_production_like();
+        if safe_mode == SafeMode::Strict {
+            // Strict asks for the connection password, but only when one
+            // is stored: the presence check is a store read, so it runs
+            // off the UI thread and the prompt appears once it answers.
+            let (service, tab, id) = (service.clone(), tab.clone(), conn.id().clone());
+            cx.spawn(async move |cx| {
+                let require_password = service.has_stored_password(&id).await.unwrap_or(false);
+                tab.update(cx, |t, cx| {
+                    t.begin_run(target.clone(), script, cx);
+                    t.ask_confirmation(
+                        crate::views::PendingConfirmation {
+                            script: sql,
+                            statement: statement_text,
+                            target,
+                            reason: danger,
+                            production,
+                            require_password,
+                        },
+                        cx,
+                    );
+                });
+            })
+            .detach();
+            return;
+        }
         tab.update(cx, |t, cx| {
             t.begin_run(target.clone(), script.clone(), cx);
             t.ask_confirmation(
@@ -1763,6 +1859,7 @@ fn run_from_editor(
                     target,
                     reason: danger,
                     production,
+                    require_password: false,
                 },
                 cx,
             );

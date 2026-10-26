@@ -500,6 +500,42 @@ impl Service {
         }
     }
 
+    /// Whether a database password is stored for this connection.
+    ///
+    /// Safe Mode Level 2 asks the UI to show a password field only when this
+    /// is true: a connection with no stored password (a local file, trust
+    /// auth) has nothing to re-authenticate against, so its confirmation
+    /// stays a plain click.
+    pub async fn has_stored_password(&self, id: &ConnectionId) -> Result<bool> {
+        let key = id.clone();
+        let stored = self
+            .with_store(move |s| s.get_secret(&key, SecretKind::DatabasePassword))
+            .await?;
+        Ok(stored.is_some())
+    }
+
+    /// Check a typed password against the connection's stored database
+    /// password, for Safe Mode Level 2 re-authentication.
+    ///
+    /// Only the verdict travels back to the UI: the stored password never
+    /// leaves the service. Returns `None` when no password is stored for the
+    /// connection, in which case the caller treats the check as passed.
+    /// The comparison is a plain equality check: the candidate arrives
+    /// through the GUI event loop, so there is no remote timing oracle to
+    /// defend against here.
+    pub async fn verify_connection_password(
+        &self,
+        id: &ConnectionId,
+        candidate: &str,
+    ) -> Result<Option<bool>> {
+        let key = id.clone();
+        let candidate = candidate.to_owned();
+        let stored = self
+            .with_store(move |s| s.get_secret(&key, SecretKind::DatabasePassword))
+            .await?;
+        Ok(stored.map(|password| password == candidate))
+    }
+
     /// Delete a connection with its password, history, drafts and UI state.
     ///
     /// In-flight statements are cancelled, same as [`Self::save_connection`].
@@ -1303,5 +1339,82 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
         panic!("cleanup failed after dropping every handle: {last_err:?}");
+    }
+
+    /// Safe Mode Level 2's building blocks: presence detection and
+    /// verification against the stored password, including the
+    /// no-stored-password case, where verification has nothing to check.
+    #[tokio::test]
+    async fn connection_password_check() {
+        let dir = std::env::temp_dir().join(format!(
+            "fg-password-check-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let keys = KeychainKeyProvider::with_backend(MemoryBackend::default());
+        let svc = Service::start(ServiceOptions::new(dir.join("store.db")), &keys).unwrap();
+
+        let with_password = svc
+            .save_connection_with_secrets(
+                ConnectionConfig::new(
+                    "with-pw",
+                    DbKind::Sqlite,
+                    ConnectionParams::File {
+                        path: dir.join("a.db").to_string_lossy().into_owned(),
+                    },
+                ),
+                PasswordUpdate::Set("s3cret".into()),
+                PasswordUpdate::Keep,
+            )
+            .await
+            .unwrap();
+        let without_password = svc
+            .save_connection(
+                ConnectionConfig::new(
+                    "without-pw",
+                    DbKind::Sqlite,
+                    ConnectionParams::File {
+                        path: dir.join("b.db").to_string_lossy().into_owned(),
+                    },
+                ),
+                PasswordUpdate::Keep,
+            )
+            .await
+            .unwrap();
+
+        assert!(svc.has_stored_password(&with_password.id).await.unwrap());
+        assert_eq!(
+            svc.verify_connection_password(&with_password.id, "s3cret")
+                .await
+                .unwrap(),
+            Some(true),
+            "the right password verifies"
+        );
+        assert_eq!(
+            svc.verify_connection_password(&with_password.id, "wrong")
+                .await
+                .unwrap(),
+            Some(false),
+            "a wrong password does not verify"
+        );
+        assert!(
+            !svc.has_stored_password(&without_password.id).await.unwrap(),
+            "no password was ever saved for this connection"
+        );
+        assert_eq!(
+            svc.verify_connection_password(&without_password.id, "anything")
+                .await
+                .unwrap(),
+            None,
+            "nothing stored means nothing to check against"
+        );
+
+        drop(svc);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

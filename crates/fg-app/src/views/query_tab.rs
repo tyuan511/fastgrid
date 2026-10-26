@@ -48,6 +48,10 @@ pub enum QueryTabEvent {
     /// The user accepted the confirmation prompt for `script`. The controller must run **this**
     /// string: the service binds a confirmation to a digest of the exact SQL.
     ConfirmedRun { script: String },
+    /// The user accepted a Strict-mode prompt that asks for the connection
+    /// password. The controller verifies `password` against the stored
+    /// secret before running anything; the prompt stays up on a mismatch.
+    ConfirmedRunWithPassword { script: String, password: String },
     /// The user refused the confirmation prompt.
     DismissedConfirmation,
     /// Explain what the current statement would do, instead of running it.
@@ -71,6 +75,10 @@ pub struct PendingConfirmation {
     pub reason: Option<DangerReason>,
     /// A production-looking connection gets a louder prompt.
     pub production: bool,
+    /// Strict mode with a stored connection password: the prompt asks for
+    /// that password instead of a bare click. False for Alert mode and for
+    /// connections with no stored password.
+    pub require_password: bool,
 }
 
 /// The cell editor open on a result cell, mirroring the browse grid's `CellEditor`.
@@ -627,6 +635,12 @@ pub struct QueryTab {
     /// buffer: positions are relative to the statement, and only that run knows where it started.
     running_target: Option<(RunTarget, String)>,
     confirmation: Option<PendingConfirmation>,
+    /// Masked input for the Strict-mode password prompt. It always exists
+    /// but is only rendered while a password prompt is shown; its value is
+    /// read and cleared at click time, never stored anywhere else.
+    confirm_password: Entity<InputState>,
+    /// Why the last password attempt was refused, shown under the input.
+    confirm_password_error: Option<String>,
     record_error: Option<String>,
     /// A draft written by a newer version: shown, read-only, never re-saved over.
     unavailable: Option<String>,
@@ -712,6 +726,20 @@ impl QueryTab {
                     this.begin_result_edit(*row, *col, None, window, cx);
                 }
             });
+        let confirm_password = cx.new(|cx| {
+            let mut state = InputState::new(window, cx);
+            state.set_masked(true, window, cx);
+            state
+        });
+        let on_confirm_password_enter = cx.subscribe_in(
+            &confirm_password,
+            window,
+            |this, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.confirm_run(window, cx);
+                }
+            },
+        );
         Self {
             document,
             kind,
@@ -720,6 +748,8 @@ impl QueryTab {
             results: QueryResults::new(),
             running_target: None,
             confirmation: None,
+            confirm_password,
+            confirm_password_error: None,
             record_error: None,
             unavailable: None,
             content_baseline: self_script_baseline,
@@ -731,7 +761,7 @@ impl QueryTab {
             _result_editor_subscription: None,
             page: PageState::new(DEFAULT_RESULT_PAGE_SIZE),
             catalog,
-            _subscriptions: vec![on_edit, on_result],
+            _subscriptions: vec![on_edit, on_result, on_confirm_password_enter],
         }
     }
 
@@ -1068,8 +1098,57 @@ impl QueryTab {
     /// Show the prompt for a statement the safe mode wants a human to look at.
     pub fn ask_confirmation(&mut self, prompt: PendingConfirmation, cx: &mut Context<Self>) {
         self.confirmation = Some(prompt);
+        self.confirm_password_error = None;
         self.stop_loading(cx);
         cx.notify();
+    }
+
+    /// Run what the confirmation prompt showed, after the password step
+    /// when the prompt requires one. Shared by the Run button and the
+    /// password input's Enter key, so both paths read and clear the input
+    /// the same way. The controller verifies the password; a mismatch
+    /// comes back through [`Self::set_confirm_password_error`] and the
+    /// prompt stays up.
+    pub fn confirm_run(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(prompt) = self.confirmation.clone() else {
+            return;
+        };
+        if prompt.require_password {
+            let password = self.confirm_password.read(cx).value().to_string();
+            self.confirm_password.update(cx, |s, cx| {
+                s.set_value("", window, cx);
+            });
+            cx.emit(QueryTabEvent::ConfirmedRunWithPassword {
+                script: prompt.script,
+                password,
+            });
+        } else {
+            cx.emit(QueryTabEvent::ConfirmedRun {
+                script: prompt.script,
+            });
+        }
+    }
+
+    /// Show a password refusal under the prompt without closing it, so
+    /// the user can retry. Only meaningful while a password prompt is shown.
+    pub fn set_confirm_password_error(&mut self, message: &str, cx: &mut Context<Self>) {
+        self.confirm_password_error = Some(message.to_owned());
+        cx.notify();
+    }
+
+    /// The password refusal currently shown, if any.
+    pub fn confirm_password_error(&self) -> Option<&str> {
+        self.confirm_password_error.as_deref()
+    }
+
+    /// The password input, while a password prompt is shown. Tests use it
+    /// to read what typing left behind; the real path reads it at click time.
+    pub fn confirm_password_input(&self, cx: &App) -> Option<Entity<InputState>> {
+        let _ = cx;
+        self.confirmation
+            .as_ref()
+            .is_some_and(|p| p.require_password)
+            .then(|| self.confirm_password.clone())
     }
 
     /// Which page of the active result set is on screen.
@@ -1758,6 +1837,32 @@ impl Render for QueryTab {
                                 .text_sm()
                                 .child(prompt.statement),
                         )
+                        .when(prompt.require_password, |d| {
+                            d.child(
+                                div().max_w(px(560.)).child(
+                                    h_flex()
+                                        .gap_2()
+                                        .items_center()
+                                        .child(div().text_sm().child("Connection password"))
+                                        .child(
+                                            Input::new(&self.confirm_password)
+                                                .id("confirm-password")
+                                                .flex_1(),
+                                        ),
+                                ),
+                            )
+                        })
+                        .when_some(self.confirm_password_error.clone(), |d, error| {
+                            d.child(
+                                div()
+                                    .id("confirm-password-error")
+                                    .test_support()
+                                    .aria_label(error.clone())
+                                    .text_sm()
+                                    .text_color(theme.danger)
+                                    .child(error),
+                            )
+                        })
                         .child(
                             h_flex()
                                 .gap_2()
@@ -1766,10 +1871,8 @@ impl Render for QueryTab {
                                         .label("Run anyway")
                                         .danger()
                                         .small()
-                                        .on_click(cx.listener(move |_, _, _, cx| {
-                                            cx.emit(QueryTabEvent::ConfirmedRun {
-                                                script: prompt.script.clone(),
-                                            });
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.confirm_run(window, cx);
                                         })),
                                 )
                                 .child(
@@ -1777,10 +1880,14 @@ impl Render for QueryTab {
                                         .label("Cancel")
                                         .ghost()
                                         .small()
-                                        .on_click(cx.listener(|this, _, _, cx| {
+                                        .on_click(cx.listener(|this, _, window, cx| {
                                             // The prompt is the tab's own state: clearing it here
                                             // is what makes "declined" visible immediately, whatever
                                             // the controller does next.
+                                            this.confirm_password.update(cx, |s, cx| {
+                                                s.set_value("", window, cx);
+                                            });
+                                            this.confirm_password_error = None;
                                             this.confirmation = None;
                                             cx.emit(QueryTabEvent::DismissedConfirmation);
                                         })),
