@@ -1084,3 +1084,106 @@ fn details_panel_toggles_with_its_key(cx: &mut TestAppContext) {
         "the same key flips it back"
     );
 }
+
+#[gpui_kit::test]
+fn export_wizard_whole_database_requests_a_database_dump(cx: &mut TestAppContext) {
+    use fg_app::views::ExportSource;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let f = open(cx);
+    open_table(cx, &f, "orders");
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let log = Rc::clone(&events);
+    cx.update(|cx| {
+        cx.subscribe(&f.view, move |_, e: &WorkspaceEvent, _| {
+            if let WorkspaceEvent::ExportRequested { source, path, .. } = e {
+                let scope = match source {
+                    ExportSource::Database(namespace) => {
+                        format!("db:{}", namespace.clone().unwrap_or_default())
+                    }
+                    _ => "other".to_owned(),
+                };
+                log.borrow_mut().push((scope, path.clone()));
+            }
+        })
+        .detach();
+    });
+    cx.update_window(f.window, |_, window, cx| {
+        f.view.update(cx, |v, cx| v.open_export_wizard(window, cx));
+        window.render_frame(cx);
+        window.click("export-database", cx);
+        window.click("export-path", cx);
+        window.input("/tmp/fg-dump-test.sql", cx);
+        window.click("export-run", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let status = cx
+        .update_window(f.window, |_, window, cx| {
+            window.render_frame(cx);
+            window.find("export-status").label().unwrap().to_owned()
+        })
+        .unwrap();
+    assert!(status.starts_with("Exporting…"), "got: {status}");
+    assert_eq!(
+        events.borrow().as_slice(),
+        [("db:main".to_owned(), "/tmp/fg-dump-test.sql".to_owned())],
+        "the tab's namespace scopes the dump"
+    );
+}
+
+#[gpui_kit::test]
+fn import_wizard_sql_mode_requests_preview_then_confirms(cx: &mut TestAppContext) {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let f = open(cx);
+    open_table(cx, &f, "orders");
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let log = Rc::clone(&events);
+    cx.update(|cx| {
+        cx.subscribe(&f.view, move |_, e: &WorkspaceEvent, _| match e {
+            WorkspaceEvent::ImportSqlRequested { path } => {
+                log.borrow_mut()
+                    .push(("requested".to_owned(), path.clone()));
+            }
+            WorkspaceEvent::ImportSqlConfirmed { path } => {
+                log.borrow_mut()
+                    .push(("confirmed".to_owned(), path.clone()));
+            }
+            _ => {}
+        })
+        .detach();
+    });
+    cx.update_window(f.window, |_, window, cx| {
+        f.view.update(cx, |v, cx| v.open_import_wizard(window, cx));
+        window.render_frame(cx);
+        window.click("import-kind-sql", cx);
+        window.click("import-path", cx);
+        window.input("/tmp/fg-import-test.sql", cx);
+        window.click("import-run", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(
+        events.borrow().as_slice(),
+        [("requested".to_owned(), "/tmp/fg-import-test.sql".to_owned())],
+        "SQL Run previews first"
+    );
+    cx.update_window(f.window, |_, window, cx| {
+        f.view.update(cx, |v, cx| {
+            v.set_import_confirming("/tmp/fg-import-test.sql".into(), 3, vec![], cx);
+        });
+        window.render_frame(cx);
+        window.click("import-confirm-run", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(
+        events.borrow().as_slice(),
+        [
+            ("requested".to_owned(), "/tmp/fg-import-test.sql".to_owned()),
+            ("confirmed".to_owned(), "/tmp/fg-import-test.sql".to_owned()),
+        ],
+        "Run anyway confirms the previewed file"
+    );
+}

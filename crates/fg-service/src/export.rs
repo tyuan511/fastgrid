@@ -15,11 +15,15 @@
 //! ever arrives it renders as empty (CSV) or null (JSON) rather than
 //! failing a long export mid-way.
 
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use fg_core::{ColumnMeta, Dialect, Error, Result, StatementClass, TableQuery, Value};
+use fg_core::{
+    ColumnMeta, Dialect, Error, ObjectKind, ObjectPath, Relation, Result, StatementClass,
+    TableQuery, Value,
+};
 use fg_driver::{Event, ExecOptions};
 use fg_sql::{BuildOptions, build_select, classify, split_statements};
 use tokio::io::AsyncWriteExt;
@@ -225,6 +229,216 @@ impl OpenConnection {
             self.export_sql(sql, options, control, &mut file).await
         }
     }
+
+    /// Dump one namespace as a single SQL script: a fastgrid header
+    /// naming the engine, then per table its DDL followed by INSERT
+    /// batches, tables in foreign-key order (parents first), views
+    /// last with DDL only.
+    ///
+    /// `namespace` scopes the dump; `None` dumps every namespace the
+    /// session lists, which for MySQL is every visible database, so
+    /// callers that mean "the current database" pass its name. Only
+    /// SQL output makes sense here, so `options.format` must be
+    /// [`ExportFormat::Sql`]; `scope` is ignored (a dump is always
+    /// structure plus data). `control` cancels between tables and
+    /// between batches, like a table export; a cancelled dump leaves
+    /// a partial file behind, same as a cancelled table export.
+    ///
+    /// The file is plain SQL by design (TablePlus dump parity), not
+    /// an encrypted bundle: it holds the database's content verbatim.
+    pub async fn export_database(
+        self: &Arc<Self>,
+        namespace: Option<&str>,
+        options: &ExportOptions,
+        control: &ExportControl,
+        out: &mut (impl tokio::io::AsyncWrite + Unpin),
+    ) -> Result<DumpReport> {
+        if options.format != ExportFormat::Sql {
+            return Err(invalid("a database dump is SQL only"));
+        }
+        let mut report = DumpReport {
+            tables: 0,
+            views: 0,
+            rows: 0,
+            bytes: 0,
+            warnings: Vec::new(),
+        };
+        let header = format!(
+            "-- fastgrid dump v1\n-- engine: {}\n",
+            self.kind().display_name()
+        );
+        out.write_all(header.as_bytes()).await.map_err(io_other)?;
+        report.bytes += header.len() as u64;
+        let data_options = ExportOptions {
+            format: ExportFormat::Sql,
+            scope: ExportScope::Data,
+            gzip: false,
+            sql_batch: options.sql_batch,
+        };
+        let namespaces = match namespace {
+            Some(name) => vec![name.to_owned()],
+            None => self.namespaces().await?,
+        };
+        for namespace in &namespaces {
+            let objects = self.objects(Some(namespace)).await?;
+            let mut tables: Vec<ObjectPath> = Vec::new();
+            let mut views: Vec<ObjectPath> = Vec::new();
+            let mut skipped: BTreeMap<String, usize> = BTreeMap::new();
+            for info in objects.iter() {
+                match info.kind {
+                    ObjectKind::Table => tables.push(info.path.clone()),
+                    ObjectKind::View => views.push(info.path.clone()),
+                    other => *skipped.entry(format!("{other:?}")).or_insert(0) += 1,
+                }
+            }
+            for (kind, count) in skipped {
+                report.warnings.push(format!(
+                    "skipped {count} {kind} object(s) in namespace {namespace}: not dumped in v1"
+                ));
+            }
+            let relations = self.relations(Some(namespace)).await?;
+            let (ordered, cyclic) = order_by_foreign_keys(&tables, &relations);
+            if !cyclic.is_empty() {
+                let names = cyclic
+                    .iter()
+                    .map(|p| p.name.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                report.warnings.push(format!(
+                    "foreign-key cycle among {names}: dumped in listed order, and a child row \
+                     may precede its parent on import"
+                ));
+            }
+            for path in &ordered {
+                if control.cancel.load(Ordering::Relaxed) {
+                    return Err(Error::Cancelled);
+                }
+                match self.ddl(path).await? {
+                    Some(ddl) => {
+                        let text = format!("{ddl};\n");
+                        out.write_all(text.as_bytes()).await.map_err(io_other)?;
+                        report.bytes += text.len() as u64;
+                    }
+                    None => report.warnings.push(format!(
+                        "no DDL for {}; its rows dump without a CREATE statement",
+                        path.name
+                    )),
+                }
+                let query = TableQuery::new(path.clone(), u64::MAX);
+                let data = self
+                    .export_table(&query, &data_options, control, out)
+                    .await?;
+                report.rows += data.rows;
+                report.bytes += data.bytes;
+                report.tables += 1;
+            }
+            for path in &views {
+                if control.cancel.load(Ordering::Relaxed) {
+                    return Err(Error::Cancelled);
+                }
+                match self.ddl(path).await? {
+                    Some(ddl) => {
+                        let text = format!("{ddl};\n");
+                        out.write_all(text.as_bytes()).await.map_err(io_other)?;
+                        report.bytes += text.len() as u64;
+                        report.views += 1;
+                    }
+                    None => report
+                        .warnings
+                        .push(format!("no DDL for view {}; skipped", path.name)),
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    /// [`OpenConnection::export_database`] writing to a file, gzipped
+    /// when `options.gzip` is set.
+    pub async fn export_database_to_file(
+        self: &Arc<Self>,
+        namespace: Option<&str>,
+        options: &ExportOptions,
+        control: &ExportControl,
+        path: &Path,
+    ) -> Result<DumpReport> {
+        let mut file = tokio::fs::File::create(path).await.map_err(io_other)?;
+        if options.gzip {
+            let mut encoder = async_compression::tokio::write::GzipEncoder::new(file);
+            let report = self
+                .export_database(namespace, options, control, &mut encoder)
+                .await;
+            if report.is_ok() {
+                encoder.shutdown().await.map_err(io_other)?;
+            } else {
+                let _ = encoder.shutdown().await;
+            }
+            report
+        } else {
+            self.export_database(namespace, options, control, &mut file)
+                .await
+        }
+    }
+}
+
+/// What a whole-database dump wrote. `warnings` covers foreign-key
+/// cycles (dumped in listed order), objects without DDL text, and
+/// kinds the dump skips; the file still imports, but the warnings
+/// say what to double-check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DumpReport {
+    pub tables: usize,
+    pub views: usize,
+    pub rows: u64,
+    pub bytes: u64,
+    pub warnings: Vec<String>,
+}
+
+/// Order tables so a table comes after every table it references.
+/// Tables left over after no more progress is possible form a
+/// foreign-key cycle (a self-reference counts); they follow in
+/// their original order and are returned second, for a warning.
+fn order_by_foreign_keys(
+    tables: &[ObjectPath],
+    relations: &[Relation],
+) -> (Vec<ObjectPath>, Vec<ObjectPath>) {
+    let set: HashSet<&ObjectPath> = tables.iter().collect();
+    let mut deps: HashMap<&ObjectPath, HashSet<&ObjectPath>> = HashMap::new();
+    for table in tables {
+        deps.insert(table, HashSet::new());
+    }
+    for relation in relations {
+        if set.contains(&relation.from)
+            && set.contains(&relation.key.referenced)
+            && let Some(deps_of) = deps.get_mut(&relation.from)
+        {
+            deps_of.insert(&relation.key.referenced);
+        }
+    }
+    let mut ordered: Vec<ObjectPath> = Vec::new();
+    let mut done: HashSet<&ObjectPath> = HashSet::new();
+    loop {
+        let mut progress = false;
+        for table in tables {
+            if done.contains(table) {
+                continue;
+            }
+            if deps[table].iter().all(|dep| done.contains(dep)) {
+                ordered.push(table.clone());
+                done.insert(table);
+                progress = true;
+            }
+        }
+        if !progress {
+            break;
+        }
+    }
+    let cyclic: Vec<ObjectPath> = tables
+        .iter()
+        .filter(|table| !done.contains(*table))
+        .cloned()
+        .collect();
+    ordered.extend(cyclic.iter().cloned());
+    (ordered, cyclic)
 }
 
 fn io_other(e: std::io::Error) -> Error {

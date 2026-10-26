@@ -20,13 +20,15 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use fg_core::{ColumnInfo, Dialect, Error, ObjectPath, Result, SafeMode, TableDetail, Value};
-use fg_driver::ExecOptions;
+use fg_driver::{Event, ExecOptions};
 use fg_sql::coerce_text;
 
 use crate::conn::OpenConnection;
 use crate::pool::Lease;
+use crate::run::{PolicyRefusal, RunOptions};
 
 /// One CSV column's destination. `column: None` skips the CSV column.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -439,5 +441,200 @@ impl Plan {
         }
         row.extend(self.null_columns.iter().map(|_| Value::Null));
         Ok(row)
+    }
+}
+
+/// A SQL dump file, read but not yet run: how many statements it
+/// holds, whether running it needs one user confirmation, and any
+/// header warnings (a missing header means the file is a foreign
+/// dump and runs as-is).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlDumpPreview {
+    pub statements: usize,
+    pub needs_confirmation: bool,
+    pub warnings: Vec<String>,
+}
+
+/// What a SQL dump import wrote. `statements` counts fully finished
+/// statements; on failure the error names the next one, and the
+/// statements before it stay committed: a dump import is not one
+/// transaction. `cancelled` means the run stopped after the current
+/// statement, and the rest never ran.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlImportReport {
+    pub statements: u64,
+    pub warnings: Vec<String>,
+    pub cancelled: bool,
+}
+
+/// Options for a SQL dump import. `cancel`, when set, is checked
+/// between statements: a set flag stops the import after the
+/// current statement finishes.
+#[derive(Debug, Clone, Default)]
+pub struct SqlImportOptions {
+    pub cancel: Option<Arc<AtomicBool>>,
+}
+
+impl SqlImportOptions {
+    fn cancelled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|c| c.load(Ordering::Relaxed))
+    }
+}
+
+impl OpenConnection {
+    /// Read a SQL dump file (gunzipping when it starts with the
+    /// gzip magic) and check its fastgrid header against this
+    /// connection's engine. The engine check only applies to files
+    /// carrying the fastgrid header; a foreign dump without one runs
+    /// as-is, with a warning.
+    ///
+    /// The file is read fully into memory before parsing (v1
+    /// limitation, same as CSV import).
+    async fn load_dump(&self, file: &Path) -> Result<(String, Vec<String>)> {
+        let bytes = tokio::fs::read(file)
+            .await
+            .map_err(|e| Error::Other(format!("import read failed: {e}")))?;
+        let text = if bytes.starts_with(&[0x1f, 0x8b]) {
+            use tokio::io::AsyncReadExt as _;
+            let mut decoder = async_compression::tokio::bufread::GzipDecoder::new(
+                tokio::io::BufReader::new(&bytes[..]),
+            );
+            let mut text = String::new();
+            decoder
+                .read_to_string(&mut text)
+                .await
+                .map_err(|e| invalid(format!("dump gzip decode failed: {e}")))?;
+            text
+        } else {
+            String::from_utf8(bytes).map_err(|_| invalid("dump is not valid UTF-8"))?
+        };
+        let mut warnings = Vec::new();
+        let mut is_fastgrid = false;
+        let mut engine: Option<String> = None;
+        for line in text.lines() {
+            let line = line.trim();
+            if !line.starts_with("--") {
+                break;
+            }
+            if line == "-- fastgrid dump v1" {
+                is_fastgrid = true;
+            }
+            if let Some(rest) = line.strip_prefix("-- engine:") {
+                engine = Some(rest.trim().to_owned());
+            }
+        }
+        match (is_fastgrid, engine) {
+            (true, Some(engine)) if engine != self.kind().display_name() => {
+                return Err(invalid(format!(
+                    "dump is for {engine}, this connection is {}",
+                    self.kind().display_name()
+                )));
+            }
+            (true, None) => {
+                warnings.push("dump header has no engine line; running as-is".into());
+            }
+            (false, _) => {
+                warnings.push("no fastgrid header; running a foreign dump as-is".into());
+            }
+            (true, Some(_)) => {}
+        }
+        Ok((text, warnings))
+    }
+
+    /// Preview a SQL dump file: read it, check its header, and
+    /// classify it. A read-only connection is refused here, before
+    /// anything runs; a dump that needs confirmation reports so,
+    /// and the caller confirms once and reruns with `confirmed`.
+    pub async fn preview_sql_dump(&self, file: &Path) -> Result<SqlDumpPreview> {
+        self.pool.ensure_current()?;
+        if self.safe_mode() == SafeMode::ReadOnly {
+            return Err(Error::PolicyDenied(
+                "this connection is read-only; import cannot write".into(),
+            ));
+        }
+        let (text, warnings) = self.load_dump(file).await?;
+        let planned = crate::run::plan(&text, self.kind(), self.safe_mode());
+        if planned.statements.is_empty() {
+            return Err(invalid("dump contains no statements"));
+        }
+        let needs_confirmation = matches!(
+            planned.first_refusal(),
+            Some(PolicyRefusal::NeedsConfirmation { .. })
+        );
+        Ok(SqlDumpPreview {
+            statements: planned.statements.len(),
+            needs_confirmation,
+            warnings,
+        })
+    }
+
+    /// Import a SQL dump file: the whole script runs through the
+    /// checked run path (classification, safe mode, history and
+    /// audit), so a read-only connection refuses, and Alert/Strict
+    /// need one confirmation for the file, not one per statement.
+    /// Pass `confirmed` after the user confirmed a preview that
+    /// reported `needs_confirmation`; the confirmed run still
+    /// re-plans, so a file edited between preview and run is
+    /// classified again before anything executes.
+    pub async fn import_sql_dump(
+        self: &Arc<Self>,
+        file: &Path,
+        options: &SqlImportOptions,
+        confirmed: bool,
+    ) -> Result<SqlImportReport> {
+        self.pool.ensure_current()?;
+        if self.safe_mode() == SafeMode::ReadOnly {
+            return Err(Error::PolicyDenied(
+                "this connection is read-only; import cannot write".into(),
+            ));
+        }
+        let (text, warnings) = self.load_dump(file).await?;
+        let planned = crate::run::plan(&text, self.kind(), self.safe_mode());
+        if planned.statements.is_empty() {
+            return Err(invalid("dump contains no statements"));
+        }
+        if let Some(refusal) = planned.first_refusal() {
+            match refusal {
+                PolicyRefusal::ReadOnly { .. } => {
+                    return Err(Error::PolicyDenied(crate::run::refusal_message(refusal)));
+                }
+                PolicyRefusal::NeedsConfirmation { .. } if !confirmed => {
+                    return Err(Error::PolicyDenied(crate::run::refusal_message(refusal)));
+                }
+                _ => {}
+            }
+        }
+        let run_options = if confirmed {
+            RunOptions::gui_confirmed(&text, self.kind())
+        } else {
+            RunOptions::gui()
+        };
+        let mut stream = self.run(&text, &[], run_options).await?;
+        let mut report = SqlImportReport {
+            statements: 0,
+            warnings,
+            cancelled: false,
+        };
+        while let Some(event) = stream.next().await {
+            let event = event.map_err(|e| {
+                Error::Other(format!(
+                    "import failed at statement {}: {e}",
+                    report.statements + 1
+                ))
+            })?;
+            if let Event::ResultEnd { .. } = event {
+                report.statements += 1;
+            }
+            if options.cancelled() {
+                report.cancelled = true;
+                return Ok(report);
+            }
+        }
+        if options.cancelled() {
+            report.cancelled = true;
+        }
+        Ok(report)
     }
 }

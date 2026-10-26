@@ -14,7 +14,7 @@ use fg_core::{
 };
 use fg_service::{
     ColumnMapping, CsvImportOptions, CsvImportReport, CsvPreview, ExportFormat, ExportOptions,
-    ExportReport, ExportScope, ImportErrorPolicy, OpenConnection, Service, preview_csv,
+    ExportScope, ImportErrorPolicy, OpenConnection, Service, SqlImportReport, preview_csv,
 };
 use gpui_kit::component::Disableable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -104,6 +104,11 @@ pub enum WorkspaceEvent {
     },
     /// The import wizard's Cancel: the controller flags the run's control.
     ImportCancel,
+    /// The import wizard's Run in SQL mode: the controller previews
+    /// the file first, then either runs it or reports Confirming.
+    ImportSqlRequested { path: String },
+    /// The import wizard's Run-anyway after a Confirming preview.
+    ImportSqlConfirmed { path: String },
     /// Answer an agent write waiting in the approvals panel. The
     /// controller resolves it through the service; the panel refreshes
     /// from the remaining pending list.
@@ -243,6 +248,20 @@ pub struct WorkspaceView {
 pub enum ExportSource {
     Table(TableQuery),
     Sql(String),
+    /// A whole namespace (`None` = every namespace the session
+    /// lists). The wizard picks the namespace from the tab it
+    /// opened from, or `None` for a query tab.
+    Database(Option<String>),
+}
+
+/// What an export wrote, for the wizard's Done message. Table and
+/// query exports carry no warnings; a database dump may (cycles,
+/// skipped kinds, objects without DDL).
+#[derive(Debug, Clone)]
+pub struct ExportFinished {
+    pub rows: u64,
+    pub bytes: u64,
+    pub warnings: Vec<String>,
 }
 
 /// The export wizard's state. The panel lives above the tabs; the
@@ -250,6 +269,10 @@ pub enum ExportSource {
 /// holds the form and the latest status.
 struct ExportWizardState {
     source: ExportSource,
+    /// Whole-database mode: the tab source is ignored and the dump
+    /// runs instead. Format and scope do not apply (a dump is
+    /// always SQL, structure plus data).
+    database: bool,
     path: Entity<InputState>,
     format: ExportFormat,
     scope: ExportScope,
@@ -265,7 +288,11 @@ struct ExportWizardState {
 enum ExportWizardStatus {
     Idle,
     Running,
-    Done { rows: u64, bytes: u64 },
+    Done {
+        rows: u64,
+        bytes: u64,
+        warnings: Vec<String>,
+    },
     Failed(String),
 }
 
@@ -277,6 +304,9 @@ struct ImportWizardState {
     /// The table's columns, snapshotted at open time for the mapping
     /// prefill (case-insensitive match against the CSV header).
     table_columns: Vec<String>,
+    /// SQL dump mode: no table, no mapping, the file runs as one
+    /// checked script instead of batched CSV rows.
+    sql: bool,
     path: Entity<InputState>,
     has_header: bool,
     preview: Option<CsvPreview>,
@@ -292,7 +322,15 @@ struct ImportWizardState {
 enum ImportWizardStatus {
     Idle,
     Running,
+    /// A SQL dump that needs one confirmation before it runs: the
+    /// controller previewed the file and counted its statements.
+    Confirming {
+        path: String,
+        statements: usize,
+        warnings: Vec<String>,
+    },
     Done(CsvImportReport),
+    DoneSql(SqlImportReport),
     Failed(String),
 }
 
@@ -448,6 +486,7 @@ impl WorkspaceView {
         let path = cx.new(|cx| InputState::new(window, cx).placeholder("File path…"));
         self.export_wizard = Some(ExportWizardState {
             source,
+            database: false,
             path,
             format: ExportFormat::Csv,
             scope: ExportScope::Data,
@@ -489,18 +528,37 @@ impl WorkspaceView {
             cx.notify();
             return;
         }
-        let options = ExportOptions {
-            format: wizard.format,
-            scope: wizard.scope,
-            gzip: wizard.gzip,
-            sql_batch: 100,
+        let (source, options) = if wizard.database {
+            let namespace = match &wizard.source {
+                ExportSource::Table(query) => query.path.namespace.clone(),
+                ExportSource::Sql(_) | ExportSource::Database(_) => None,
+            };
+            (
+                ExportSource::Database(namespace),
+                ExportOptions {
+                    format: ExportFormat::Sql,
+                    scope: ExportScope::Both,
+                    gzip: wizard.gzip,
+                    sql_batch: 100,
+                },
+            )
+        } else {
+            (
+                wizard.source.clone(),
+                ExportOptions {
+                    format: wizard.format,
+                    scope: wizard.scope,
+                    gzip: wizard.gzip,
+                    sql_batch: 100,
+                },
+            )
         };
         wizard.status = ExportWizardStatus::Running;
         wizard.rows = 0;
         wizard.last_path = Some(path.clone());
         cx.notify();
         cx.emit(WorkspaceEvent::ExportRequested {
-            source: wizard.source.clone(),
+            source,
             options,
             path,
         });
@@ -519,7 +577,7 @@ impl WorkspaceView {
     /// The controller's report for the finished run.
     pub fn set_export_finished(
         &mut self,
-        result: std::result::Result<ExportReport, String>,
+        result: std::result::Result<ExportFinished, String>,
         cx: &mut Context<Self>,
     ) {
         if let Some(wizard) = self.export_wizard.as_mut() {
@@ -527,6 +585,7 @@ impl WorkspaceView {
                 Ok(report) => ExportWizardStatus::Done {
                     rows: report.rows,
                     bytes: report.bytes,
+                    warnings: report.warnings,
                 },
                 Err(message) => ExportWizardStatus::Failed(message),
             };
@@ -550,6 +609,7 @@ impl WorkspaceView {
         self.import_wizard = Some(ImportWizardState {
             table,
             table_columns,
+            sql: false,
             path,
             has_header: true,
             preview: None,
@@ -624,8 +684,21 @@ impl WorkspaceView {
         }
         let path = wizard.path.read(cx).value().trim().to_owned();
         if path.is_empty() {
-            wizard.status = ImportWizardStatus::Failed("Enter a CSV file path.".into());
+            wizard.status = ImportWizardStatus::Failed(if wizard.sql {
+                "Enter a SQL file path.".into()
+            } else {
+                "Enter a CSV file path.".into()
+            });
             cx.notify();
+            return;
+        }
+        if wizard.sql {
+            // The controller previews the file first: a dump that
+            // needs confirmation comes back as Confirming, the rest
+            // runs straight through.
+            wizard.status = ImportWizardStatus::Running;
+            cx.notify();
+            cx.emit(WorkspaceEvent::ImportSqlRequested { path });
             return;
         }
         if wizard.preview.is_none() {
@@ -674,6 +747,40 @@ impl WorkspaceView {
         if let Some(wizard) = self.import_wizard.as_mut() {
             wizard.status = match result {
                 Ok(report) => ImportWizardStatus::Done(report),
+                Err(message) => ImportWizardStatus::Failed(message),
+            };
+            cx.notify();
+        }
+    }
+
+    /// The controller previewed a SQL dump that needs one
+    /// confirmation: show the statement count and wait for Run.
+    pub fn set_import_confirming(
+        &mut self,
+        path: String,
+        statements: usize,
+        warnings: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(wizard) = self.import_wizard.as_mut() {
+            wizard.status = ImportWizardStatus::Confirming {
+                path,
+                statements,
+                warnings,
+            };
+            cx.notify();
+        }
+    }
+
+    /// The controller's report for a finished SQL dump import.
+    pub fn set_import_finished_sql(
+        &mut self,
+        result: std::result::Result<SqlImportReport, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(wizard) = self.import_wizard.as_mut() {
+            wizard.status = match result {
+                Ok(report) => ImportWizardStatus::DoneSql(report),
                 Err(message) => ImportWizardStatus::Failed(message),
             };
             cx.notify();
@@ -2572,10 +2679,20 @@ impl WorkspaceView {
             ExportWizardStatus::Running => {
                 format!("Exporting… {} rows written.", wizard.rows)
             }
-            ExportWizardStatus::Done { rows, bytes } => format!(
-                "Exported {rows} rows ({bytes} bytes) to {}.",
-                wizard.last_path.clone().unwrap_or_default()
-            ),
+            ExportWizardStatus::Done {
+                rows,
+                bytes,
+                warnings,
+            } => {
+                let mut text = format!(
+                    "Exported {rows} rows ({bytes} bytes) to {}.",
+                    wizard.last_path.clone().unwrap_or_default()
+                );
+                if !warnings.is_empty() {
+                    text.push_str(&format!(" Warnings: {}.", warnings.join("; ")));
+                }
+                text
+            }
             ExportWizardStatus::Failed(message) => message.clone(),
         };
         let format_button =
@@ -2605,6 +2722,7 @@ impl WorkspaceView {
                     }))
             };
         let gzip_checked = wizard.gzip;
+        let database_active = wizard.database;
         let mut row = h_flex()
             .gap_2()
             .items_center()
@@ -2614,19 +2732,36 @@ impl WorkspaceView {
                     .flex_1()
                     .child(Input::new(&wizard.path).id("export-path")),
             )
-            .child(format_button(
-                "export-format-csv",
-                "CSV",
-                wizard.format == ExportFormat::Csv,
-                ExportFormat::Csv,
-            ))
-            .child(format_button(
-                "export-format-json",
-                "JSON",
-                wizard.format == ExportFormat::Json,
-                ExportFormat::Json,
-            ));
-        if !is_sql_source {
+            .child(
+                Button::new("export-database")
+                    .label("Whole database")
+                    .small()
+                    .when(database_active, |b| b.primary())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(wizard) = this.export_wizard.as_mut() {
+                            wizard.database = !wizard.database;
+                            cx.notify();
+                        }
+                    })),
+            );
+        // A dump is always SQL, structure plus data: format and
+        // scope do not apply in database mode.
+        if !database_active {
+            row = row
+                .child(format_button(
+                    "export-format-csv",
+                    "CSV",
+                    wizard.format == ExportFormat::Csv,
+                    ExportFormat::Csv,
+                ))
+                .child(format_button(
+                    "export-format-json",
+                    "JSON",
+                    wizard.format == ExportFormat::Json,
+                    ExportFormat::Json,
+                ));
+        }
+        if !database_active && !is_sql_source {
             row = row.child(format_button(
                 "export-format-sql",
                 "SQL",
@@ -2634,7 +2769,7 @@ impl WorkspaceView {
                 ExportFormat::Sql,
             ));
         }
-        if wizard.format == ExportFormat::Sql {
+        if !database_active && wizard.format == ExportFormat::Sql {
             row = row
                 .child(scope_button(
                     "export-scope-data",
@@ -2720,9 +2855,37 @@ impl WorkspaceView {
         let running = matches!(wizard.status, ImportWizardStatus::Running);
         let status_text = match &wizard.status {
             ImportWizardStatus::Idle => {
-                "Choose a CSV file, load its preview, map its columns.".to_owned()
+                if wizard.sql {
+                    "Choose a SQL file to import.".to_owned()
+                } else {
+                    "Choose a CSV file, load its preview, map its columns.".to_owned()
+                }
             }
             ImportWizardStatus::Running => "Importing…".to_owned(),
+            ImportWizardStatus::Confirming {
+                statements,
+                warnings,
+                ..
+            } => {
+                let mut text = format!(
+                    "This file holds {statements} statements and needs confirmation. Run it?"
+                );
+                if !warnings.is_empty() {
+                    text.push_str(&format!(" Warnings: {}.", warnings.join("; ")));
+                }
+                text
+            }
+            ImportWizardStatus::DoneSql(report) => {
+                let mut text = if report.cancelled {
+                    format!("Import cancelled after {} statements.", report.statements)
+                } else {
+                    format!("Imported {} statements.", report.statements)
+                };
+                if !report.warnings.is_empty() {
+                    text.push_str(&format!(" Warnings: {}.", report.warnings.join("; ")));
+                }
+                text
+            }
             ImportWizardStatus::Done(report) => {
                 if report.cancelled {
                     format!(
@@ -2739,6 +2902,23 @@ impl WorkspaceView {
             ImportWizardStatus::Failed(message) => message.clone(),
         };
         let has_header = wizard.has_header;
+        let sql_active = wizard.sql;
+        let confirming = matches!(wizard.status, ImportWizardStatus::Confirming { .. });
+        let kind_button = |id: &'static str, label: &'static str, active: bool, sql: bool| {
+            Button::new(id)
+                .label(label)
+                .small()
+                .when(active, |b| b.primary())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(wizard) = this.import_wizard.as_mut() {
+                        wizard.sql = sql;
+                        wizard.preview = None;
+                        wizard.preview_error = None;
+                        wizard.mapping_inputs = Vec::new();
+                        cx.notify();
+                    }
+                }))
+        };
         let mut row = h_flex()
             .gap_2()
             .items_center()
@@ -2748,61 +2928,68 @@ impl WorkspaceView {
                     .flex_1()
                     .child(Input::new(&wizard.path).id("import-path")),
             )
-            .child(
-                Checkbox::new(SharedString::from("import-has-header"))
-                    .label("Header row")
-                    .checked(has_header)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if let Some(wizard) = this.import_wizard.as_mut() {
-                            wizard.has_header = !wizard.has_header;
-                            wizard.preview = None;
-                            wizard.mapping_inputs = Vec::new();
-                            cx.notify();
-                        }
-                    })),
-            )
-            .child(
-                Button::new("import-load-preview")
-                    .label("Load preview")
-                    .small()
-                    .disabled(running)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.load_import_preview(window, cx);
-                    })),
-            )
-            .child(
-                Button::new("import-policy-abort")
-                    .label("Abort on error")
-                    .small()
-                    .when(wizard.policy == ImportErrorPolicy::Abort, |b| b.primary())
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if let Some(wizard) = this.import_wizard.as_mut() {
-                            wizard.policy = ImportErrorPolicy::Abort;
-                            cx.notify();
-                        }
-                    })),
-            )
-            .child(
-                Button::new("import-policy-skip")
-                    .label("Skip bad rows")
-                    .small()
-                    .when(wizard.policy == ImportErrorPolicy::SkipAndRecord, |b| {
-                        b.primary()
-                    })
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if let Some(wizard) = this.import_wizard.as_mut() {
-                            wizard.policy = ImportErrorPolicy::SkipAndRecord;
-                            cx.notify();
-                        }
-                    })),
-            )
-            .child(
-                Button::new("import-run")
-                    .label("Run")
-                    .small()
-                    .disabled(running)
-                    .on_click(cx.listener(|this, _, _, cx| this.run_import(cx))),
-            );
+            .child(kind_button("import-kind-csv", "CSV", !sql_active, false))
+            .child(kind_button("import-kind-sql", "SQL", sql_active, true));
+        // Header, preview, and mapping are CSV-only: a SQL file
+        // runs as one checked script, with no per-column mapping.
+        if !sql_active {
+            row = row
+                .child(
+                    Checkbox::new(SharedString::from("import-has-header"))
+                        .label("Header row")
+                        .checked(has_header)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(wizard) = this.import_wizard.as_mut() {
+                                wizard.has_header = !wizard.has_header;
+                                wizard.preview = None;
+                                wizard.mapping_inputs = Vec::new();
+                                cx.notify();
+                            }
+                        })),
+                )
+                .child(
+                    Button::new("import-load-preview")
+                        .label("Load preview")
+                        .small()
+                        .disabled(running)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.load_import_preview(window, cx);
+                        })),
+                )
+                .child(
+                    Button::new("import-policy-abort")
+                        .label("Abort on error")
+                        .small()
+                        .when(wizard.policy == ImportErrorPolicy::Abort, |b| b.primary())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(wizard) = this.import_wizard.as_mut() {
+                                wizard.policy = ImportErrorPolicy::Abort;
+                                cx.notify();
+                            }
+                        })),
+                )
+                .child(
+                    Button::new("import-policy-skip")
+                        .label("Skip bad rows")
+                        .small()
+                        .when(wizard.policy == ImportErrorPolicy::SkipAndRecord, |b| {
+                            b.primary()
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(wizard) = this.import_wizard.as_mut() {
+                                wizard.policy = ImportErrorPolicy::SkipAndRecord;
+                                cx.notify();
+                            }
+                        })),
+                );
+        }
+        row = row.child(
+            Button::new("import-run")
+                .label("Run")
+                .small()
+                .disabled(running || confirming)
+                .on_click(cx.listener(|this, _, _, cx| this.run_import(cx))),
+        );
         if running {
             row = row.child(
                 Button::new("import-cancel")
@@ -2829,7 +3016,7 @@ impl WorkspaceView {
             .border_color(theme.border)
             .bg(theme.background)
             .child(row);
-        if let Some(error) = &wizard.preview_error {
+        if !sql_active && let Some(error) = &wizard.preview_error {
             panel = panel.child(
                 div()
                     .id("import-preview-error")
@@ -2840,7 +3027,7 @@ impl WorkspaceView {
                     .child(error.clone()),
             );
         }
-        if let Some(preview) = &wizard.preview {
+        if !sql_active && let Some(preview) = &wizard.preview {
             let header_line = preview.columns.join(",");
             let sample_lines: Vec<String> = preview.rows.iter().map(|r| r.join(",")).collect();
             let preview_label = if sample_lines.is_empty() {
@@ -2879,6 +3066,37 @@ impl WorkspaceView {
                 .text_color(theme.muted_foreground)
                 .child(status_text),
         );
+        if let ImportWizardStatus::Confirming { path, .. } = &wizard.status {
+            let path = path.clone();
+            panel = panel.child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Button::new("import-confirm-run")
+                            .label("Run anyway")
+                            .small()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(wizard) = this.import_wizard.as_mut() {
+                                    wizard.status = ImportWizardStatus::Running;
+                                    cx.notify();
+                                }
+                                cx.emit(WorkspaceEvent::ImportSqlConfirmed { path: path.clone() });
+                            })),
+                    )
+                    .child(
+                        Button::new("import-confirm-back")
+                            .label("Back")
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(wizard) = this.import_wizard.as_mut() {
+                                    wizard.status = ImportWizardStatus::Idle;
+                                    cx.notify();
+                                }
+                            })),
+                    ),
+            );
+        }
         if let ImportWizardStatus::Done(report) = &wizard.status
             && !report.skipped.is_empty()
         {

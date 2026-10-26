@@ -29,6 +29,6 @@ pub use query_tab::{
 };
 pub use recovery::{Recovery, RecoveryEvent, move_store_aside};
 pub use workspace::{
-    ExportSource, TabContent, WorkspaceEvent, WorkspaceView, next_safe_mode, open_workspace_window,
-    restore_query, safe_mode_label,
+    ExportFinished, ExportSource, TabContent, WorkspaceEvent, WorkspaceView, next_safe_mode,
+    open_workspace_window, restore_query, safe_mode_label,
 };

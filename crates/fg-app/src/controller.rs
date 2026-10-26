@@ -1014,28 +1014,52 @@ fn wire_workspace(
                 .detach();
                 cx.spawn(async move |cx| {
                     let result = match source {
-                        crate::views::ExportSource::Table(query) => {
-                            conn.export_table_to_file(
+                        crate::views::ExportSource::Table(query) => conn
+                            .export_table_to_file(
                                 &query,
                                 &options,
                                 &control,
                                 std::path::Path::new(&path),
                             )
                             .await
-                        }
-                        crate::views::ExportSource::Sql(sql) => {
-                            conn.export_sql_to_file(
+                            .map(|report| crate::views::ExportFinished {
+                                rows: report.rows,
+                                bytes: report.bytes,
+                                warnings: Vec::new(),
+                            })
+                            .map_err(|e| e.to_string()),
+                        crate::views::ExportSource::Sql(sql) => conn
+                            .export_sql_to_file(
                                 &sql,
                                 &options,
                                 &control,
                                 std::path::Path::new(&path),
                             )
                             .await
-                        }
+                            .map(|report| crate::views::ExportFinished {
+                                rows: report.rows,
+                                bytes: report.bytes,
+                                warnings: Vec::new(),
+                            })
+                            .map_err(|e| e.to_string()),
+                        crate::views::ExportSource::Database(namespace) => conn
+                            .export_database_to_file(
+                                namespace.as_deref(),
+                                &options,
+                                &control,
+                                std::path::Path::new(&path),
+                            )
+                            .await
+                            .map(|report| crate::views::ExportFinished {
+                                rows: report.rows,
+                                bytes: report.bytes,
+                                warnings: report.warnings,
+                            })
+                            .map_err(|e| e.to_string()),
                     };
                     done.store(true, std::sync::atomic::Ordering::Relaxed);
                     view.update(cx, |v, cx| {
-                        v.set_export_finished(result.map_err(|e| e.to_string()), cx);
+                        v.set_export_finished(result, cx);
                     });
                 })
                 .detach();
@@ -1078,6 +1102,61 @@ fn wire_workspace(
                 if let Some(control) = import_control.borrow().as_ref() {
                     control.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
+            }
+            WorkspaceEvent::ImportSqlRequested { path } => {
+                let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                *import_control.borrow_mut() = Some(Arc::clone(&cancel));
+                let (conn, view, path) = (conn.clone(), view.clone(), path.clone());
+                cx.spawn(async move |cx| {
+                    match conn.preview_sql_dump(std::path::Path::new(&path)).await {
+                        Ok(preview) if preview.needs_confirmation => {
+                            view.update(cx, |v, cx| {
+                                v.set_import_confirming(
+                                    path,
+                                    preview.statements,
+                                    preview.warnings,
+                                    cx,
+                                );
+                            });
+                        }
+                        Ok(_) => {
+                            let options = fg_service::SqlImportOptions {
+                                cancel: Some(cancel),
+                            };
+                            let result = conn
+                                .import_sql_dump(std::path::Path::new(&path), &options, false)
+                                .await
+                                .map_err(|e| e.to_string());
+                            view.update(cx, |v, cx| {
+                                v.set_import_finished_sql(result, cx);
+                            });
+                        }
+                        Err(e) => {
+                            view.update(cx, |v, cx| {
+                                v.set_import_finished_sql(Err(e.to_string()), cx);
+                            });
+                        }
+                    }
+                })
+                .detach();
+            }
+            WorkspaceEvent::ImportSqlConfirmed { path } => {
+                let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                *import_control.borrow_mut() = Some(Arc::clone(&cancel));
+                let (conn, view, path) = (conn.clone(), view.clone(), path.clone());
+                cx.spawn(async move |cx| {
+                    let options = fg_service::SqlImportOptions {
+                        cancel: Some(cancel),
+                    };
+                    let result = conn
+                        .import_sql_dump(std::path::Path::new(&path), &options, true)
+                        .await
+                        .map_err(|e| e.to_string());
+                    view.update(cx, |v, cx| {
+                        v.set_import_finished_sql(result, cx);
+                    });
+                })
+                .detach();
             }
             WorkspaceEvent::McpWriteResolve { id, approved } => {
                 // A stale answer is harmless: resolving an unknown id

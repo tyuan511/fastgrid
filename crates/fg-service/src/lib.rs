@@ -56,14 +56,17 @@ use tokio::sync::broadcast;
 pub use commit::CommitOutcome;
 pub use commit_schema::{ApplySchemaOutcome, SchemaPreview};
 pub use conn::{BrowseOptions, OpenConnection, Refresh};
-pub use export::{ExportControl, ExportFormat, ExportOptions, ExportReport, ExportScope};
+pub use export::{
+    DumpReport, ExportControl, ExportFormat, ExportOptions, ExportReport, ExportScope,
+};
 pub use fg_store::AuditFilter;
 pub use fg_store::{
     ExportOptions as BackupOptions, ExportScope as BackupScope, ImportReport as BackupReport,
     StoredConnection,
 };
 pub use import::{
-    ColumnMapping, CsvImportOptions, CsvImportReport, CsvPreview, ImportErrorPolicy, preview_csv,
+    ColumnMapping, CsvImportOptions, CsvImportReport, CsvPreview, ImportErrorPolicy,
+    SqlDumpPreview, SqlImportOptions, SqlImportReport, preview_csv,
 };
 pub use keychain::{
     DEV_KEYRING_FILE, FileBackend, KeychainKeyProvider, MemoryBackend, OsKeychain, SecretBackend,
