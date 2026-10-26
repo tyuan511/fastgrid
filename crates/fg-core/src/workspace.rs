@@ -263,6 +263,11 @@ pub struct PrivacySettings {
     /// Off unless the user turns it on.
     #[serde(default)]
     pub telemetry: bool,
+    /// Update checks are off unless the user turns them on. When on, the
+    /// launcher asks GitHub for the latest release tag and shows a notice;
+    /// fastgrid never downloads or installs an update by itself.
+    #[serde(default)]
+    pub auto_update: bool,
 }
 
 impl SettingGroup for PrivacySettings {

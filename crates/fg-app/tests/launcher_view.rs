@@ -931,3 +931,65 @@ fn mcp_http_panel_opens_and_requests_a_start(cx: &mut TestAppContext) {
     assert_eq!(events.len(), 1, "expected one event, got: {events:?}");
     assert!(matches!(events[0], LauncherEvent::StartMcpHttp));
 }
+
+#[gpui_kit::test]
+fn diagnostics_panel_opens_and_requests_export_and_telemetry_toggle(cx: &mut TestAppContext) {
+    let f = open(cx, vec![row("billing", true)]);
+    cx.update_window(f.window, |_, window, cx| {
+        window.click("diagnostics", cx);
+        window.render_frame(cx);
+        let _ = window.find("diagnostics-panel").bounds();
+        window.click("diagnostics-path", cx);
+        window.input("/tmp/fg-diag-test.txt", cx);
+        window.render_frame(cx);
+        // The toggle starts unknown (the controller has not reported
+        // yet); from unknown it asks to turn telemetry on.
+        window.click("diagnostics-telemetry-toggle", cx);
+        window.click("diagnostics-export", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let events = f.events.borrow();
+    assert_eq!(events.len(), 3, "expected three events, got: {events:?}");
+    assert!(matches!(events[0], LauncherEvent::DiagnosticsOpened));
+    assert!(matches!(events[1], LauncherEvent::SetTelemetry(true)));
+    let LauncherEvent::ExportDiagnostics { path } = &events[2] else {
+        panic!("expected ExportDiagnostics, got: {:?}", events[2]);
+    };
+    assert_eq!(path, "/tmp/fg-diag-test.txt", "exported path was: {path:?}");
+}
+
+#[gpui_kit::test]
+fn update_notice_shows_when_a_newer_release_is_set(cx: &mut TestAppContext) {
+    let f = open(cx, vec![row("billing", true)]);
+    cx.update_window(f.window, |_, window, cx| {
+        f.view.update(cx, |v, cx| {
+            v.set_update_available(Some("v9.9.9".to_owned()), cx);
+        });
+        window.render_frame(cx);
+        let _ = window.find("update-notice").bounds();
+        f.view.update(cx, |v, cx| {
+            v.set_update_available(None, cx);
+        });
+        window.render_frame(cx);
+        assert!(window.try_find("update-notice").is_none());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn diagnostics_auto_update_toggle_requests_a_change(cx: &mut TestAppContext) {
+    let f = open(cx, vec![row("billing", true)]);
+    cx.update_window(f.window, |_, window, cx| {
+        window.click("diagnostics", cx);
+        window.render_frame(cx);
+        let _ = window.find("diagnostics-panel").bounds();
+        window.click("diagnostics-auto-update-toggle", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let events = f.events.borrow();
+    assert_eq!(events.len(), 2, "expected two events, got: {events:?}");
+    assert!(matches!(events[0], LauncherEvent::DiagnosticsOpened));
+    assert!(matches!(events[1], LauncherEvent::SetAutoUpdate(true)));
+}

@@ -1,0 +1,8 @@
+[book]
+title = "fastgrid"
+authors = ["tyuan511"]
+language = "zh"
+src = "docs"
+
+[build]
+build-dir = "book"

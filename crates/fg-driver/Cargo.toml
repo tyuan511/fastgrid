@@ -36,6 +36,15 @@ postgres = [
     "dep:bit-vec",
 ]
 
+[dev-dependencies]
+criterion.workspace = true
+
+# criterion_main! defines its own main; the libtest harness would
+# otherwise swallow it and report "0 tests".
+[[bench]]
+name = "sqlite"
+harness = false
+
 [dependencies]
 fg-core.workspace = true
 async-trait.workspace = true

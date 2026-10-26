@@ -23,12 +23,15 @@ keyring.workspace = true
 fg-sql.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "macros", "fs"] }
 tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde.workspace = true
 serde_json.workspace = true
 russh = "0.64"
 tokio-stream = "0.1"
 async-compression = { version = "0.4", features = ["tokio", "gzip"] }
 csv = "1"
+# Update checks only: one GET to the GitHub releases API, no downloads.
+ureq = { version = "3", features = ["rustls"] }
 
 
 [dev-dependencies]

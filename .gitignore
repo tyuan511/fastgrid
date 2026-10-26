@@ -1,5 +1,7 @@
 # Rust build artifacts
 /target
+/dist
+/book
 
 # OS and Editor files
 .DS_Store

@@ -38,6 +38,8 @@ uuid = { version = "1", features = ["v7"] }
 keyring = "4.2"
 dirs = "7"
 rusqlite = { version = "0.40", features = ["bundled", "column_decltype", "column_metadata"] }
+# Benches only (fg-sql, fg-driver); never a runtime dependency.
+criterion = "0.8"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -162,6 +162,18 @@ pub enum LauncherEvent {
     /// Replace the bearer token. The running server reads the token
     /// per request, so this needs no restart.
     RotateMcpToken,
+    /// The diagnostics panel opened; the controller reports the current
+    /// telemetry setting through `set_diagnostics_telemetry`.
+    DiagnosticsOpened,
+    /// Write the diagnostics bundle to this path. The controller builds
+    /// it and reports back through `set_diagnostics_status`.
+    ExportDiagnostics {
+        path: String,
+    },
+    /// Turn telemetry on or off and persist the choice. The controller
+    /// reports back through `set_diagnostics_telemetry`.
+    SetTelemetry(bool),
+    SetAutoUpdate(bool),
 }
 
 type Choice = Entity<SelectState<SearchableVec<SharedString>>>;
@@ -236,6 +248,16 @@ struct McpHttpPanel {
     status: Option<SharedString>,
 }
 
+/// The diagnostics panel: an export path, the telemetry switch, and the
+/// last status. `telemetry` is `None` until the controller reports the
+/// stored setting after the panel opens.
+struct DiagnosticsPanel {
+    path: Entity<InputState>,
+    telemetry: Option<bool>,
+    auto_update: Option<bool>,
+    status: Option<SharedString>,
+}
+
 pub struct Launcher {
     rows: Vec<Row>,
     groups: Vec<ConnectionGroup>,
@@ -248,6 +270,8 @@ pub struct Launcher {
     group_editor: Option<GroupEditor>,
     backup: Option<BackupPanel>,
     mcp_http: Option<McpHttpPanel>,
+    diagnostics: Option<DiagnosticsPanel>,
+    update_available: Option<SharedString>,
     confirm_delete: Option<ConnectionId>,
     confirm_delete_group: Option<GroupId>,
     show_backup_nudge: bool,
@@ -343,6 +367,8 @@ impl Launcher {
             group_editor: None,
             backup: None,
             mcp_http: None,
+            diagnostics: None,
+            update_available: None,
             confirm_delete: None,
             confirm_delete_group: None,
             show_backup_nudge: false,
@@ -507,6 +533,82 @@ impl Launcher {
     pub fn close_mcp_http_panel(&mut self, cx: &mut Context<Self>) {
         self.mcp_http = None;
         cx.notify();
+    }
+
+    /// Open the diagnostics panel. The telemetry value arrives from the
+    /// controller (`DiagnosticsOpened`); until then the switch shows an
+    /// unknown state rather than guessing the default.
+    pub fn open_diagnostics_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.diagnostics.is_none() {
+            self.diagnostics = Some(DiagnosticsPanel {
+                path: editor_input("Diagnostics file path…", "", false, window, cx),
+                telemetry: None,
+                auto_update: None,
+                status: None,
+            });
+        }
+        cx.notify();
+    }
+
+    pub fn close_diagnostics_panel(&mut self, cx: &mut Context<Self>) {
+        self.diagnostics = None;
+        cx.notify();
+    }
+
+    /// The controller's report for the panel: the stored telemetry
+    /// setting, or the result of a toggle. A report that arrives after
+    /// the panel closed is dropped: there is nothing to show it in.
+    pub fn set_diagnostics_telemetry(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if let Some(panel) = self.diagnostics.as_mut() {
+            panel.telemetry = Some(enabled);
+            cx.notify();
+        }
+    }
+
+    pub fn set_diagnostics_auto_update(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if let Some(panel) = self.diagnostics.as_mut() {
+            panel.auto_update = Some(enabled);
+            cx.notify();
+        }
+    }
+
+    pub fn set_diagnostics_status(&mut self, status: String, cx: &mut Context<Self>) {
+        if let Some(panel) = self.diagnostics.as_mut() {
+            panel.status = Some(SharedString::from(status));
+            cx.notify();
+        }
+    }
+
+    pub fn diagnostics_telemetry(&self) -> Option<bool> {
+        self.diagnostics.as_ref().and_then(|p| p.telemetry)
+    }
+
+    pub fn diagnostics_auto_update(&self) -> Option<bool> {
+        self.diagnostics.as_ref().and_then(|p| p.auto_update)
+    }
+
+    pub fn set_update_available(&mut self, tag: Option<String>, cx: &mut Context<Self>) {
+        self.update_available = tag.map(SharedString::from);
+        cx.notify();
+    }
+
+    /// The update notice line, if a newer release was found. Rendered
+    /// below the panels so it never covers the connection list.
+    fn update_notice(&self) -> Option<AnyElement> {
+        let tag = self.update_available.clone()?;
+        let is_zh = is_chinese_locale();
+        Some(
+            div()
+                .id("update-notice")
+                .test_support()
+                .text_size(px(12.))
+                .child(if is_zh {
+                    format!("有新版本 {tag}，请到发布页手动下载安装。")
+                } else {
+                    format!("Update available: {tag} (download it from the releases page)")
+                })
+                .into_any_element(),
+        )
     }
 
     /// Whether the panel currently shows a running server, so a token
@@ -1673,6 +1775,18 @@ impl Render for Launcher {
                         )
                         .child(
                             tableplus_action_button(
+                                "diagnostics",
+                                hugeicon(Hugeicon::Info),
+                                if is_zh { "诊断" } else { "Diagnostics" },
+                                cx,
+                            )
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_diagnostics_panel(window, cx);
+                                cx.emit(LauncherEvent::DiagnosticsOpened);
+                            })),
+                        )
+                        .child(
+                            tableplus_action_button(
                                 "new-connection",
                                 hugeicon(Hugeicon::Plug),
                                 if is_zh {
@@ -1810,6 +1924,8 @@ impl Render for Launcher {
                     .when_some(self.render_group_editor(cx), |d, editor| d.child(editor))
                     .when_some(self.render_backup_panel(cx), |d, panel| d.child(panel))
                     .when_some(self.render_mcp_http_panel(cx), |d, panel| d.child(panel))
+                    .when_some(self.render_diagnostics_panel(cx), |d, panel| d.child(panel))
+                    .when_some(self.update_notice(), |d, notice| d.child(notice))
                     .child(
                         // Headless test-support action triggers.
                         // Visual operations are right-click only (matching TablePlus).
@@ -2052,6 +2168,150 @@ impl Launcher {
                         .small()
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.close_mcp_http_panel(cx);
+                        })),
+                ),
+        );
+        Some(body.into_any_element())
+    }
+
+    fn render_diagnostics_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let panel = self.diagnostics.as_ref()?;
+        let theme = cx.theme().clone();
+        let is_zh = is_chinese_locale();
+        let mut body = v_flex()
+            .id("diagnostics-panel")
+            .test_support()
+            .gap_2()
+            .p_2()
+            .rounded(px(6.))
+            .border_1()
+            .border_color(theme.border)
+            // Without a cap, the long description below sizes the whole
+            // launcher column past the window, and the full-width path
+            // input's center lands outside it (clicks there miss).
+            .max_w(px(560.))
+            .child(div().font_weight(FontWeight::SEMIBOLD).child(if is_zh {
+                "诊断与隐私"
+            } else {
+                "Diagnostics & privacy"
+            }))
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(theme.muted_foreground)
+                    .child(if is_zh {
+                        "导出包含版本、平台、遥测开关、按引擎统计的连接数与日志尾部；不含密码、连接串、SQL 与连接名。"
+                    } else {
+                        "Export holds the version, platform, telemetry setting, connection counts by engine, and the log tail. No passwords, connection strings, SQL, or connection names."
+                    }),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(div().text_size(px(12.)).child(match panel.telemetry {
+                        Some(true) => {
+                            if is_zh {
+                                "遥测：开"
+                            } else {
+                                "Telemetry: on"
+                            }
+                        }
+                        Some(false) => {
+                            if is_zh {
+                                "遥测：关"
+                            } else {
+                                "Telemetry: off"
+                            }
+                        }
+                        None => {
+                            if is_zh {
+                                "遥测：读取中…"
+                            } else {
+                                "Telemetry: loading…"
+                            }
+                        }
+                    }))
+                    .child(
+                        Button::new("diagnostics-telemetry-toggle")
+                            .label(if is_zh { "切换" } else { "Toggle" })
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let next =
+                                    !this.diagnostics_telemetry().unwrap_or(false);
+                                cx.emit(LauncherEvent::SetTelemetry(next));
+                            })),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(div().text_size(px(12.)).child(match panel.auto_update {
+                        Some(true) => {
+                            if is_zh {
+                                "自动检查更新：开"
+                            } else {
+                                "Update checks: on"
+                            }
+                        }
+                        Some(false) => {
+                            if is_zh {
+                                "自动检查更新：关"
+                            } else {
+                                "Update checks: off"
+                            }
+                        }
+                        None => {
+                            if is_zh {
+                                "自动检查更新：读取中…"
+                            } else {
+                                "Update checks: loading…"
+                            }
+                        }
+                    }))
+                    .child(
+                        Button::new("diagnostics-auto-update-toggle")
+                            .label(if is_zh { "切换" } else { "Toggle" })
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let next =
+                                    !this.diagnostics_auto_update().unwrap_or(false);
+                                cx.emit(LauncherEvent::SetAutoUpdate(next));
+                            })),
+                    ),
+            )
+            .child(Input::new(&panel.path).id("diagnostics-path"));
+        if let Some(status) = &panel.status {
+            body = body.child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(theme.muted_foreground)
+                    .child(status.clone()),
+            );
+        }
+        body = body.child(
+            h_flex()
+                .gap_2()
+                .child(
+                    Button::new("diagnostics-export")
+                        .label(if is_zh { "导出" } else { "Export" })
+                        .small()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let path = this
+                                .diagnostics
+                                .as_ref()
+                                .map(|p| p.path.read(cx).value().to_string())
+                                .unwrap_or_default();
+                            cx.emit(LauncherEvent::ExportDiagnostics { path });
+                        })),
+                )
+                .child(
+                    Button::new("diagnostics-close")
+                        .label(if is_zh { "关闭" } else { "Close" })
+                        .small()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.close_diagnostics_panel(cx);
                         })),
                 ),
         );

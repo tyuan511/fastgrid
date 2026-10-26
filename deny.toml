@@ -1,6 +1,15 @@
 [licenses]
 allow = ["Apache-2.0", "MIT", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib", "0BSD", "MPL-2.0", "CC0-1.0", "OpenSSL"]
 
+# webpki-roots 1.x relicensed its root store under CDLA-Permissive-2.0, a
+# permissive license in the same spirit as the allow list (use, modify,
+# and distribute with attribution). It reaches us only through ureq's
+# `rustls` feature, which the opt-in update check uses for one GitHub
+# API GET. Narrow exception: one crate, one license, pinned major line.
+exceptions = [
+  { name = "webpki-roots", version = "1", allow = ["CDLA-Permissive-2.0"] },
+]
+
 # RUSTSEC's `unmaintained` notices fire for crates that only reach us transitively: GPUI Kit
 # (text shaping, SVG rasterising, its vendored reqwest, its Linux accessibility stack) and the
 # D-Bus crates behind `keyring`/atspi on Linux. None is a vulnerability, and none can be
@@ -9,6 +18,7 @@ allow = ["Apache-2.0", "MIT", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.
 # Drop an entry once the offending crate leaves the tree.
 [advisories]
 ignore = [
+  { id = "RUSTSEC-2023-0071", reason = "rsa: Marvin timing attack, no patched version exists (patched = [] as of 2026-09-12). fastgrid reaches rsa only through russh as an SSH client (signing and host-key verification), never decrypting attacker-chosen ciphertexts, which matches the advisory's own workaround that local use on a non-compromised computer is fine. Revisit if a patched rsa ships." },
   { id = "RUSTSEC-2024-0384", reason = "instant: gpui-base/gpui-component dependency, the suggested web-time replacement is wasm-only" },
   { id = "RUSTSEC-2024-0436", reason = "paste: proc-macro helper of gpui-component, metal and exr/pulp; archived but functional" },
   { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile: inside gpui-kit's vendored reqwest; we hand it no PEM - TLS is rustls and keys live in the OS keychain" },

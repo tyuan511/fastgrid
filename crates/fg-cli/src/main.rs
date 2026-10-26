@@ -123,6 +123,9 @@ fn data_dir() -> PathBuf {
 /// headless operator has no GUI panel to read it from.
 fn serve_mcp_http(port: u16) -> io::Result<()> {
     let data_dir = data_dir();
+    if let Err(e) = fg_service::init_file_logging(&data_dir) {
+        eprintln!("fastgrid-cli: file logging unavailable: {e}");
+    }
     let options = ServiceOptions::new(data_dir.join("store.db"));
     let keys = default_key_provider(&data_dir);
     let service =
@@ -147,6 +150,9 @@ fn serve_mcp_http(port: u16) -> io::Result<()> {
 /// relies on the statement timeout rather than a mid-call cancel.
 fn serve_mcp() -> io::Result<()> {
     let data_dir = data_dir();
+    if let Err(e) = fg_service::init_file_logging(&data_dir) {
+        eprintln!("fastgrid-cli: file logging unavailable: {e}");
+    }
     let mut options = ServiceOptions::new(data_dir.join("store.db"));
     options.force_read_only = true;
     let keys = default_key_provider(&data_dir);

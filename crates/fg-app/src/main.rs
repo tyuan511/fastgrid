@@ -25,6 +25,11 @@ fn start_service(data_dir: &std::path::Path) -> Result<Service, Error> {
 
 fn main() {
     let data_dir = data_dir();
+    // Logging must never fail startup: without it, tracing events are
+    // dropped exactly as before, and the diagnostics export says so.
+    if let Err(e) = fg_service::init_file_logging(&data_dir) {
+        eprintln!("fastgrid: file logging unavailable: {e}");
+    }
     let started = start_service(&data_dir);
 
     gpui_kit::application()

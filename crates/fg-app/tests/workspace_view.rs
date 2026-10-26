@@ -960,3 +960,100 @@ fn audit_panel_shows_rows_and_requests_export(cx: &mut TestAppContext) {
     .unwrap();
     assert_eq!(*events.borrow(), vec!["/tmp/fg-audit-test.csv"]);
 }
+
+#[gpui_kit::test]
+fn command_palette_opens_with_its_key_and_toggles_shut(cx: &mut TestAppContext) {
+    let f = open(cx);
+    assert!(!cx.read_entity(&f.view, |v, _| v.command_palette_visible()));
+    press(cx, &f, "secondary-shift-p");
+    assert!(
+        cx.read_entity(&f.view, |v, _| v.command_palette_visible()),
+        "⌘⇧P opens the palette"
+    );
+    cx.update_window(f.window, |_, window, _| {
+        assert!(window.try_find("command-palette").is_some());
+    })
+    .unwrap();
+    press(cx, &f, "secondary-shift-p");
+    assert!(
+        !cx.read_entity(&f.view, |v, _| v.command_palette_visible()),
+        "the same key closes it again"
+    );
+}
+
+#[gpui_kit::test]
+fn dismiss_topmost_closes_overlays_in_order(cx: &mut TestAppContext) {
+    let f = open(cx);
+    press(cx, &f, "secondary-p");
+    cx.update_window(f.window, |_, window, cx| {
+        f.view.update(cx, |v, cx| v.open_history(window, cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert!(quick_visible(cx, &f));
+    assert!(cx.read_entity(&f.view, |v, _| v.history_visible()));
+
+    // The palette outranks both.
+    cx.update_window(f.window, |_, window, cx| {
+        f.view
+            .update(cx, |v, cx| v.open_command_palette(window, cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let dismiss = |cx: &mut TestAppContext| {
+        cx.update_window(f.window, |_, window, cx| {
+            f.view.update(cx, |v, cx| {
+                v.dismiss_topmost(window, cx);
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+    };
+    dismiss(cx);
+    assert!(!cx.read_entity(&f.view, |v, _| v.command_palette_visible()));
+    assert!(
+        quick_visible(cx, &f),
+        "quick open survives the first dismiss"
+    );
+    dismiss(cx);
+    assert!(!quick_visible(cx, &f), "quick open goes second");
+    assert!(
+        cx.read_entity(&f.view, |v, _| v.history_visible()),
+        "history survives until its turn"
+    );
+    dismiss(cx);
+    assert!(!cx.read_entity(&f.view, |v, _| v.history_visible()));
+}
+
+#[gpui_kit::test]
+fn audit_panel_toggles_with_its_key(cx: &mut TestAppContext) {
+    let f = open(cx);
+    press(cx, &f, "secondary-shift-a");
+    cx.update_window(f.window, |_, window, _| {
+        assert!(window.try_find("audit-panel").is_some());
+    })
+    .unwrap();
+    press(cx, &f, "secondary-shift-a");
+    cx.update_window(f.window, |_, window, _| {
+        assert!(window.try_find("audit-panel").is_none());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn details_panel_toggles_with_its_key(cx: &mut TestAppContext) {
+    let f = open(cx);
+    let initial = cx.read_entity(&f.view, |v, _| v.details_visible());
+    press(cx, &f, "secondary-shift-d");
+    assert_ne!(
+        cx.read_entity(&f.view, |v, _| v.details_visible()),
+        initial,
+        "the key flips the panel"
+    );
+    press(cx, &f, "secondary-shift-d");
+    assert_eq!(
+        cx.read_entity(&f.view, |v, _| v.details_visible()),
+        initial,
+        "the same key flips it back"
+    );
+}

@@ -30,9 +30,10 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::actions::{
-    CloseTab, ExportWizard, HISTORY_CONTEXT, HistoryDismiss, HistoryNext, HistoryOpen, HistoryPrev,
-    ImportWizard, NewQuery, NextTab, PrevTab, QuickOpen, RefreshSchema, SNIPPETS_CONTEXT,
-    SaveSnippet, SnippetDismiss, SnippetOpen, SwitchDatabase, ToggleFilters, ToggleHistory,
+    CloseTab, CommandPalette, CycleSafeMode, CycleTheme, DismissTopmost, ExportWizard,
+    HISTORY_CONTEXT, HistoryDismiss, HistoryNext, HistoryOpen, HistoryPrev, ImportWizard, NewQuery,
+    NextTab, PrevTab, QuickOpen, RefreshSchema, SNIPPETS_CONTEXT, SaveSnippet, SnippetDismiss,
+    SnippetOpen, SwitchDatabase, ToggleAudit, ToggleDetails, ToggleFilters, ToggleHistory,
     ToggleSidebar, ToggleSnippets, WORKSPACE_CONTEXT,
 };
 use super::grid::{TableTab, TableTabEvent};
@@ -198,6 +199,12 @@ pub struct WorkspaceView {
     details_visible: bool,
     focus: FocusHandle,
     quick: Option<QuickOpenState>,
+    /// The `⌘⇧P` palette: workspace commands by name. Only workspace-level
+    /// commands are listed: confirming an item dispatches its action from
+    /// the palette overlay, which bubbles to this view, so grid- and
+    /// editor-scoped actions (they live in other branches) cannot be
+    /// reached from here and keep their keys instead.
+    commands: Option<CommandPaletteState>,
     /// The `⌘K` panel: databases on this server, for switching without reopening.
     switcher: Option<SwitchDatabaseState>,
     /// The `⌘Y` panel: recent statements of this connection, newest first.
@@ -317,6 +324,13 @@ struct QuickOpenState {
     query: String,
 }
 
+/// The open `⌘⇧P` palette: just its widget. The command list is static,
+/// so the widget's own substring filter is enough and no query state is
+/// kept here (unlike Quick Open, which ranks its own matches).
+struct CommandPaletteState {
+    palette: Entity<CommandState>,
+}
+
 /// How many matches the palette lists.
 const QUICK_RESULTS: usize = 50;
 
@@ -397,6 +411,7 @@ impl WorkspaceView {
             details_visible: true,
             focus: cx.focus_handle(),
             quick: None,
+            commands: None,
             switcher: None,
             history: None,
             snippets: None,
@@ -1094,6 +1109,94 @@ impl WorkspaceView {
         }
     }
 
+    // ---- command palette ---------------------------------------------------------------
+
+    pub fn command_palette_visible(&self) -> bool {
+        self.commands.is_some()
+    }
+
+    /// Open the `⌘⇧P` palette, or close it when it is already open. The
+    /// widget dispatches the confirmed item's action itself; this view
+    /// only closes the palette afterwards.
+    pub fn open_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.commands.is_some() {
+            self.close_command_palette(window, cx);
+            return;
+        }
+        let palette = cx.new(|cx| CommandState::new(window, cx));
+        palette.update(cx, |p, cx| p.focus(window, cx));
+        self.commands = Some(CommandPaletteState { palette });
+        cx.notify();
+    }
+
+    pub fn close_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.commands.take().is_some() {
+            window.focus(&self.focus, cx);
+            cx.notify();
+        }
+    }
+
+    /// Close the topmost overlay, if any, and report whether one closed.
+    /// Order is outermost-in for what the user sees: the palette, then
+    /// the jump/switch panels, then the wizards, then the side panels,
+    /// then the active tab's filter drawer, then the close-confirmation
+    /// banner. Agent approvals are deliberately absent: a parked agent
+    /// write must be answered, never dismissed unseen. Tabs are never
+    /// closed here, and neither is the app.
+    pub fn dismiss_topmost(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.commands.is_some() {
+            self.close_command_palette(window, cx);
+            return true;
+        }
+        if self.quick.is_some() {
+            self.close_quick_open(window, cx);
+            return true;
+        }
+        if self.switcher.is_some() {
+            self.close_database_switcher(window, cx);
+            return true;
+        }
+        if self.export_wizard.is_some() {
+            self.close_export_wizard(cx);
+            return true;
+        }
+        if self.import_wizard.is_some() {
+            self.close_import_wizard(cx);
+            return true;
+        }
+        if self.history.is_some() {
+            self.close_history(cx);
+            return true;
+        }
+        if self.snippets.is_some() {
+            self.close_snippets(cx);
+            return true;
+        }
+        if self.audit.is_some() {
+            self.close_audit(cx);
+            return true;
+        }
+        let drawer_open = self
+            .tabs
+            .active()
+            .and_then(|t| self.tab_views.get(&t.id))
+            .cloned()
+            .is_some_and(|tab| match tab {
+                TabContent::Table(tab) => tab.read(cx).filters_open(),
+                TabContent::Query(_) => false,
+            });
+        if drawer_open {
+            self.toggle_filters_of_active_tab(cx);
+            return true;
+        }
+        if self.confirm_close.is_some() {
+            self.confirm_close = None;
+            cx.notify();
+            return true;
+        }
+        false
+    }
+
     /// Open the item at `index` of the palette's list.
     fn confirm_quick_open(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let target = self
@@ -1629,6 +1732,7 @@ const TOOLBAR_ICON_BOX: Pixels = px(24.);
 impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
+        let is_zh = crate::views::style::is_zh_locale();
         let view = cx.entity().downgrade();
         let active_table_name = self.tabs.active().map(|t| match &t.kind {
             TabKind::Table { path, .. } => table_title(path),
@@ -1690,7 +1794,11 @@ impl Render for WorkspaceView {
                                     .icon(hugeicon(Hugeicon::SidebarLeft))
                                     .ghost()
                                     .with_size(TOOLBAR_ICON_BOX)
-                                    .tooltip("Toggle sidebar")
+                                    .tooltip(if is_zh {
+                                        "切换侧栏"
+                                    } else {
+                                        "Toggle sidebar"
+                                    })
                                     .on_click(
                                         cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)),
                                     ),
@@ -1703,7 +1811,11 @@ impl Render for WorkspaceView {
                                         .icon(hugeicon(Hugeicon::CircleX))
                                         .ghost()
                                         .with_size(TOOLBAR_ICON_BOX)
-                                        .tooltip("Cancel the running statement")
+                                        .tooltip(if is_zh {
+                                            "取消正在运行的语句"
+                                        } else {
+                                            "Cancel the running statement"
+                                        })
                                         .when(!self.active_query_running(cx), |b| b.disabled(true))
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             if let Some(tab) = this.query_view_of_active().cloned()
@@ -1718,7 +1830,11 @@ impl Render for WorkspaceView {
                                         .icon(hugeicon(Hugeicon::History))
                                         .ghost()
                                         .with_size(TOOLBAR_ICON_BOX)
-                                        .tooltip("Query history")
+                                        .tooltip(if is_zh {
+                                            "查询历史"
+                                        } else {
+                                            "Query history"
+                                        })
                                         .when(self.history.is_some(), |b| b.primary())
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.open_history(window, cx)
@@ -1729,7 +1845,7 @@ impl Render for WorkspaceView {
                                         .icon(hugeicon(Hugeicon::Lock))
                                         .ghost()
                                         .with_size(TOOLBAR_ICON_BOX)
-                                        .tooltip("Audit log")
+                                        .tooltip(if is_zh { "审计日志" } else { "Audit log" })
                                         .when(self.audit.is_some(), |b| b.primary())
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.open_audit(window, cx)
@@ -1747,10 +1863,14 @@ impl Render for WorkspaceView {
                                         }))
                                         .ghost()
                                         .with_size(TOOLBAR_ICON_BOX)
-                                        .tooltip(format!(
-                                            "Safe mode: {}",
-                                            safe_mode_label(self.safe_mode)
-                                        ))
+                                        .tooltip(if is_zh {
+                                            format!("安全模式：{}", safe_mode_label(self.safe_mode))
+                                        } else {
+                                            format!(
+                                                "Safe mode: {}",
+                                                safe_mode_label(self.safe_mode)
+                                            )
+                                        })
                                         .when(self.safe_mode != SafeMode::Normal, |b| b.primary())
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             cx.emit(WorkspaceEvent::SafeModeChanged {
@@ -1771,7 +1891,7 @@ impl Render for WorkspaceView {
                                         )
                                         .ghost()
                                         .h(TOOLBAR_ICON_BOX)
-                                        .tooltip("New query")
+                                        .tooltip(if is_zh { "新建查询" } else { "New query" })
                                         .on_click(cx.listener(|_, _, _, cx| {
                                             cx.emit(WorkspaceEvent::NewQueryRequested)
                                         })),
@@ -1822,7 +1942,11 @@ impl Render for WorkspaceView {
                                         .icon(hugeicon(Hugeicon::Refresh))
                                         .ghost()
                                         .with_size(TOOLBAR_ICON_BOX)
-                                        .tooltip("Refresh schema")
+                                        .tooltip(if is_zh {
+                                            "刷新结构"
+                                        } else {
+                                            "Refresh schema"
+                                        })
                                         .on_click(cx.listener(|_, _, _, cx| {
                                             cx.emit(WorkspaceEvent::RefreshSchema)
                                         })),
@@ -1837,12 +1961,21 @@ impl Render for WorkspaceView {
                                         })
                                         .ghost()
                                         .with_size(TOOLBAR_ICON_BOX)
-                                        .tooltip(format!(
-                                            "Theme: {}",
-                                            crate::theme_control::label(
-                                                crate::theme_control::chosen(cx)
+                                        .tooltip(if is_zh {
+                                            format!(
+                                                "主题：{}",
+                                                crate::theme_control::label(
+                                                    crate::theme_control::chosen(cx)
+                                                )
                                             )
-                                        ))
+                                        } else {
+                                            format!(
+                                                "Theme: {}",
+                                                crate::theme_control::label(
+                                                    crate::theme_control::chosen(cx)
+                                                )
+                                            )
+                                        })
                                         .on_click(cx.listener(|_, _, _, cx| {
                                             cx.emit(WorkspaceEvent::CycleTheme)
                                         })),
@@ -1854,7 +1987,11 @@ impl Render for WorkspaceView {
                                     .icon(hugeicon(Hugeicon::SidebarRight))
                                     .ghost()
                                     .with_size(TOOLBAR_ICON_BOX)
-                                    .tooltip("Toggle details panel")
+                                    .tooltip(if is_zh {
+                                        "切换详情面板"
+                                    } else {
+                                        "Toggle details panel"
+                                    })
                                     .on_click(
                                         cx.listener(|this, _, _, cx| this.toggle_details(cx)),
                                     ),
@@ -1880,6 +2017,12 @@ impl Render for WorkspaceView {
             .on_action(
                 cx.listener(|this, _: &QuickOpen, window, cx| this.open_quick_open(window, cx)),
             )
+            .on_action(cx.listener(|this, _: &CommandPalette, window, cx| {
+                this.open_command_palette(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &DismissTopmost, window, cx| {
+                this.dismiss_topmost(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &SwitchDatabase, window, cx| {
                 this.open_database_switcher(window, cx)
             }))
@@ -1903,6 +2046,14 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|this, _: &NextTab, _, cx| this.next_tab(cx)))
             .on_action(cx.listener(|this, _: &PrevTab, _, cx| this.prev_tab(cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
+            .on_action(cx.listener(|this, _: &ToggleAudit, window, cx| this.open_audit(window, cx)))
+            .on_action(cx.listener(|this, _: &CycleSafeMode, _, cx| {
+                cx.emit(WorkspaceEvent::SafeModeChanged {
+                    mode: next_safe_mode(this.safe_mode),
+                })
+            }))
+            .on_action(cx.listener(|_, _: &CycleTheme, _, cx| cx.emit(WorkspaceEvent::CycleTheme)))
+            .on_action(cx.listener(|this, _: &ToggleDetails, _, cx| this.toggle_details(cx)))
             .on_action(
                 cx.listener(|this, _: &ToggleFilters, _, cx| this.toggle_filters_of_active_tab(cx)),
             )
@@ -1951,10 +2102,143 @@ impl Render for WorkspaceView {
             .children(snippets)
             .children(overlay)
             .children(self.render_database_switcher(window, cx))
+            .children(self.render_command_palette(window, cx))
     }
 }
 
 impl WorkspaceView {
+    /// The `⌘⇧P` palette, drawn over the window like Quick Open. The
+    /// widget dispatches the confirmed item's action (and shows its
+    /// keybinding) itself; closing the palette is all we do afterwards.
+    /// Only workspace-level commands are listed, for the reason on the
+    /// `commands` field: grid and editor actions keep their keys.
+    fn render_command_palette(&self, _: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let state = self.commands.as_ref()?;
+        let theme = cx.theme().clone();
+        let view = cx.entity().downgrade();
+        let (confirm_view, cancel_view) = (view.clone(), view);
+
+        let item = |label: &str, keywords: &[&str], action: Box<dyn gpui_kit::Action>| {
+            let mut item = CommandItem::new().label(label.to_owned()).action(action);
+            if !keywords.is_empty() {
+                item = item.keywords(keywords.iter().map(|k| k.to_string()).collect::<Vec<_>>());
+            }
+            item
+        };
+        let items = [
+            item(
+                "Quick Open…",
+                &["open", "table", "view", "jump"],
+                Box::new(QuickOpen),
+            ),
+            item(
+                "Switch database…",
+                &["database", "schema", "server"],
+                Box::new(SwitchDatabase),
+            ),
+            item(
+                "New query tab",
+                &["query", "sql", "new"],
+                Box::new(NewQuery),
+            ),
+            item("Close tab", &["close"], Box::new(CloseTab)),
+            item("Next tab", &["next"], Box::new(NextTab)),
+            item("Previous tab", &["previous"], Box::new(PrevTab)),
+            item(
+                "Toggle sidebar",
+                &["sidebar", "tree"],
+                Box::new(ToggleSidebar),
+            ),
+            item(
+                "Toggle details panel",
+                &["details"],
+                Box::new(ToggleDetails),
+            ),
+            item("Audit log", &["audit", "log"], Box::new(ToggleAudit)),
+            item(
+                "Cycle safe mode",
+                &["safe", "mode"],
+                Box::new(CycleSafeMode),
+            ),
+            item(
+                "Cycle theme",
+                &["theme", "dark", "light"],
+                Box::new(CycleTheme),
+            ),
+            item(
+                "Query history",
+                &["history", "recent", "statements"],
+                Box::new(ToggleHistory),
+            ),
+            item(
+                "Snippets",
+                &["snippets", "fragments", "saved"],
+                Box::new(ToggleSnippets),
+            ),
+            item(
+                "Save current statement as snippet",
+                &["save", "snippet"],
+                Box::new(SaveSnippet),
+            ),
+            item(
+                "Refresh schema",
+                &["refresh", "reload", "schema"],
+                Box::new(RefreshSchema),
+            ),
+            item(
+                "Toggle filters",
+                &["filter", "drawer"],
+                Box::new(ToggleFilters),
+            ),
+            item(
+                "Export…",
+                &["export", "csv", "json", "sql"],
+                Box::new(ExportWizard),
+            ),
+            item("Import CSV…", &["import", "csv"], Box::new(ImportWizard)),
+        ];
+
+        let palette = Command::new(&state.palette)
+            .items(items)
+            .placeholder("Run a command…")
+            .max_h(px(320.))
+            .on_confirm(move |_, window, cx| {
+                let _ = confirm_view.update(cx, |this, cx| {
+                    this.close_command_palette(window, cx);
+                });
+            })
+            .on_cancel(move |window, cx| {
+                let _ = cancel_view.update(cx, |this, cx| {
+                    this.close_command_palette(window, cx);
+                });
+            });
+
+        Some(
+            div()
+                .id("command-palette")
+                .test_support()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .flex()
+                .justify_center()
+                .items_start()
+                .pt(px(80.))
+                .child(
+                    div()
+                        .w(px(560.))
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.popover)
+                        .shadow_lg()
+                        .child(palette),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// The `⌘P` palette, drawn over the window. The palette widget does the searching, the up and
     /// down keys, Enter and Esc; we turn its answer back into "open this table".
     fn render_quick_open(&self, _: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -3338,6 +3622,7 @@ impl WorkspaceView {
             return None;
         }
         let theme = cx.theme().clone();
+        let is_zh = crate::views::style::is_zh_locale();
         let active = self.tabs.active_id().cloned();
         let tabs: Vec<AnyElement> = self
             .tabs
@@ -3414,6 +3699,11 @@ impl WorkspaceView {
                                     .icon(hugeicon(Hugeicon::Close))
                                     .ghost()
                                     .small()
+                                    .tooltip(if is_zh {
+                                        "关闭标签页"
+                                    } else {
+                                        "Close tab"
+                                    })
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.close_tab(&close_id, cx);
                                     })),
@@ -3458,6 +3748,11 @@ impl WorkspaceView {
                         .icon(hugeicon(Hugeicon::ArrowLeft))
                         .ghost()
                         .small()
+                        .tooltip(if is_zh {
+                            "上一个标签页"
+                        } else {
+                            "Previous tab"
+                        })
                         .disabled(!several)
                         .on_click(cx.listener(|this, _, _, cx| this.prev_tab(cx))),
                 )
@@ -3466,6 +3761,11 @@ impl WorkspaceView {
                         .icon(hugeicon(Hugeicon::ArrowRight))
                         .ghost()
                         .small()
+                        .tooltip(if is_zh {
+                            "下一个标签页"
+                        } else {
+                            "Next tab"
+                        })
                         .disabled(!several)
                         .on_click(cx.listener(|this, _, _, cx| this.next_tab(cx))),
                 )

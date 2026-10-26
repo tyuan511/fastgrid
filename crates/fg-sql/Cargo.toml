@@ -11,3 +11,12 @@ workspace = true
 [dependencies]
 fg-core.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+# criterion_main! defines its own main; the libtest harness would
+# otherwise swallow it and report "0 tests".
+[[bench]]
+name = "sql"
+harness = false

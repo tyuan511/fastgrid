@@ -66,6 +66,71 @@ fn cycle_theme(service: &Service, cx: &mut App) {
     .detach();
 }
 
+/// Build the diagnostics bundle. Deliberately narrow: version, platform,
+/// telemetry setting, connection counts by engine, and the log tail. No
+/// connection names (they are the user's data), no passwords, no
+/// connection strings, no SQL — the log itself never carries those
+/// either, by the repo's logging rule. An unreadable setting or
+/// connection list degrades to a count of zero or "off", never to an
+/// error: a diagnostics export that fails when something is already
+/// wrong is useless.
+async fn build_diagnostics(service: &Service) -> String {
+    let telemetry = service
+        .setting::<fg_core::PrivacySettings>()
+        .await
+        .map(|p| p.telemetry)
+        .unwrap_or(false);
+    let mut kinds: BTreeMap<String, usize> = BTreeMap::new();
+    let mut unreadable = 0usize;
+    if let Ok(connections) = service.connections().await {
+        for conn in &connections {
+            match conn {
+                fg_service::StoredConnection::Ok(config) => {
+                    *kinds.entry(format!("{:?}", config.kind)).or_default() += 1;
+                }
+                fg_service::StoredConnection::Unreadable { .. } => unreadable += 1,
+            }
+        }
+    }
+    let counts = if kinds.is_empty() && unreadable == 0 {
+        "none".to_owned()
+    } else {
+        let mut parts: Vec<String> = kinds
+            .iter()
+            .map(|(kind, n)| format!("{kind}: {n}"))
+            .collect();
+        if unreadable > 0 {
+            parts.push(format!("unreadable: {unreadable}"));
+        }
+        parts.join(", ")
+    };
+    let log_path = service.log_path();
+    let log_tail = match std::fs::read_to_string(&log_path) {
+        Ok(text) => {
+            let lines: Vec<&str> = text.lines().collect();
+            let tail = if lines.len() > 50 {
+                &lines[lines.len() - 50..]
+            } else {
+                &lines[..]
+            };
+            if tail.is_empty() {
+                "(log file is empty)".to_owned()
+            } else {
+                tail.join("\n")
+            }
+        }
+        Err(_) => "(no log file yet)".to_owned(),
+    };
+    format!(
+        "fastgrid diagnostics\nversion: {}\nplatform: {} {}\ntelemetry: {}\nconnections: {counts}\nlog file: {}\n--- log tail ---\n{log_tail}\n",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        if telemetry { "on" } else { "off" },
+        log_path.display(),
+    )
+}
+
 /// Create the launcher view and connect it to the service. Call from the window's builder.
 pub fn launcher(service: Service, window: &mut Window, cx: &mut App) -> Entity<Launcher> {
     let view = cx.new(|cx| Launcher::new(window, cx));
@@ -176,6 +241,97 @@ pub fn launcher(service: Service, window: &mut Window, cx: &mut App) -> Entity<L
             )
             .detach();
         }
+        LauncherEvent::DiagnosticsOpened => {
+            let (view, service) = (view.downgrade(), events_service.clone());
+            cx.spawn(async move |cx| {
+                let settings = service
+                    .setting::<fg_core::PrivacySettings>()
+                    .await
+                    .unwrap_or_default();
+                let _ = view.update(cx, |v, cx| {
+                    v.set_diagnostics_telemetry(settings.telemetry, cx);
+                    v.set_diagnostics_auto_update(settings.auto_update, cx);
+                });
+            })
+            .detach();
+        }
+        LauncherEvent::ExportDiagnostics { path } => {
+            if path.trim().is_empty() {
+                view.update(cx, |v, cx| {
+                    v.set_diagnostics_status("Enter a file path.".into(), cx);
+                });
+                return;
+            }
+            let (view, service) = (view.downgrade(), events_service.clone());
+            let path = path.clone();
+            cx.spawn(async move |cx| {
+                let report = build_diagnostics(&service).await;
+                let outcome = std::fs::write(&path, report)
+                    .map_err(|e| fg_core::Error::Other(format!("diagnostics write failed: {e}")));
+                let _ = view.update(cx, |v, cx| match outcome {
+                    Ok(()) => {
+                        v.set_diagnostics_status(format!("Diagnostics written to {path}."), cx);
+                    }
+                    Err(e) => v.set_diagnostics_status(e.to_string(), cx),
+                });
+            })
+            .detach();
+        }
+        LauncherEvent::SetTelemetry(enabled) => {
+            let enabled = *enabled;
+            let (view, service) = (view.downgrade(), events_service.clone());
+            cx.spawn(async move |cx| {
+                // Read-modify-write: the other privacy flag must survive.
+                let mut settings = service
+                    .setting::<fg_core::PrivacySettings>()
+                    .await
+                    .unwrap_or_default();
+                settings.telemetry = enabled;
+                let outcome = service.set_setting(settings).await;
+                let _ = view.update(cx, |v, cx| match outcome {
+                    Ok(()) => {
+                        v.set_diagnostics_telemetry(enabled, cx);
+                        v.set_diagnostics_status(
+                            if enabled {
+                                "Telemetry is on.".into()
+                            } else {
+                                "Telemetry is off.".into()
+                            },
+                            cx,
+                        );
+                    }
+                    Err(e) => v.set_diagnostics_status(e.to_string(), cx),
+                });
+            })
+            .detach();
+        }
+        LauncherEvent::SetAutoUpdate(enabled) => {
+            let enabled = *enabled;
+            let (view, service) = (view.downgrade(), events_service.clone());
+            cx.spawn(async move |cx| {
+                let mut settings = service
+                    .setting::<fg_core::PrivacySettings>()
+                    .await
+                    .unwrap_or_default();
+                settings.auto_update = enabled;
+                let outcome = service.set_setting(settings).await;
+                let _ = view.update(cx, |v, cx| match outcome {
+                    Ok(()) => {
+                        v.set_diagnostics_auto_update(enabled, cx);
+                        v.set_diagnostics_status(
+                            if enabled {
+                                "Update checks are on.".into()
+                            } else {
+                                "Update checks are off.".into()
+                            },
+                            cx,
+                        );
+                    }
+                    Err(e) => v.set_diagnostics_status(e.to_string(), cx),
+                });
+            })
+            .detach();
+        }
         LauncherEvent::CycleTheme => cycle_theme(&events_service, cx),
         LauncherEvent::DismissBackupNudge => dismiss_backup_nudge(&view, &events_service, cx),
         LauncherEvent::SaveGroup(group) => save_group(&view, &events_service, group.clone(), cx),
@@ -192,6 +348,31 @@ pub fn launcher(service: Service, window: &mut Window, cx: &mut App) -> Entity<L
             .map(|n| n.dismissed)
             .unwrap_or(false);
         let _ = nudge_view.update(cx, |view, cx| view.set_backup_nudge(!dismissed, cx));
+    })
+    .detach();
+
+    // Update check, once per launcher open and only when the user turned
+    // it on. A failed check is silent: no notice, no error surface.
+    // The fetch is synchronous with a 10 s timeout, inside the same
+    // spawn style the file already uses for blocking work.
+    let (update_view, update_service) = (view.downgrade(), service.clone());
+    cx.spawn(async move |cx| {
+        let enabled = update_service
+            .setting::<fg_core::PrivacySettings>()
+            .await
+            .map(|p| p.auto_update)
+            .unwrap_or(false);
+        if !enabled {
+            return;
+        }
+        let current = env!("CARGO_PKG_VERSION");
+        if let Ok(tag) = fg_service::fetch_latest_tag(fg_service::RELEASES_URL)
+            && fg_service::newer_than(current, &tag)
+        {
+            let _ = update_view.update(cx, |view, cx| {
+                view.set_update_available(Some(tag), cx);
+            });
+        }
     })
     .detach();
 

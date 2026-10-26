@@ -23,11 +23,13 @@ mod conn;
 mod export;
 mod import;
 mod keychain;
+mod logging;
 pub(crate) mod mcp;
 mod pool;
 mod run;
 mod ssh;
 mod task;
+mod update;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -61,10 +63,12 @@ pub use keychain::{
     DEV_KEYRING_FILE, FileBackend, KeychainKeyProvider, MemoryBackend, OsKeychain, SecretBackend,
     account_name, default_key_provider,
 };
+pub use logging::{LOG_FILE, init_file_logging, log_path};
 pub use mcp::{MCP_WRITE_APPROVAL_TIMEOUT, McpWriteRegistry, McpWriteRequest, McpWriteStatement};
 pub use run::{PlannedStatement, PolicyRefusal, RunOptions, RunPlan, RunStream, plan};
 pub use ssh::SshTunnel;
 pub use task::{TaskCanceller, TaskStream};
+pub use update::{RELEASES_URL, fetch_latest_tag, newer_than};
 
 use conn::{Rt, SharedRuntime};
 use pool::SessionPool;
@@ -208,6 +212,9 @@ struct Inner {
     /// still exists. `None` when the caller supplied the runtime.
     _owned_runtime: Option<Arc<SharedRuntime>>,
     store: Arc<Mutex<Store>>,
+    /// Where `store.db` lives; its parent is the data dir, which also
+    /// holds `logs/` (see `log_path`).
+    store_path: PathBuf,
     open: Mutex<HashMap<ConnectionId, Arc<OpenConnection>>>,
     /// Serialises open, save and delete so a config read cannot publish after a newer save.
     open_gate: tokio::sync::Mutex<()>,
@@ -266,6 +273,7 @@ impl Service {
                 },
                 _owned_runtime: owned,
                 store,
+                store_path: options.store_path,
                 open: Mutex::new(HashMap::new()),
                 open_gate: tokio::sync::Mutex::new(()),
                 epochs: Arc::new(Mutex::new(HashMap::new())),
@@ -281,6 +289,18 @@ impl Service {
                 force_read_only: options.force_read_only,
             }),
         })
+    }
+
+    /// Where this service's log file lives (`<data_dir>/logs/fastgrid.log`).
+    /// The file may not exist when file logging failed to start; callers
+    /// report that instead of inventing content.
+    pub fn log_path(&self) -> PathBuf {
+        let dir = self
+            .inner
+            .store_path
+            .parent()
+            .unwrap_or(std::path::Path::new(""));
+        crate::logging::log_path(dir)
     }
 
     /// Block until history and audit jobs queued so far have been written.

@@ -607,7 +607,8 @@ fn the_sql_preview_shows_the_statements_with_values_written_in(cx: &mut TestAppC
         "closed until asked for"
     );
 
-    press(cx, &f, "secondary-shift-p");
+    // Preview moved from `⌘⇧P` to `⌘⌥P` in M8: `⌘⇧P` is the command palette now.
+    press(cx, &f, "secondary-alt-p");
     cx.update_window(f.window, |_, window, cx| window.render_frame(cx))
         .unwrap();
     let panel = label(cx, &f, "preview-panel").expect("the panel opens");

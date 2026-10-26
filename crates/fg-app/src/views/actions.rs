@@ -29,11 +29,17 @@ gpui_kit::actions!(
     fastgrid,
     [
         QuickOpen,
+        CommandPalette,
+        DismissTopmost,
         CloseTab,
         NextTab,
         PrevTab,
         ToggleSidebar,
         ToggleFilters,
+        ToggleAudit,
+        CycleSafeMode,
+        CycleTheme,
+        ToggleDetails,
         RefreshSchema,
         CopySelection,
         LauncherNext,
@@ -82,10 +88,26 @@ gpui_kit::actions!(
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("secondary-p", QuickOpen, Some(WORKSPACE_CONTEXT)),
+        // The command palette owns `⌘⇧P` everywhere, including the grid:
+        // the grid's SQL preview moves to `⌘⌥P` (see below). A context-less
+        // binding would be simpler, but explicit contexts keep the list
+        // reviewable against docs/shortcuts.md.
+        KeyBinding::new("secondary-shift-p", CommandPalette, Some(WORKSPACE_CONTEXT)),
+        KeyBinding::new("secondary-shift-p", CommandPalette, Some(GRID_CONTEXT)),
+        KeyBinding::new("secondary-shift-p", CommandPalette, Some(RESULT_CONTEXT)),
+        KeyBinding::new("secondary-shift-p", CommandPalette, Some(EDITOR_CONTEXT)),
+        // Staged exit: close the topmost overlay, never a tab, never the
+        // app. Deeper contexts (cell editor, history, snippets) keep their
+        // own Escape and win first.
+        KeyBinding::new("escape", DismissTopmost, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("secondary-k", SwitchDatabase, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("secondary-w", CloseTab, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("secondary-b", ToggleSidebar, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("secondary-r", RefreshSchema, Some(WORKSPACE_CONTEXT)),
+        KeyBinding::new("secondary-shift-a", ToggleAudit, Some(WORKSPACE_CONTEXT)),
+        KeyBinding::new("secondary-shift-m", CycleSafeMode, Some(WORKSPACE_CONTEXT)),
+        KeyBinding::new("secondary-shift-t", CycleTheme, Some(WORKSPACE_CONTEXT)),
+        KeyBinding::new("secondary-shift-d", ToggleDetails, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("secondary-]", NextTab, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("secondary-[", PrevTab, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("ctrl-tab", NextTab, Some(WORKSPACE_CONTEXT)),
@@ -101,7 +123,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-i", InsertRow, Some(GRID_CONTEXT)),
         KeyBinding::new("secondary-d", CloneRow, Some(GRID_CONTEXT)),
         KeyBinding::new("secondary-backspace", ToggleDeleteRow, Some(GRID_CONTEXT)),
-        KeyBinding::new("secondary-shift-p", PreviewChanges, Some(GRID_CONTEXT)),
+        // Was `⌘⇧P` until M8; that key now opens the command palette.
+        KeyBinding::new("secondary-alt-p", PreviewChanges, Some(GRID_CONTEXT)),
         KeyBinding::new("secondary-ctrl-[", SwitchToStructure, Some(GRID_CONTEXT)),
         KeyBinding::new("secondary-ctrl-]", SwitchToData, Some(GRID_CONTEXT)),
         KeyBinding::new("secondary-shift-e", ExportWizard, Some(GRID_CONTEXT)),
