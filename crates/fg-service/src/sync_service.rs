@@ -316,20 +316,18 @@ impl Service {
             )?;
             let mut devices: Vec<SyncDevice> = device_ids_from_keys(&backend.list("devices")?)
                 .into_iter()
-                .map(|device_id| SyncDevice {
-                    last_seq: store
-                        .sync_cursor(engine.vault_id(), &device_id)
-                        .unwrap_or(0),
-                    is_local: device_id == engine.device_id(),
-                    device_id,
+                .map(|device_id| {
+                    Ok(SyncDevice {
+                        last_seq: store.sync_cursor(engine.vault_id(), &device_id)?,
+                        is_local: device_id == engine.device_id(),
+                        device_id,
+                    })
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             if !devices.iter().any(|d| d.is_local) {
                 devices.push(SyncDevice {
                     device_id: engine.device_id().to_string(),
-                    last_seq: store
-                        .sync_cursor(engine.vault_id(), engine.device_id())
-                        .unwrap_or(0),
+                    last_seq: store.sync_cursor(engine.vault_id(), engine.device_id())?,
                     is_local: true,
                 });
             }

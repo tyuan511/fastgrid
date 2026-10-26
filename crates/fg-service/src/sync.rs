@@ -365,7 +365,7 @@ impl SyncEngine {
         watermarks.remove(SNAPSHOT_CURSOR_DEVICE);
         watermarks.insert(self.device_id.clone(), self.next_seq(store)? - 1);
         let records = store.synced_records()?;
-        let created_at = now_millis();
+        let created_at = self.next_snapshot_millis()?;
         let snapshot = Snapshot {
             format_version: SYNC_FORMAT_VERSION,
             device_id: self.device_id.clone(),
@@ -383,7 +383,13 @@ impl SyncEngine {
         )
         .map_err(|e| Error::Storage(e.to_string()))?;
         let key = snapshot_key(&self.device_id, created_at);
-        self.backend.put_if_absent(&key, &sealed)?;
+        if !self.backend.put_if_absent(&key, &sealed)? {
+            // Deletion below must never run for a snapshot that was not
+            // written: its segments would be deleted with no copy left.
+            return Err(Error::Other(format!(
+                "sync snapshot {key} already exists; try again"
+            )));
+        }
         let mut deleted = 0;
         for (device, mark) in &watermarks {
             for (seq, seg_key) in self.list_segments(device)? {
@@ -545,6 +551,25 @@ impl SyncEngine {
             .ok_or_else(|| Error::Other("no sync vault at this target".into()))?;
         serde_json::from_slice(&bytes)
             .map_err(|_| Error::Other("the sync vault manifest is damaged".into()))
+    }
+
+    /// Timestamp for a new snapshot from this device. Snapshot keys embed the
+    /// timestamp, so two snapshots in the same millisecond would collide and
+    /// the second put_if_absent would silently fail while cleanup still ran.
+    /// Taking the max with the device's latest snapshot timestamp also keeps
+    /// timestamps monotonic when the wall clock jumps backward, so a snapshot
+    /// is never skipped as "already applied" by its own millis cursor.
+    fn next_snapshot_millis(&self) -> Result<i64> {
+        let mut latest = 0;
+        for key in self.backend.list("snapshots")? {
+            if let Some((device, millis)) = parse_snapshot_key(&key)
+                && device == self.device_id
+                && millis > latest
+            {
+                latest = millis;
+            }
+        }
+        Ok(now_millis().max(latest + 1))
     }
 
     fn newest_snapshot_key(&self) -> Result<Option<String>> {
@@ -777,6 +802,25 @@ mod tests {
         assert_eq!(backend.list("snapshots").unwrap().len(), 1);
 
         // A fresh device bootstraps from the snapshot alone.
+        let c = store();
+        let engine_c = SyncEngine::join(backend.clone(), "dev-c", "pw").unwrap();
+        engine_c.pull(&c).unwrap();
+        assert_eq!(titles(&c), vec!["one", "two"]);
+    }
+
+    #[test]
+    fn consecutive_snapshots_have_distinct_keys() {
+        let backend: Arc<dyn SyncBackend> = Arc::new(MemorySyncBackend::new());
+        let a = store();
+        let engine_a = SyncEngine::create(backend.clone(), "dev-a", "pw").unwrap();
+        a.save_snippet(&snippet("one", "SELECT 1")).unwrap();
+        let first = engine_a.snapshot(&a).unwrap();
+        a.save_snippet(&snippet("two", "SELECT 2")).unwrap();
+        let second = engine_a.snapshot(&a).unwrap();
+        assert_ne!(first.key, second.key);
+        assert_eq!(backend.list("snapshots").unwrap().len(), 2);
+        // Both snapshots survive: the second snapshot's cleanup only removes
+        // segments, never another snapshot.
         let c = store();
         let engine_c = SyncEngine::join(backend.clone(), "dev-c", "pw").unwrap();
         engine_c.pull(&c).unwrap();
