@@ -10,6 +10,13 @@ workspace = true
 
 [features]
 default = ["sqlite"]
+mysql = [
+    "dep:mysql_async",
+    "dep:mysql_common",
+    "dep:fg-sql",
+    "dep:rustls",
+    "dep:chrono",
+]
 sqlite = ["dep:rusqlite", "dep:fallible-iterator"]
 postgres = [
     "dep:tokio-postgres",
@@ -54,3 +61,8 @@ rustls-pemfile = { version = "2", optional = true }
 rustls-native-certs = { version = "0.8", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"], optional = true }
 bit-vec = { version = "0.6", optional = true }
+mysql_async = { version = "0.37", features = [
+    "rustls-tls",
+    "ring",
+], optional = true }
+mysql_common = { version = "0.37", optional = true }

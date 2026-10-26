@@ -40,6 +40,7 @@ impl Driver for PostgresDriver {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             multiple_databases: true,
+            databases_are_namespaces: false,
             namespaces: true,
             multi_statement: true,
             transactions: true,

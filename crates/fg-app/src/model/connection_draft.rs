@@ -1,6 +1,6 @@
 //! The connection form's fields, and their conversion to and from a saved connection.
 //!
-//! SQLite shows a file path; network engines (PostgreSQL for now) show host / port / user /
+//! SQLite shows a file path; network engines (PostgreSQL, MySQL) show host / port / user /
 //! database / TLS / SSH fields. Passwords are form-only: they are never read back from a saved
 //! connection, and a blank password field means "keep the saved secret". Everything the form
 //! does not show is carried over untouched, so editing a connection never drops settings it
@@ -11,7 +11,7 @@ use fg_core::{
     SshConfig, TagColor, TlsConfig, TlsMode,
 };
 
-use super::connection_url::ParsedPostgresUrl;
+use super::connection_url::ParsedNetworkUrl;
 
 /// Colour choices in menu order; `None` = follow the environment.
 pub const TAG_COLORS: &[(Option<TagColor>, &str)] = &[
@@ -264,8 +264,8 @@ impl ConnectionDraft {
 
     /// Fill the network fields from a parsed URL. Fields the URL does not
     /// carry (an absent port, an absent sslmode) are left alone.
-    pub fn apply_url(&mut self, parsed: &ParsedPostgresUrl) {
-        self.kind = DbKind::Postgres;
+    pub fn apply_url(&mut self, kind: DbKind, parsed: &ParsedNetworkUrl) {
+        self.kind = kind;
         self.host = parsed.host.clone();
         if let Some(port) = parsed.port {
             self.port = port.to_string();
@@ -310,12 +310,16 @@ impl ConnectionDraft {
                     Self::default_name_for(path),
                 )
             }
-            DbKind::Postgres => {
+            DbKind::Postgres | DbKind::MySql => {
                 let host = self.host.trim();
                 if host.is_empty() {
                     return Err("Enter a host.".into());
                 }
-                let port = parse_port_field(&self.port, 5432)?;
+                let default_port = match self.kind {
+                    DbKind::MySql => 3306,
+                    _ => 5432,
+                };
+                let port = parse_port_field(&self.port, default_port)?;
                 let user = self.user.trim();
                 if user.is_empty() {
                     return Err("Enter a user.".into());
@@ -339,7 +343,7 @@ impl ConnectionDraft {
                     },
                 )
             }
-            // The form only offers SQLite and PostgreSQL; anything else keeps
+            // The form only offers SQLite, PostgreSQL and MySQL; anything else keeps
             // the base params untouched (this arm is unreachable from the UI).
             _ => match base {
                 Some(b) => (b.params.clone(), b.name.clone()),
@@ -372,7 +376,7 @@ impl ConnectionDraft {
                     config.options.remove("create");
                 }
             }
-            DbKind::Postgres => {
+            DbKind::Postgres | DbKind::MySql => {
                 config.options.remove("create");
                 let tls = TlsConfig {
                     mode: self.tls_mode,
@@ -684,7 +688,7 @@ mod tests {
         let parsed =
             crate::model::parse_postgres_url("postgres://bob:pw@h:5432/db?sslmode=disable")
                 .unwrap();
-        d.apply_url(&parsed);
+        d.apply_url(DbKind::Postgres, &parsed);
         assert_eq!(d.kind, DbKind::Postgres);
         assert_eq!(d.host, "h");
         assert_eq!(d.port, "5432");
@@ -692,6 +696,26 @@ mod tests {
         assert_eq!(d.password, "pw");
         assert_eq!(d.database, "db");
         assert_eq!(d.tls_mode, TlsMode::Disable);
+    }
+
+    #[test]
+    fn mysql_draft_defaults_to_port_3306() {
+        let mut d = ConnectionDraft::blank();
+        let parsed = crate::model::parse_mysql_url("mysql://fgtest:fgtest@127.0.0.1/app").unwrap();
+        d.apply_url(DbKind::MySql, &parsed);
+        assert_eq!(d.kind, DbKind::MySql);
+        d.port = String::new();
+        let c = d.to_config(None).unwrap();
+        assert_eq!(
+            c.params,
+            ConnectionParams::Network {
+                host: "127.0.0.1".into(),
+                port: 3306,
+                user: "fgtest".into(),
+                database: Some("app".into()),
+                socket: None,
+            }
+        );
     }
 
     #[test]

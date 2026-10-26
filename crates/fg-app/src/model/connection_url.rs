@@ -1,16 +1,17 @@
-//! Parse a PostgreSQL connection URL into form fields.
+//! Parse a database connection URL into form fields.
 //!
-//! Accepts `postgres://` and `postgresql://` URLs the way libpq spells them:
-//! `postgres://user:password@host:port/database?sslmode=verify-full`. Only the
-//! parts the connection form shows are extracted; anything else in the query
-//! is ignored. Percent-decoding applies to the user, password and database
-//! (a `+` stays a `+`: it is not a space outside form encoding).
+//! Accepts `postgres://` and `postgresql://` URLs the way libpq spells them
+//! (`postgres://user:password@host:port/database?sslmode=verify-full`) and
+//! `mysql://` URLs (`mysql://user:password@host:port/database?sslMode=VERIFY_CA`).
+//! Only the parts the connection form shows are extracted; anything else in
+//! the query is ignored. Percent-decoding applies to the user, password and
+//! database (a `+` stays a `+`: it is not a space outside form encoding).
 
 use fg_core::TlsMode;
 
 /// What a URL filled in: everything the form can take from it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParsedPostgresUrl {
+pub struct ParsedNetworkUrl {
     pub host: String,
     pub port: Option<u16>,
     pub user: String,
@@ -20,12 +21,25 @@ pub struct ParsedPostgresUrl {
 }
 
 /// Parse `input` or explain why it is not a usable PostgreSQL URL.
-pub fn parse_postgres_url(input: &str) -> Result<ParsedPostgresUrl, String> {
-    let rest = input
-        .trim()
-        .strip_prefix("postgres://")
-        .or_else(|| input.trim().strip_prefix("postgresql://"))
-        .ok_or_else(|| "expected a URL starting with postgres://".to_owned())?;
+pub fn parse_postgres_url(input: &str) -> Result<ParsedNetworkUrl, String> {
+    parse_network_url(input, &["postgres://", "postgresql://"], "postgres://")
+}
+
+/// Parse `input` or explain why it is not a usable MySQL URL.
+pub fn parse_mysql_url(input: &str) -> Result<ParsedNetworkUrl, String> {
+    parse_network_url(input, &["mysql://"], "mysql://")
+}
+
+fn parse_network_url(
+    input: &str,
+    schemes: &[&str],
+    expected: &str,
+) -> Result<ParsedNetworkUrl, String> {
+    let trimmed = input.trim();
+    let rest = schemes
+        .iter()
+        .find_map(|scheme| trimmed.strip_prefix(scheme))
+        .ok_or_else(|| format!("expected a URL starting with {expected}"))?;
     let (authority_and_path, query) = match rest.split_once('?') {
         Some((head, query)) => (head, Some(query)),
         None => (rest, None),
@@ -72,6 +86,9 @@ pub fn parse_postgres_url(input: &str) -> Result<ParsedPostgresUrl, String> {
             let Some((key, value)) = pair.split_once('=') else {
                 continue;
             };
+            // libpq spells it `sslmode=verify-full`; MySQL spells it
+            // `sslMode=VERIFY_IDENTITY`. Both are accepted for either
+            // scheme: the form does not care which dialect wrote the URL.
             if key == "sslmode" {
                 tls_mode = Some(match value {
                     "disable" => TlsMode::Disable,
@@ -81,10 +98,19 @@ pub fn parse_postgres_url(input: &str) -> Result<ParsedPostgresUrl, String> {
                     "verify-full" => TlsMode::VerifyFull,
                     other => return Err(format!("unknown sslmode '{other}'")),
                 });
+            } else if key == "sslMode" {
+                tls_mode = Some(match value {
+                    "DISABLED" => TlsMode::Disable,
+                    "PREFERRED" => TlsMode::Prefer,
+                    "REQUIRED" => TlsMode::Require,
+                    "VERIFY_CA" => TlsMode::VerifyCa,
+                    "VERIFY_IDENTITY" => TlsMode::VerifyFull,
+                    other => return Err(format!("unknown sslMode '{other}'")),
+                });
             }
         }
     }
-    Ok(ParsedPostgresUrl {
+    Ok(ParsedNetworkUrl {
         host,
         port,
         user,
@@ -192,6 +218,24 @@ mod tests {
         assert_eq!(parsed.port, Some(5432));
         assert_eq!(parsed.password.as_deref(), Some("p@ss:w"));
         assert_eq!(parsed.database.as_deref(), Some("my db"));
+    }
+
+    #[test]
+    fn mysql_url_with_ssl_mode() {
+        let parsed =
+            parse_mysql_url("mysql://fgtest:fgtest@127.0.0.1:53306/app?sslMode=VERIFY_CA").unwrap();
+        assert_eq!(parsed.host, "127.0.0.1");
+        assert_eq!(parsed.port, Some(53306));
+        assert_eq!(parsed.user, "fgtest");
+        assert_eq!(parsed.password.as_deref(), Some("fgtest"));
+        assert_eq!(parsed.database.as_deref(), Some("app"));
+        assert_eq!(parsed.tls_mode, Some(TlsMode::VerifyCa));
+    }
+
+    #[test]
+    fn mysql_url_rejects_other_schemes() {
+        assert!(parse_mysql_url("postgres://host/db").is_err());
+        assert!(parse_mysql_url("mysql://host/db?sslMode=BOGUS").is_err());
     }
 
     #[test]

@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 pub struct Capabilities {
     /// `Session::list_databases` is meaningful and the connection can switch between them.
     pub multiple_databases: bool,
+    /// Databases *are* the namespaces (MySQL): the namespace list is the
+    /// switch menu, and `list_databases` stays empty per its contract.
+    #[serde(default)]
+    pub databases_are_namespaces: bool,
     /// Objects live in namespaces (MySQL databases, PostgreSQL schemas, SQLite `main`...).
     pub namespaces: bool,
     /// Multiple `;`-separated statements in a single `execute` call.

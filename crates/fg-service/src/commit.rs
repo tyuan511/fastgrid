@@ -14,8 +14,11 @@ pub struct CommitOutcome {
     pub statements: usize,
     pub affected_rows: u64,
     /// One row per insert that read itself back, in insert order: the row as
-    /// written, with defaults and generated keys filled in. Empty on dialects
-    /// without `RETURNING`, where no readback was possible.
+    /// written, with defaults and generated keys filled in. Dialects with
+    /// `RETURNING` read back directly; dialects without it re-select by
+    /// primary key (and by the session's last insert id for a generated
+    /// single-column key). An insert whose row cannot be located simply
+    /// contributes no entry.
     pub returned_rows: Vec<Vec<fg_core::Value>>,
 }
 
@@ -50,7 +53,16 @@ impl OpenConnection {
             });
         }
         let detail = self.describe(path).await?;
-        let primary_key = detail.primary_key();
+        // Everything the commit task needs is owned up front: the task
+        // outlives this method, so borrowed column names, paths, and
+        // changes cannot travel into it.
+        let primary_key: Vec<String> = detail
+            .primary_key()
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let columns: Vec<String> = detail.columns.iter().map(|c| c.name.clone()).collect();
+        let table = self.dialect().qualified_name(path);
         for (i, change) in changes.iter().enumerate() {
             let key = match change {
                 RowChange::Update { key, .. } | RowChange::Delete { key } => key,
@@ -64,7 +76,7 @@ impl OpenConnection {
                 )));
             }
             let mut given: Vec<&str> = key.iter().map(|(c, _)| c.as_str()).collect();
-            let mut expected = primary_key.clone();
+            let mut expected: Vec<&str> = primary_key.iter().map(String::as_str).collect();
             given.sort_unstable();
             expected.sort_unstable();
             if given != expected {
@@ -76,6 +88,7 @@ impl OpenConnection {
             }
         }
         let statements = compile_changes(path, changes, self.dialect())?;
+        let changes = changes.to_vec();
 
         let this = Arc::clone(self);
         self.rt
@@ -131,6 +144,104 @@ impl OpenConnection {
                                 break;
                             }
                             affected += rows;
+                            // No `RETURNING`? Re-select the inserted row by
+                            // primary key, inside the same transaction, so
+                            // the grid still shows defaults and generated
+                            // keys. Only inserts read back; updates and
+                            // deletes already know their row.
+                            if let fg_sql::RowChange::Insert { cells } = &changes[i]
+                                && !primary_key.is_empty()
+                            {
+                                // The key is the change's explicit PK values
+                                // when all are present; otherwise, for a
+                                // generated single-column key, the session's
+                                // last insert id. A composite key with a
+                                // missing value cannot be located: no
+                                // readback, but the insert still stands.
+                                let explicit: Option<Vec<fg_core::Value>> = primary_key
+                                    .iter()
+                                    .map(|pk| {
+                                        cells.iter().find(|(c, _)| c.as_str() == pk.as_str()).and_then(
+                                            |(_, change)| match change {
+                                                fg_sql::CellChange::Set(v)
+                                                    if *v != fg_core::Value::Null =>
+                                                {
+                                                    Some(v.clone())
+                                                }
+                                                _ => None,
+                                            },
+                                        )
+                                    })
+                                    .collect();
+                                let key = match explicit {
+                                    Some(key) => Some(key),
+                                    None if primary_key.len() == 1 => {
+                                        match this.dialect().last_insert_id_sql() {
+                                            Some(sql) => {
+                                                match run(sql.to_owned(), Vec::new()).await {
+                                                    Ok((_, rows)) => rows
+                                                        .into_iter()
+                                                        .next()
+                                                        .and_then(|r| r.into_iter().next())
+                                                        .map(|id| vec![id]),
+                                                    Err(e) => {
+                                                        failure = Some(Error::Other(format!(
+                                                            "change {}: {}",
+                                                            i + 1,
+                                                            e
+                                                        )));
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            None => None,
+                                        }
+                                    }
+                                    None => None,
+                                };
+                                if let Some(key) = key {
+                                    let cols = columns
+                                        .iter()
+                                        .map(|c| this.dialect().quote_ident(c))
+                                        .collect::<Vec<_>>()
+                                        .join(", ");
+                                    let where_clause = primary_key
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(j, pk)| {
+                                            format!(
+                                                "{} = {}",
+                                                this.dialect().quote_ident(pk),
+                                                this.dialect().placeholder(j + 1)
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join(" AND ");
+                                    let sql = format!(
+                                        "SELECT {cols} FROM {table} WHERE {where_clause}"
+                                    );
+                                    match run(sql, key).await {
+                                        Ok((_, mut found)) => {
+                                            if found.len() != 1 {
+                                                failure = Some(Error::Other(format!(
+                                                    "change {}: inserted row could not be read back",
+                                                    i + 1
+                                                )));
+                                                break;
+                                            }
+                                            returned_rows.push(found.remove(0));
+                                        }
+                                        Err(e) => {
+                                            failure = Some(Error::Other(format!(
+                                                "change {}: {}",
+                                                i + 1,
+                                                e
+                                            )));
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
                         }
                         Err(e) => {
                             failure = Some(match e {

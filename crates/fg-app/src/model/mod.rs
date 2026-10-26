@@ -23,7 +23,7 @@ pub use connection_draft::{
     safe_mode_from_label, safe_mode_label, ssh_auth_from_label, ssh_auth_label,
     tls_mode_from_label, tls_mode_label,
 };
-pub use connection_url::{ParsedPostgresUrl, parse_postgres_url};
+pub use connection_url::{ParsedNetworkUrl, parse_mysql_url, parse_postgres_url};
 pub use filter_draft::{
     Applied, DraftRow, FilterDraft, OPERATORS, RowError, op_from_label, op_label, parse_cell_text,
     value_slots,

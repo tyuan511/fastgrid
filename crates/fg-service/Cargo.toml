@@ -16,7 +16,7 @@ test-seams = ["fg-store/test-seams"]
 fg-core.workspace = true
 # The service owns connections of every engine, so it enables the network
 # drivers too; feature unification carries them into the app and CLI builds.
-fg-driver = { workspace = true, features = ["postgres"] }
+fg-driver = { workspace = true, features = ["postgres", "mysql"] }
 fg-store.workspace = true
 fg-crypto.workspace = true
 keyring.workspace = true

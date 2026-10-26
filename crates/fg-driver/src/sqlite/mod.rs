@@ -32,6 +32,7 @@ impl Driver for SqliteDriver {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             multiple_databases: false,
+            databases_are_namespaces: false,
             namespaces: true,
             multi_statement: true,
             transactions: true,

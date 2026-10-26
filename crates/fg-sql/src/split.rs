@@ -1,9 +1,16 @@
 //! Split a script into statements, and find the statement under the cursor.
 //!
 //! Splitting is lexical: a `;` ends a statement unless it sits inside a string, quoted identifier,
-//! comment, dollar-quoted body, parentheses, or the body of a trigger. Not supported yet: MySQL's
-//! client-side `DELIMITER` command and compound `CREATE PROCEDURE ... BEGIN ... END` bodies
-//! (M5, together with the MySQL driver).
+//! comment, dollar-quoted body, parentheses, or a compound body (`CREATE ... BEGIN ... END`).
+//! MySQL's client-side `DELIMITER` command is honored: a `DELIMITER $$` line switches the
+//! terminator until another `DELIMITER` line switches it back. The directive itself is never
+//! emitted as a statement — the server would reject it.
+//!
+//! Compound bodies are tracked with a stack, not a single flag: a procedure body can nest
+//! `BEGIN ... END` blocks (handlers) and mix in `IF ... END IF`, `CASE ... END`, `LOOP ... END
+//! LOOP`, `WHILE ... END WHILE`, and `REPEAT ... END REPEAT`. A bare `END` closes the body only
+//! when it pops the last open block; the second word of a two-word closer (`END IF`) is consumed
+//! as part of the closer, never as a new block.
 
 use std::ops::Range;
 
@@ -28,6 +35,18 @@ impl StatementSpan {
     }
 }
 
+/// A block open inside a compound body. `Begin` is the body's own block;
+/// the rest close with a two-word `END <word>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Block {
+    Begin,
+    If,
+    Case,
+    Loop,
+    While,
+    Repeat,
+}
+
 pub fn split_statements(sql: &str, kind: DbKind) -> Vec<StatementSpan> {
     let flavor = Flavor::from(kind);
     let tokens = lex(sql, flavor);
@@ -39,35 +58,118 @@ pub fn split_statements(sql: &str, kind: DbKind) -> Vec<StatementSpan> {
     let mut last_sig: Option<usize> = None;
     let mut depth = 0usize;
 
-    // Trigger bodies contain `;` and end with a lone `END`.
-    let mut words: Vec<&str> = Vec::new(); // first few words of the statement
-    let mut in_trigger_body = false;
-    let mut at_inner_start = false;
-    let triggers_have_bodies = matches!(flavor, Flavor::Sqlite | Flavor::MySql);
+    // Compound bodies (`CREATE ... BEGIN ... END`) and the MySQL terminator.
+    let mut words: Vec<&str> = Vec::new(); // first words of the statement
+    let mut compound = false; // this statement is a CREATE ... body
+    let mut stack: Vec<Block> = Vec::new();
+    let mut after_end = false; // the next word completes a two-word closer
+    let mut delimiter = ";".to_owned();
+    let mut skip_until = 0usize; // byte offset: tokens starting before it are ignored
+    let bodies_have_blocks = matches!(flavor, Flavor::Sqlite | Flavor::MySql);
 
     for (idx, tok) in tokens.iter().enumerate() {
+        if tok.start < skip_until {
+            continue;
+        }
         if tok.kind != Kind::Whitespace {
             first_any.get_or_insert(idx);
         }
         if tok.is_trivia() {
             continue;
         }
-        let ends_statement = tok.is_punct(sql, ';') && depth == 0 && !in_trigger_body;
 
-        if ends_statement {
-            if let (Some(f), Some(l)) = (first_any.filter(|_| first_sig.is_some()), last_sig) {
-                out.push(StatementSpan {
-                    text: tokens[f].start..tokens[l].end,
-                    extent: extent_start..tok.end,
-                });
+        // MySQL's client-side DELIMITER: only at a statement boundary, never
+        // inside a body, and never emitted. The delimiter is the rest of the
+        // line, trimmed; an empty one leaves the terminator unchanged.
+        if flavor == Flavor::MySql
+            && first_sig.is_none()
+            && stack.is_empty()
+            && tok.kind == Kind::Word
+            && tok.text(sql).eq_ignore_ascii_case("delimiter")
+        {
+            let rest = &sql[tok.end..];
+            let line_end = rest.find('\n').map(|i| tok.end + i).unwrap_or(sql.len());
+            let new_delimiter = sql[tok.end..line_end].trim();
+            if !new_delimiter.is_empty() {
+                delimiter = new_delimiter.to_owned();
             }
-            extent_start = tok.end;
+            extent_start = line_end;
+            skip_until = line_end;
             first_any = None;
             first_sig = None;
             last_sig = None;
             words.clear();
-            in_trigger_body = false;
-            at_inner_start = false;
+            continue;
+        }
+
+        // A word glued to a multi-character terminator (`END$$`): `$` is a
+        // word character for MySQL, so the lexer keeps `END` and `$$` in one
+        // token and the plain terminator check below never sees the `$$`.
+        // Only a body's closing END glues this way in real scripts; treat
+        // the prefix as the END (popping the block) and the suffix as the
+        // terminator. The statement text runs to the end of the prefix.
+        let glued_end = delimiter != ";"
+            && depth == 0
+            && tok.kind == Kind::Word
+            && tok
+                .text(sql)
+                .strip_suffix(delimiter.as_str())
+                .is_some_and(|prefix| !prefix.is_empty() && prefix.eq_ignore_ascii_case("end"));
+        if glued_end {
+            stack.pop();
+            let prefix_len = tok.text(sql).len() - delimiter.len();
+            let text_end = tok.start + prefix_len;
+            if first_sig.is_some()
+                && let Some(f) = first_any
+            {
+                out.push(StatementSpan {
+                    text: tokens[f].start..text_end,
+                    extent: extent_start..tok.end,
+                });
+            }
+            extent_start = tok.end;
+            skip_until = tok.end;
+            first_any = None;
+            first_sig = None;
+            last_sig = None;
+            words.clear();
+            compound = false;
+            stack.clear();
+            after_end = false;
+            continue;
+        }
+
+        let ends_statement = if delimiter == ";" {
+            tok.is_punct(sql, ';') && depth == 0 && stack.is_empty()
+        } else {
+            // A multi-character terminator (`$$`, `//`): the source text at
+            // this token starts with it. Strings and comments are single
+            // tokens, so a match here cannot sit inside one; `//` cannot
+            // appear as an operator, and `$` never starts a word token.
+            sql[tok.start..].starts_with(delimiter.as_str()) && depth == 0 && stack.is_empty()
+        };
+
+        if ends_statement {
+            let extent_end = if delimiter == ";" {
+                tok.end
+            } else {
+                tok.start + delimiter.len()
+            };
+            if let (Some(f), Some(l)) = (first_any.filter(|_| first_sig.is_some()), last_sig) {
+                out.push(StatementSpan {
+                    text: tokens[f].start..tokens[l].end,
+                    extent: extent_start..extent_end,
+                });
+            }
+            extent_start = extent_end;
+            skip_until = extent_end;
+            first_any = None;
+            first_sig = None;
+            last_sig = None;
+            words.clear();
+            compound = false;
+            stack.clear();
+            after_end = false;
             continue;
         }
 
@@ -81,14 +183,24 @@ pub fn split_statements(sql: &str, kind: DbKind) -> Vec<StatementSpan> {
         }
 
         if tok.kind == Kind::Word {
-            if words.len() < 8 {
+            if words.len() < 12 {
                 words.push(tok.text(sql));
             }
-            if triggers_have_bodies {
-                trigger_state(sql, tok, &words, &mut in_trigger_body, &mut at_inner_start);
+            if bodies_have_blocks {
+                block_state(
+                    sql,
+                    &tokens,
+                    idx,
+                    &words,
+                    &mut compound,
+                    &mut stack,
+                    &mut after_end,
+                );
             }
-        } else if in_trigger_body {
-            at_inner_start = tok.is_punct(sql, ';');
+        } else {
+            // A significant non-word token between `END` and its second
+            // word cannot happen in valid SQL, so the closer is over.
+            after_end = false;
         }
     }
 
@@ -101,34 +213,71 @@ pub fn split_statements(sql: &str, kind: DbKind) -> Vec<StatementSpan> {
     out
 }
 
-/// Track `CREATE [TEMP] TRIGGER ... BEGIN <statements>; END`.
-fn trigger_state(
+/// Track compound bodies: `CREATE ... TRIGGER | PROCEDURE | FUNCTION ... BEGIN ... END`.
+///
+/// Detection looks at the statement's opening words (`CREATE` first, then a
+/// body keyword within the next eleven words, so `DEFINER = ...` clauses do
+/// not hide it). Once the body's `BEGIN` opens, every block keyword pushes
+/// and every `END` pops; the body ends when the stack empties. Outside a
+/// body, block words are ignored — a top-level `BEGIN` is a transaction, and
+/// a top-level `CASE ... END` is an expression.
+fn block_state(
     sql: &str,
-    tok: &Token,
+    tokens: &[Token],
+    idx: usize,
     words: &[&str],
-    in_body: &mut bool,
-    at_inner_start: &mut bool,
+    compound: &mut bool,
+    stack: &mut Vec<Block>,
+    after_end: &mut bool,
 ) {
+    let tok = &tokens[idx];
     let w = tok.text(sql);
-    let is_create_trigger = words
-        .first()
-        .is_some_and(|f| f.eq_ignore_ascii_case("create"))
-        && words
-            .iter()
-            .skip(1)
-            .take(6)
-            .any(|x| x.eq_ignore_ascii_case("trigger"));
-    if !is_create_trigger {
+    if *after_end {
+        // The second word of `END IF` / `END CASE` / `END LOOP` /
+        // `END WHILE` / `END REPEAT`: part of the closer, not a new block.
+        *after_end = false;
         return;
     }
-    if *in_body {
-        if *at_inner_start && w.eq_ignore_ascii_case("end") {
-            *in_body = false;
+    if stack.is_empty() && !*compound {
+        let is_create_body = words
+            .first()
+            .is_some_and(|f| f.eq_ignore_ascii_case("create"))
+            && words.iter().skip(1).take(11).any(|x| {
+                x.eq_ignore_ascii_case("trigger")
+                    || x.eq_ignore_ascii_case("procedure")
+                    || x.eq_ignore_ascii_case("function")
+            });
+        if is_create_body {
+            *compound = true;
         }
-        *at_inner_start = false;
-    } else if w.eq_ignore_ascii_case("begin") {
-        *in_body = true;
-        *at_inner_start = true;
+        return;
+    }
+    if !*compound {
+        return;
+    }
+    if w.eq_ignore_ascii_case("begin") {
+        stack.push(Block::Begin);
+    } else if w.eq_ignore_ascii_case("end") {
+        stack.pop();
+        *after_end = true;
+    } else if w.eq_ignore_ascii_case("if") {
+        // `IF(...)` is a function call, not a statement block: look at the
+        // next significant token.
+        let is_function = tokens[idx + 1..]
+            .iter()
+            .find(|t| !t.is_trivia())
+            .is_some_and(|t| t.is_punct(sql, '('));
+        if !is_function {
+            stack.push(Block::If);
+        }
+    } else if w.eq_ignore_ascii_case("case") {
+        stack.push(Block::Case);
+    } else if w.eq_ignore_ascii_case("loop") {
+        stack.push(Block::Loop);
+    } else if w.eq_ignore_ascii_case("while") {
+        stack.push(Block::While);
+    } else if w.eq_ignore_ascii_case("repeat") {
+        stack.push(Block::Repeat);
     }
 }
 
@@ -209,6 +358,75 @@ mod tests {
             2,
             "PostgreSQL: the string ended at the backslash"
         );
+    }
+
+    #[test]
+    fn mysql_procedure_bodies_are_one_statement() {
+        let sql = "CREATE PROCEDURE p() BEGIN SELECT 1; SELECT 2; END; SELECT 3";
+        let t = texts(sql, DbKind::MySql);
+        assert_eq!(t.len(), 2, "{t:?}");
+        assert!(t[0].starts_with("CREATE PROCEDURE") && t[0].ends_with("END"));
+        assert_eq!(t[1], "SELECT 3");
+    }
+
+    #[test]
+    fn nested_blocks_and_handlers_stay_whole() {
+        let sql = "CREATE PROCEDURE p() BEGIN DECLARE EXIT HANDLER FOR SQLEXCEPTION BEGIN ROLLBACK; END; INSERT INTO t VALUES (1); END; SELECT 1";
+        let t = texts(sql, DbKind::MySql);
+        assert_eq!(t.len(), 2, "{t:?}");
+        assert!(t[0].ends_with("END"));
+    }
+
+    #[test]
+    fn if_blocks_do_not_close_the_body_early() {
+        // The old single-flag tracking closed the body at `END IF`; the
+        // stack keeps the outer BEGIN open until its own END.
+        let sql =
+            "CREATE PROCEDURE p() BEGIN IF TRUE THEN SELECT 1; END IF; SELECT 2; END; SELECT 3";
+        let t = texts(sql, DbKind::MySql);
+        assert_eq!(t.len(), 2, "{t:?}");
+        assert!(t[0].ends_with("END"));
+        assert_eq!(t[1], "SELECT 3");
+    }
+
+    #[test]
+    fn if_function_calls_are_not_blocks() {
+        let sql = "CREATE PROCEDURE p() BEGIN SET x = IF(a, 1, 2); SELECT x; END; SELECT 1";
+        let t = texts(sql, DbKind::MySql);
+        assert_eq!(t.len(), 2, "{t:?}");
+    }
+
+    #[test]
+    fn mysql_trigger_with_if_stays_whole() {
+        let sql = "CREATE TRIGGER t AFTER INSERT ON a BEGIN IF NEW.x > 0 THEN INSERT INTO log VALUES (1); END IF; END; SELECT 1";
+        let t = texts(sql, DbKind::MySql);
+        assert_eq!(t.len(), 2, "{t:?}");
+    }
+
+    #[test]
+    fn delimiter_switches_the_terminator() {
+        let sql = "DELIMITER $$\nCREATE PROCEDURE p() BEGIN SELECT 1; END$$\nDELIMITER ;\nSELECT 2";
+        let t = texts(sql, DbKind::MySql);
+        assert_eq!(t.len(), 2, "{t:?}");
+        assert!(t[0].starts_with("CREATE PROCEDURE") && t[0].ends_with("END"));
+        assert_eq!(t[1], "SELECT 2");
+    }
+
+    #[test]
+    fn delimiter_slashes_work_for_functions() {
+        let sql = "DELIMITER //\nCREATE FUNCTION f() RETURNS INT BEGIN RETURN 1; END//\nDELIMITER ;\nSELECT f()";
+        let t = texts(sql, DbKind::MySql);
+        assert_eq!(t.len(), 2, "{t:?}");
+        assert_eq!(t[1], "SELECT f()");
+    }
+
+    #[test]
+    fn delimiter_is_mysql_only() {
+        // Other engines have no DELIMITER command: the line stays a
+        // statement like any other (and the server will reject it).
+        // `//` avoids Postgres dollar-quoting, which would swallow `$$`.
+        let t = texts("DELIMITER //; SELECT 1;", DbKind::Postgres);
+        assert_eq!(t, ["DELIMITER //", "SELECT 1"]);
     }
 
     #[test]

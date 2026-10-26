@@ -411,9 +411,10 @@ async fn missing_file_is_not_created_implicitly() {
 
 #[tokio::test]
 async fn other_engines_are_not_available_yet() {
-    // MySQL has no driver in any build. Postgres is only unavailable when the
-    // postgres feature is off; workspace builds unify the feature on (fg-service
-    // enables it), so asserting Postgres-unavailable here would fail there.
+    // Postgres and MySQL are only unavailable when their feature is off;
+    // workspace builds unify the features on (fg-service enables both), so
+    // asserting unavailability here would fail there.
+    #[cfg(not(feature = "mysql"))]
     assert!(matches!(
         driver_for(DbKind::MySql),
         Err(Error::Unsupported(_))

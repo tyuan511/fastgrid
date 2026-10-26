@@ -181,14 +181,25 @@ impl OpenConnection {
             .await
     }
 
-    /// Databases on this server. Engines without the concept (SQLite)
-    /// report none; the list is not cached, so a just-created database shows up.
+    /// Switch targets on this server: databases for engines with several
+    /// (PostgreSQL), namespaces for engines where databases *are* the
+    /// namespaces (MySQL). Engines without the concept (SQLite) report
+    /// none; the list is not cached, so a just-created database shows up.
+    /// The choice is capability-driven, never a match on the engine.
     pub async fn databases(self: &Arc<Self>) -> Result<Vec<String>> {
         let this = Arc::clone(self);
+        let caps = this.driver.capabilities();
         self.rt
             .run(async move {
                 let lease = this.pool.acquire().await?;
-                lease.session()?.list_databases().await
+                let session = lease.session()?;
+                if caps.multiple_databases {
+                    session.list_databases().await
+                } else if caps.databases_are_namespaces {
+                    session.list_namespaces().await
+                } else {
+                    Ok(Vec::new())
+                }
             })
             .await
     }

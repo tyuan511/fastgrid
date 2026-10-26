@@ -56,7 +56,7 @@
       用户手写的 `WHERE` 经校验只能是单个表达式，且可对 agent 整体禁用
 - [x] `fg-sql`：语句拆分（分号感知，处理字符串、注释、`$$`、SQLite/MySQL 触发器体、光标所在语句）与语句分类（读 / 写 / DDL / 事务 / 工具 / 未知，
       危险语句：DROP、TRUNCATE、无 WHERE 的 UPDATE/DELETE、破坏性 ALTER；可穿透可写 CTE、`EXPLAIN ANALYZE`、MySQL 可执行注释）。
-      **MySQL 的 `DELIMITER` 与不带分隔符的存储过程体留到 M5**
+      **MySQL 的 `DELIMITER` 与存储过程体在 M5 已做**：`DELIMITER $$` 切换分隔符（指令本身不下发），`CREATE PROCEDURE/FUNCTION/TRIGGER ... BEGIN ... END` 以栈式跟踪（BEGIN/IF/CASE/LOOP/WHILE/REPEAT 入栈，END 出栈，裸 END 清空栈才结束），`CALL` 的多结果集由驱动按集边界拆分
 - [x] 以上全部有单元测试（`fg-sql` 47 个）；与真实 SQLite 的端到端见 `fg-service/tests/e2e.rs`
 
 **验收**：`cargo test --workspace` 通过；`list_relations` 在含外键的 SQLite 库上返回正确结果。
@@ -207,7 +207,7 @@
 - [~] 行内编辑：选中单元格后直接键入（空格和带 ⌘/Ctrl/Alt 的组合除外）即以所键入的字符开始编辑并替换原值；双击 / `Enter` 打开输入框并全选。`Enter` 确认并下移，`Tab` / `⇧Tab` 确认并右 / 左移（行末折返到下一 / 上一行，到网格边缘不动），`Esc` 放弃；点到别的单元格（选区变化）时保留已键入的有效值，无效值则关闭输入框并提示 `Not saved: …`。值按列类型解析（数字列里写字母会留在编辑框并显示原因），只有全大写 `NULL` 表示 SQL NULL。*枚举与外键下拉已做：编辑枚举 / Set 列时编辑区下方列出全部变体，点选即暂存；编辑外键列时列出本页已有的不同取值（仍可直接输入其他键值）。点击表格以外的控件导致的失焦依赖输入框的 Blur 事件，无头测试里没有被触发，真机行为需要看一眼*
 - [~] 行操作：插入（`⌘I` / `+ Row` 按钮）、删除标记 / 恢复（`⌘⌫`）、克隆（`⌘D` / `Ctrl+D`，主键列清空）、`Set NULL` / `Set Empty` / `Set Default`、单点还原已做；Set / 还原等动作通过单元格右键菜单提供（另有克隆行、删除 / 恢复行）
 - [x] 撤销 / 重做栈（纯内存）：`fg-app::model::Changeset`（快照式，深度 500，新编辑清空重做；`fg-app/src/model/changeset.rs` 12 个单元测试）
-- [~] DML 编译：`fg-sql::compile_changes` 基于 `Dialect` 生成 `INSERT` / `UPDATE` / `DELETE`（全部带参数，标识符经方言引用）；`UPDATE` / `DELETE` 只按主键定位并声明 `expect_rows = 1`，空键 / NULL 键 / 重复列被拒绝；`SET c = DEFAULT` 在 SQLite 上返回 `Unsupported`（方言能力 `supports_default_keyword`）。*用 `RETURNING` 获取默认值和自增主键已做：支持 `RETURNING` 的方言（SQLite、PostgreSQL）插入时带 `RETURNING *`，`CommitOutcome.returned_rows` 按插入顺序返回写回的行；不支持的方言（MySQL）暂无回读，待 M5 的回读策略。基于属性的测试已做：200 个确定性随机变更集（删除 / 更新 / 插入混合，含默认值省略与自增键）提交后表内容与回读行均与模型一致*
+- [~] DML 编译：`fg-sql::compile_changes` 基于 `Dialect` 生成 `INSERT` / `UPDATE` / `DELETE`（全部带参数，标识符经方言引用）；`UPDATE` / `DELETE` 只按主键定位并声明 `expect_rows = 1`，空键 / NULL 键 / 重复列被拒绝；`SET c = DEFAULT` 在 SQLite 上返回 `Unsupported`（方言能力 `supports_default_keyword`）。*用 `RETURNING` 获取默认值和自增主键已做：支持 `RETURNING` 的方言（SQLite、PostgreSQL）插入时带 `RETURNING *`，`CommitOutcome.returned_rows` 按插入顺序返回写回的行；不支持的方言（MySQL）在 M5 已有回读：显式主键直接用键重查，单列主键用方言的 `last_insert_id_sql()`（MySQL 为 `SELECT LAST_INSERT_ID()`）取生成键后在同一事务内重查整行，读不到则整个提交回滚。基于属性的测试已做：200 个确定性随机变更集（删除 / 更新 / 插入混合，含默认值省略与自增键）提交后表内容与回读行均与模型一致*
 - [~] 提交：`OpenConnection::commit_changes`，单会话单事务；只读连接拒绝；无主键表、键不等于完整主键的更新 / 删除在租会话前拒绝；任一语句出错或影响行数不为 1 → 整体 `ROLLBACK`，错误指出第几条（`fg-service/tests/commit.rs` 5 个，去掉回滚后 2 个必然失败）。*不写历史行；L1 批量确认由界面负责；1000 条混合变更（333 删 / 333 改 / 334 增）提交与末尾失败整体回滚均已测试*
 - [~] 提交：有暂存变更时网格底部出现一条醒目的提示条（`● N unsaved changes · 1 edited · 1 new · 1 deleted`），带 `Preview SQL ⌘⇧P` / `Discard` / `Save ⌘S`；对应的标签页标题前显示 `●`，别的标签页里也能看到哪张表有未保存的工作。`⌘S` 在单事务里提交，`⌘Z` / `⌘⇧Z` 撤销重做。打开的编辑框会先被暂存再提交；提交进行中按钮显示 `Saving…`，再按 `⌘S` 被忽略。*放弃全部有二次确认条（首次点击只打开确认条，第二次才放弃，可取消）；关闭有暂存变更的表标签页时先出确认条，确认后才关闭*
 - [x] 预览 SQL（`⌘⇧P` / 提示条按钮）：按提交顺序（删除 → 更新 → 插入）列出将执行的语句，值已写进语句里（字符串转义、二进制 `X'..'`、长文本截断），仅用于显示——真正执行的仍是带参数的语句（`fg-sql` 的 `DmlStatement::preview`，含标识符里带 `?` 的用例）。变更清空时面板自动收起
@@ -252,21 +252,21 @@
 
 ## M5 MySQL / MariaDB（2.5w）
 
-- [ ] `fg-driver/src/mysql/`：`mysql_async` + rustls
-- [ ] 取消：旁路连接执行 `KILL QUERY`；只读：`START TRANSACTION READ ONLY`
-- [ ] 元数据：`information_schema`；`SHOW CREATE TABLE`；数据库即命名空间（`list_databases` == `list_namespaces`，`USE` 切换无需重连）
-- [ ] 类型解码：有符号 / 无符号整数、`decimal`、`tinyint(1)` 布尔约定、`enum` / `set`、`json`、`bit`、
+- [x] `fg-driver/src/mysql/`：`mysql_async` + rustls
+- [x] 取消：旁路连接执行 `KILL QUERY`；只读：会话级 `SET SESSION TRANSACTION READ ONLY`（路线图原句的 `START TRANSACTION READ ONLY` 是单事务形式，`Session` 契约需要会话级形式；已在 MariaDB 10.11 上实测写操作被 1792 拒绝）
+- [x] 元数据：`information_schema`；`SHOW CREATE TABLE`；数据库即命名空间（新增 `Capabilities.databases_are_namespaces`，切换菜单走 `list_namespaces`，`list_databases` 按契约保持为空；`USE` 免重连未做——服务目前重连切换，行为正确但不是最小代价，留待后续优化）
+- [x] 类型解码：有符号 / 无符号整数、`decimal`、`tinyint(1)` 布尔约定、`enum` / `set`、`json`、`bit`、
       日期时间（含 `0000-00-00` 零值日期）、`blob` 系列、字符集与排序规则
-- [ ] 多语句与多结果集（`CLIENT_MULTI_STATEMENTS`）
-- [ ] 方言细节：反引号、`?` 占位符、`LIMIT` 写法、无 `RETURNING`（MariaDB 有）→ 回读策略；DDL 隐式提交的提示
-- [ ] 复用 M4 的 SSH / TLS / 连接界面
-- [ ] 行为测试在 MySQL 5.7 / 8.0 / 8.4 与 MariaDB 10.6 / 11 上通过
+- [x] 多语句与多结果集（`CLIENT_MULTI_STATEMENTS`，含单条 `CALL` 的多结果集）
+- [x] 方言细节：反引号、`?` 占位符、`LIMIT` 写法、无 `RETURNING` → 回读策略；DDL 隐式提交的提示**不在 M5 做**：网格提交路径只产生 DML，DDL 永远不会出现在一次提交里，提示属于 M6 结构应用流程，在那里落地
+- [x] 复用 M4 的 SSH / TLS / 连接界面（启动页新增 MySQL 引擎卡，URL 解析与草稿复用网络表单）
+- [~] 行为测试在 MySQL 5.7 / 8.0 / 8.4 与 MariaDB 10.6 / 11 上通过（本地只在 MariaDB 10.11.7 上实测通过；MySQL 8.0 未装机，其余版本靠 CI 矩阵）
 
 **验收**
 
-- 与 M4 相同的行为测试集与类型往返测试全部通过
+- 与 M4 相同的行为测试集与类型往返测试全部通过（本地 MariaDB 10.11.7：驱动 16 个行为测试 + 服务提交回读 1 个，零值日期与 `utf8mb4` 表情往返无损）
 - 无符号 `bigint` 最大值、零值日期、`utf8mb4` 表情字符的往返无损
-- 在一次提交中执行 DDL 时，UI 明确提示「MySQL 的 DDL 无法回滚」
+- 在一次提交中执行 DDL 时，UI 明确提示「MySQL 的 DDL 无法回滚」（移至 M6：见上方方言细节条目）
 
 ---
 

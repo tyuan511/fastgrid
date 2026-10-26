@@ -52,6 +52,14 @@ pub trait Dialect: Send + Sync {
         false
     }
 
+    /// A statement that yields the generated key of the last single-row
+    /// insert on this session, for dialects without `RETURNING` (MySQL's
+    /// `LAST_INSERT_ID()`). `None` means the dialect offers no such
+    /// function, and a commit without `RETURNING` simply has no readback.
+    fn last_insert_id_sql(&self) -> Option<&str> {
+        None
+    }
+
     /// An `INSERT` that sets no column: every column takes its default.
     fn insert_defaults(&self, table: &str) -> String {
         format!("INSERT INTO {table} DEFAULT VALUES")
@@ -123,6 +131,9 @@ impl Dialect for MySqlDialect {
     }
     fn supports_nulls_ordering(&self) -> bool {
         false
+    }
+    fn last_insert_id_sql(&self) -> Option<&str> {
+        Some("SELECT LAST_INSERT_ID()")
     }
     fn insert_defaults(&self, table: &str) -> String {
         format!("INSERT INTO {table} () VALUES ()")

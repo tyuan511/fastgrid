@@ -28,8 +28,9 @@ use super::icons::{Hugeicon, hugeicon};
 use super::style::environment_color;
 use crate::model::{
     ConnectionDraft, ENVIRONMENTS, SAFE_MODES, SSH_AUTHS, SshAuthChoice, TAG_COLORS, TLS_MODES,
-    color_from_label, duplicate, environment_from_label, environment_label, parse_postgres_url,
-    rank, safe_mode_from_label, safe_mode_label, ssh_auth_from_label, tls_mode_from_label,
+    color_from_label, duplicate, environment_from_label, environment_label, parse_mysql_url,
+    parse_postgres_url, rank, safe_mode_from_label, safe_mode_label, ssh_auth_from_label,
+    tls_mode_from_label,
 };
 
 /// One entry of the rendered launcher list.
@@ -576,15 +577,19 @@ impl Launcher {
             s.set_value(draft.path.clone(), window, cx);
             s
         });
-        let url = editor_input(
-            "postgres://user:password@host:port/database",
-            &draft.url,
-            false,
-            window,
-            cx,
-        );
+        let url_placeholder = if draft.kind == DbKind::MySql {
+            "mysql://user:password@host:port/database"
+        } else {
+            "postgres://user:password@host:port/database"
+        };
+        let url = editor_input(url_placeholder, &draft.url, false, window, cx);
         let host = editor_input("localhost", &draft.host, false, window, cx);
-        let port = editor_input("5432", &draft.port, false, window, cx);
+        let port_placeholder = if draft.kind == DbKind::MySql {
+            "3306"
+        } else {
+            "5432"
+        };
+        let port = editor_input(port_placeholder, &draft.port, false, window, cx);
         let user = editor_input("User", &draft.user, false, window, cx);
         let database = editor_input(
             "Database (blank = server default)",
@@ -897,9 +902,15 @@ impl Launcher {
             .as_ref()
             .map(|e| e.url.read(cx).value().to_string())
             .unwrap_or_default();
-        match parse_postgres_url(&url) {
-            Ok(parsed) => {
-                draft.apply_url(&parsed);
+        let trimmed = url.trim();
+        let parsed = if trimmed.starts_with("mysql://") {
+            parse_mysql_url(&url).map(|p| (DbKind::MySql, p))
+        } else {
+            parse_postgres_url(&url).map(|p| (DbKind::Postgres, p))
+        };
+        match parsed {
+            Ok((kind, parsed)) => {
+                draft.apply_url(kind, &parsed);
                 self.open_editor(draft, base, window, cx);
             }
             Err(message) => {
@@ -1001,6 +1012,7 @@ const ENGINES: &[(DbKind, &str, &str, f32, f32, f32)] = &[
         0.56,
         0.40,
     ),
+    (DbKind::MySql, "MySQL", "Ms", 32.0 / 360.0, 0.85, 0.55),
 ];
 
 pub fn is_chinese_locale() -> bool {
@@ -1825,7 +1837,7 @@ impl Launcher {
         };
         let error = e.error.clone();
         let active_engine = e.selected_engine;
-        let is_postgres = active_engine == DbKind::Postgres;
+        let is_network = matches!(active_engine, DbKind::Postgres | DbKind::MySql);
         let ssh_auth_now = e
             .ssh_auth
             .read(cx)
@@ -1987,7 +1999,7 @@ impl Launcher {
                             },
                             Input::new(&e.name).id("editor-name").into_any_element(),
                         ))
-                        .when(!is_postgres, |d| {
+                        .when(!is_network, |d| {
                             d.child(field(
                                 if is_zh {
                                     "数据库文件".into()
@@ -2011,7 +2023,7 @@ impl Launcher {
                                     .into_any_element(),
                             ))
                         })
-                        .when(is_postgres, |d| {
+                        .when(is_network, |d| {
                             d.child(field(
                                 if is_zh {
                                     "连接 URL（粘贴后点解析）".into()
@@ -2304,7 +2316,7 @@ impl Launcher {
                                 )
                                 .into_any_element(),
                         ))
-                        .when(!is_postgres, |d| {
+                        .when(!is_network, |d| {
                             d.child(
                                 Checkbox::new("editor-create")
                                     .label(if is_zh {
