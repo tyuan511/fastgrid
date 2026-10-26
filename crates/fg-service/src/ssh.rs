@@ -150,33 +150,44 @@ impl SshTunnel {
                 check_auth(result, &ssh.user, &ssh.host)?;
             }
             SshAuth::Agent => {
-                let mut agent = AgentClient::connect_env().await.map_err(|err| {
-                    Error::Connection(format!("cannot reach the SSH agent: {err}"))
-                })?;
-                let identities = agent.request_identities().await.map_err(|err| {
-                    Error::Connection(format!("cannot list SSH agent identities: {err}"))
-                })?;
-                let mut accepted = false;
-                for identity in identities {
-                    let AgentIdentity::PublicKey { key, .. } = identity else {
-                        continue;
-                    };
-                    match handle
-                        .authenticate_publickey_with(&ssh.user, key, None, &mut agent)
-                        .await
-                    {
-                        Ok(AuthResult::Success) => {
-                            accepted = true;
-                            break;
+                #[cfg(unix)]
+                {
+                    let mut agent = AgentClient::connect_env().await.map_err(|err| {
+                        Error::Connection(format!("cannot reach the SSH agent: {err}"))
+                    })?;
+                    let identities = agent.request_identities().await.map_err(|err| {
+                        Error::Connection(format!("cannot list SSH agent identities: {err}"))
+                    })?;
+                    let mut accepted = false;
+                    for identity in identities {
+                        let AgentIdentity::PublicKey { key, .. } = identity else {
+                            continue;
+                        };
+                        match handle
+                            .authenticate_publickey_with(&ssh.user, key, None, &mut agent)
+                            .await
+                        {
+                            Ok(AuthResult::Success) => {
+                                accepted = true;
+                                break;
+                            }
+                            Ok(_) | Err(_) => continue,
                         }
-                        Ok(_) | Err(_) => continue,
+                    }
+                    if !accepted {
+                        return Err(Error::Connection(format!(
+                            "no SSH agent identity was accepted for {}@{}",
+                            ssh.user, ssh.host
+                        )));
                     }
                 }
-                if !accepted {
-                    return Err(Error::Connection(format!(
-                        "no SSH agent identity was accepted for {}@{}",
-                        ssh.user, ssh.host
-                    )));
+                #[cfg(not(unix))]
+                {
+                    // russh's agent client over the environment socket is
+                    // Unix-only, so this branch cannot compile on Windows.
+                    return Err(Error::Unsupported(
+                        "SSH agent authentication is not supported on this platform".into(),
+                    ));
                 }
             }
         }

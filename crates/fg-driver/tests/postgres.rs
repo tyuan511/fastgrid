@@ -774,6 +774,13 @@ async fn tls_require_connects_without_verification() {
         eprintln!("skipping TLS tests: explicit server configured");
         return;
     }
+    // Require mode needs no CA, but the CA file's presence is this file's
+    // proxy for "the TLS test server exists": without it, the connect below
+    // fails with connection refused instead of skipping.
+    let Some(_ca) = tls_ca("FG_TEST_PG_TLS_CA", "/home/pgtest/certs/ca.crt") else {
+        eprintln!("skipping TLS tests: no CA file");
+        return;
+    };
     let s = tls_connect(TlsMode::Require, None, None).await.unwrap();
     s.ping().await.unwrap();
 }
