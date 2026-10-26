@@ -274,6 +274,65 @@ impl SettingGroup for PrivacySettings {
     const KEY: &'static str = "privacy";
 }
 
+/// Which dumb object store a sync vault lives on. Unknown values from newer
+/// versions fall back to `Unknown`, never to a backend the user did not pick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SyncBackendKind {
+    #[default]
+    LocalFolder,
+    S3,
+    WebDav,
+    #[serde(other)]
+    Unknown,
+}
+
+fn default_s3_region() -> String {
+    "us-east-1".to_string()
+}
+
+/// Sync setup: which backend and where. This group syncs (it is a `setting`
+/// record), so a second device picks up the same target; backend credentials
+/// live separately as local-only records and the sync password is never
+/// stored at all. Status and last error are service memory, not settings:
+/// they change on every run and must not churn synced records.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SyncSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub backend: SyncBackendKind,
+    #[serde(default)]
+    pub local_folder: String,
+    #[serde(default)]
+    pub s3_endpoint: String,
+    #[serde(default)]
+    pub s3_bucket: String,
+    #[serde(default = "default_s3_region")]
+    pub s3_region: String,
+    #[serde(default)]
+    pub webdav_url: String,
+}
+
+impl Default for SyncSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            backend: SyncBackendKind::default(),
+            local_folder: String::new(),
+            s3_endpoint: String::new(),
+            s3_bucket: String::new(),
+            s3_region: default_s3_region(),
+            webdav_url: String::new(),
+        }
+    }
+}
+
+impl SettingGroup for SyncSettings {
+    const KEY: &'static str = "sync";
+}
+
 fn default_exec_max_rows() -> Option<u64> {
     Some(100_000)
 }

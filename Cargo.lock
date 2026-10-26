@@ -2387,6 +2387,7 @@ name = "fg-service"
 version = "0.0.1"
 dependencies = [
  "async-compression",
+ "base64 0.22.1",
  "csv",
  "fg-core",
  "fg-crypto",
@@ -2395,11 +2396,15 @@ dependencies = [
  "fg-sql",
  "fg-store",
  "flate2",
+ "hmac 0.12.1",
+ "http",
  "keyring",
+ "quick-xml",
  "rusqlite",
  "russh",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tokio-stream",
  "tracing",

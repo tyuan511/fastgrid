@@ -32,6 +32,12 @@ async-compression = { version = "0.4", features = ["tokio", "gzip"] }
 csv = "1"
 # Update checks only: one GET to the GitHub releases API, no downloads.
 ureq = { version = "3", features = ["rustls"] }
+# Sync backends: S3 signing (SigV4), WebDAV requests and listings.
+base64 = "0.22"
+hmac = "0.12"
+http = "1"
+quick-xml = "0.41"
+sha2 = "0.10"
 
 
 [dev-dependencies]

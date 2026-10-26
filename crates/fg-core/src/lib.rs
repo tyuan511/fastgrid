@@ -52,5 +52,6 @@ pub use value::{LargeKind, Truncated, Value};
 pub use workspace::{
     AppearanceSettings, BackupNudge, EditorSettings, ExecSettings, GridSettings,
     KeybindingOverrides, McpHttpSettings, McpSettings, PrivacySettings, RowHeight, SettingGroup,
-    TabKind, TabState, TableViewMode, TableViewState, ThemeMode, WorkspaceState,
+    SyncBackendKind, SyncSettings, TabKind, TabState, TableViewMode, TableViewState, ThemeMode,
+    WorkspaceState,
 };

@@ -196,6 +196,39 @@ impl Store {
         rows.iter().map(|r| self.sync_record(r)).collect()
     }
 
+    /// Every synced record, live or tombstone. Snapshots use this: a snapshot that
+    /// omitted tombstones would let a device that falls back to it resurrect records
+    /// deleted before the snapshot's watermark.
+    pub fn synced_records(&self) -> Result<Vec<SyncRecord>> {
+        let kinds_list = kinds::SYNCED
+            .iter()
+            .map(|k| format!("'{k}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql =
+            format!("SELECT {COLUMNS} FROM record WHERE kind IN ({kinds_list}) ORDER BY kind, id");
+        let mut stmt = self.conn.prepare(&sql).map_err(storage)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(Row {
+                    kind: r.get(0)?,
+                    id: r.get(1)?,
+                    parent_id: r.get(2)?,
+                    sort_ts: r.get(3)?,
+                    rev: r.get(4)?,
+                    device_id: r.get(5)?,
+                    updated_at: r.get(6)?,
+                    deleted_at: r.get(7)?,
+                    key_id: r.get(8)?,
+                    enc: r.get(9)?,
+                })
+            })
+            .map_err(storage)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(storage)?;
+        rows.iter().map(|r| self.sync_record(r)).collect()
+    }
+
     /// Mark pushed records clean. A record edited again after it was read keeps its dirty flag
     /// (its `rev` no longer matches), so no change is ever lost.
     pub fn mark_clean(&self, pushed: &[(String, String, i64)]) -> Result<()> {
@@ -350,6 +383,25 @@ mod tests {
             deleted_at: None,
             data: Some(serde_json::json!({"v": rev})),
         }
+    }
+
+    #[test]
+    fn synced_records_covers_live_and_tombstones_but_not_local_only() {
+        let s = store();
+        let live = rec("snippet", "a", 1, 10, "dev-a");
+        let mut tomb = rec("snippet", "b", 2, 20, "dev-a");
+        tomb.deleted_at = Some(21);
+        tomb.data = None;
+        let local = rec("mcp_client", "tok", 1, 30, "dev-a");
+        s.write_record(&live, false).unwrap();
+        s.write_record(&tomb, false).unwrap();
+        s.write_record(&local, false).unwrap();
+        let all = s.synced_records().unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].id, "a");
+        assert_eq!(all[1].id, "b");
+        assert_eq!(all[1].deleted_at, Some(21));
+        assert_eq!(all[1].data, None);
     }
 
     #[test]

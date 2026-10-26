@@ -28,6 +28,12 @@ pub(crate) mod mcp;
 mod pool;
 mod run;
 mod ssh;
+mod sync;
+mod sync_backend;
+mod sync_keys;
+mod sync_s3;
+mod sync_service;
+mod sync_webdav;
 mod task;
 mod update;
 
@@ -67,6 +73,12 @@ pub use logging::{LOG_FILE, init_file_logging, log_path};
 pub use mcp::{MCP_WRITE_APPROVAL_TIMEOUT, McpWriteRegistry, McpWriteRequest, McpWriteStatement};
 pub use run::{PlannedStatement, PolicyRefusal, RunOptions, RunPlan, RunStream, plan};
 pub use ssh::SshTunnel;
+pub use sync::{PullReport, PushReport, SYNC_FORMAT_VERSION, SnapshotReport, SyncEngine};
+pub use sync_backend::{LocalFolderBackend, MemorySyncBackend, SyncBackend};
+pub use sync_keys::{SYNC_KEY_CONTEXT, generate_sync_key, unwrap_sync_key, wrap_sync_key};
+pub use sync_s3::{S3Backend, S3Config};
+pub use sync_service::{SyncDevice, SyncState, SyncStatus};
+pub use sync_webdav::{WebDavBackend, WebDavConfig};
 pub use task::{TaskCanceller, TaskStream};
 pub use update::{RELEASES_URL, fetch_latest_tag, newer_than};
 
@@ -226,6 +238,9 @@ struct Inner {
     recorder: Recorder,
     events: broadcast::Sender<ServiceEvent>,
     mcp_writes: Arc<McpWriteRegistry>,
+    /// Sync engine + run status. The engine holds the unwrapped sync key and
+    /// lives only for the session; see `sync_service.rs` for the lock order.
+    sync: Arc<Mutex<SyncState>>,
     max_cell_bytes: Arc<AtomicUsize>,
     max_sessions: usize,
     metadata_ttl: Duration,
@@ -283,6 +298,7 @@ impl Service {
                 recorder,
                 events,
                 mcp_writes: Arc::new(McpWriteRegistry::new()),
+                sync: Arc::new(Mutex::new(SyncState::default())),
                 max_cell_bytes: Arc::new(AtomicUsize::new(grid.max_cell_bytes as usize)),
                 max_sessions: options.max_sessions_per_connection,
                 metadata_ttl: options.metadata_ttl,

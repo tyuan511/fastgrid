@@ -241,6 +241,252 @@ pub fn launcher(service: Service, window: &mut Window, cx: &mut App) -> Entity<L
             )
             .detach();
         }
+        LauncherEvent::SyncPanelOpened => {
+            let (view, service) = (view.downgrade(), events_service.clone());
+            cx.spawn(async move |cx| {
+                let settings = service.sync_settings().await.ok();
+                let has_credentials = service.sync_credentials().await.ok().map(|c| c.has_any());
+                let setup_done = service.sync_is_setup();
+                let last_error = service.sync_status().last_error;
+                let devices = if setup_done {
+                    service.sync_devices().await.ok()
+                } else {
+                    None
+                };
+                let _ = view.update(cx, |v, cx| {
+                    v.set_sync_state(
+                        settings,
+                        has_credentials,
+                        Some(setup_done),
+                        last_error,
+                        devices,
+                        cx,
+                    );
+                });
+            })
+            .detach();
+        }
+        LauncherEvent::SaveSyncSettings {
+            settings,
+            credentials,
+        } => {
+            let (view, service) = (view.downgrade(), events_service.clone());
+            let (settings, credentials) = (settings.clone(), credentials.clone());
+            cx.spawn(async move |cx| {
+                let outcome = async {
+                    // Empty fields keep the saved value: the panel never
+                    // reads credentials back, so blank means "unchanged".
+                    let mut saved = service.sync_credentials().await?;
+                    if credentials.s3_access_key.is_some() {
+                        saved.s3_access_key = credentials.s3_access_key;
+                    }
+                    if credentials.s3_secret_key.is_some() {
+                        saved.s3_secret_key = credentials.s3_secret_key;
+                    }
+                    if credentials.webdav_username.is_some() {
+                        saved.webdav_username = credentials.webdav_username;
+                    }
+                    if credentials.webdav_password.is_some() {
+                        saved.webdav_password = credentials.webdav_password;
+                    }
+                    let has_credentials = saved.has_any();
+                    service.set_sync_credentials(saved).await?;
+                    service.set_sync_settings(settings).await?;
+                    Ok::<bool, fg_core::Error>(has_credentials)
+                }
+                .await;
+                let _ = view.update(cx, |v, cx| match outcome {
+                    Ok(has_credentials) => v.set_sync_state(
+                        None,
+                        Some(has_credentials),
+                        Some(false),
+                        Some("Settings saved. Create or join a vault to start syncing.".into()),
+                        Some(Vec::new()),
+                        cx,
+                    ),
+                    Err(e) => v.set_sync_state(None, None, None, Some(e.to_string()), None, cx),
+                });
+            })
+            .detach();
+        }
+        LauncherEvent::SyncSetupCreate { password } => {
+            let (view, service) = (view.downgrade(), events_service.clone());
+            let password = password.clone();
+            cx.spawn(async move |cx| {
+                let outcome = service.sync_setup_create(&password).await;
+                let devices = if outcome.is_ok() {
+                    service.sync_devices().await.ok()
+                } else {
+                    None
+                };
+                let _ = view.update(cx, |v, cx| match outcome {
+                    Ok(()) => v.set_sync_state(
+                        None,
+                        None,
+                        Some(true),
+                        Some("Vault created.".into()),
+                        devices,
+                        cx,
+                    ),
+                    Err(e) => v.set_sync_state(None, None, None, Some(e.to_string()), None, cx),
+                });
+            })
+            .detach();
+        }
+        LauncherEvent::SyncSetupJoin { password } => {
+            let (view, service) = (view.downgrade(), events_service.clone());
+            let password = password.clone();
+            cx.spawn(async move |cx| {
+                let outcome = service.sync_setup_join(&password).await;
+                let devices = if outcome.is_ok() {
+                    service.sync_devices().await.ok()
+                } else {
+                    None
+                };
+                let _ = view.update(cx, |v, cx| match outcome {
+                    Ok(()) => v.set_sync_state(
+                        None,
+                        None,
+                        Some(true),
+                        Some("Joined the vault.".into()),
+                        devices,
+                        cx,
+                    ),
+                    Err(e) => v.set_sync_state(None, None, None, Some(e.to_string()), None, cx),
+                });
+            })
+            .detach();
+        }
+        LauncherEvent::SyncNow => {
+            let (view, service) = (view.downgrade(), events_service.clone());
+            cx.spawn(async move |cx| {
+                let outcome = service.sync_now().await;
+                let devices = if outcome.is_ok() {
+                    service.sync_devices().await.ok()
+                } else {
+                    None
+                };
+                let _ = view.update(cx, |v, cx| match outcome {
+                    Ok((push, pull)) => v.set_sync_state(
+                        None,
+                        None,
+                        None,
+                        Some(format!(
+                            "Pushed {} records, applied {} from {} devices.",
+                            push.pushed,
+                            pull.applied,
+                            pull.devices.len()
+                        )),
+                        devices,
+                        cx,
+                    ),
+                    Err(e) => v.set_sync_state(None, None, None, Some(e.to_string()), None, cx),
+                });
+            })
+            .detach();
+        }
+        LauncherEvent::SyncSnapshot => {
+            let (view, service) = (view.downgrade(), events_service.clone());
+            cx.spawn(async move |cx| {
+                let outcome = service.sync_snapshot().await;
+                let _ = view.update(cx, |v, cx| match outcome {
+                    Ok(report) => v.set_sync_state(
+                        None,
+                        None,
+                        None,
+                        Some(format!(
+                            "Snapshot captured: {} records, {} segments deleted.",
+                            report.records, report.segments_deleted
+                        )),
+                        None,
+                        cx,
+                    ),
+                    Err(e) => v.set_sync_state(None, None, None, Some(e.to_string()), None, cx),
+                });
+            })
+            .detach();
+        }
+        LauncherEvent::SyncChangePassword {
+            old_password,
+            new_password,
+        } => {
+            let (view, service) = (view.downgrade(), events_service.clone());
+            let (old_password, new_password) = (old_password.clone(), new_password.clone());
+            cx.spawn(async move |cx| {
+                let outcome = service
+                    .sync_change_password(&old_password, &new_password)
+                    .await;
+                let _ = view.update(cx, |v, cx| match outcome {
+                    Ok(()) => v.set_sync_state(
+                        None,
+                        None,
+                        None,
+                        Some("Password changed. Remote data was not rewritten.".into()),
+                        None,
+                        cx,
+                    ),
+                    Err(e) => v.set_sync_state(None, None, None, Some(e.to_string()), None, cx),
+                });
+            })
+            .detach();
+        }
+        LauncherEvent::SyncRotateKey { new_password } => {
+            let (view, service) = (view.downgrade(), events_service.clone());
+            let new_password = new_password.clone();
+            cx.spawn(async move |cx| {
+                let outcome = service.sync_rotate_key(&new_password).await;
+                let _ = view.update(cx, |v, cx| match outcome {
+                    Ok(()) => v.set_sync_state(
+                        None,
+                        None,
+                        None,
+                        Some(
+                            "Key rotated. Other devices must re-join with the new password.".into(),
+                        ),
+                        None,
+                        cx,
+                    ),
+                    Err(e) => v.set_sync_state(None, None, None, Some(e.to_string()), None, cx),
+                });
+            })
+            .detach();
+        }
+        LauncherEvent::SyncReset { new_password } => {
+            let (view, service) = (view.downgrade(), events_service.clone());
+            let new_password = new_password.clone();
+            cx.spawn(async move |cx| {
+                let outcome = service.sync_reset(&new_password).await;
+                let devices = if outcome.is_ok() {
+                    service.sync_devices().await.ok()
+                } else {
+                    None
+                };
+                let _ = view.update(cx, |v, cx| match outcome {
+                    Ok(()) => v.set_sync_state(
+                        None,
+                        None,
+                        Some(true),
+                        Some(
+                            "Vault reset. Other devices must re-join with the new password.".into(),
+                        ),
+                        devices,
+                        cx,
+                    ),
+                    Err(e) => v.set_sync_state(None, None, None, Some(e.to_string()), None, cx),
+                });
+            })
+            .detach();
+        }
+        LauncherEvent::SyncRefreshDevices => {
+            let (view, service) = (view.downgrade(), events_service.clone());
+            cx.spawn(async move |cx| {
+                let devices = service.sync_devices().await.ok();
+                let _ = view.update(cx, |v, cx| {
+                    v.set_sync_state(None, None, None, None, devices, cx);
+                });
+            })
+            .detach();
+        }
         LauncherEvent::DiagnosticsOpened => {
             let (view, service) = (view.downgrade(), events_service.clone());
             cx.spawn(async move |cx| {

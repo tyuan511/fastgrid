@@ -17,6 +17,8 @@ mod record;
 mod secrets;
 mod settings;
 mod snippets;
+mod sync_creds;
+mod sync_state;
 mod workspace;
 
 use std::path::{Path, PathBuf};
@@ -34,6 +36,7 @@ pub use migrations::{MIGRATIONS, Migration, Step, latest_version};
 pub use record::Loaded;
 pub(crate) use record::SealedRow;
 pub use snippets::StoredSnippet;
+pub use sync_creds::SyncCredentials;
 
 /// Record kinds. A new kind needs no schema change.
 pub mod kinds {
@@ -55,6 +58,11 @@ pub mod kinds {
     pub const SETTING: &str = "setting";
     /// Per-device credential for the local MCP endpoint. Never synced or exported.
     pub const MCP_CLIENT: &str = "mcp_client";
+    /// Sync backend credentials (S3 keys, WebDAV login). Local-only, like
+    /// `mcp_client`: deliberately absent from `SYNCED`, so they never leave
+    /// the device and never appear in exports. Other devices enter their own
+    /// credentials when they join the vault.
+    pub const SYNC_CREDENTIAL: &str = "sync_credential";
 
     /// Everything that is synced and exported. `mcp_client` tokens belong to one device.
     pub const SYNCED: &[&str] = &[

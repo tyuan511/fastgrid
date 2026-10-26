@@ -8,7 +8,7 @@ use std::rc::Rc;
 use fg_app::views::{Launcher, LauncherEvent, Row, bind_keys};
 use fg_core::{
     ConnectionConfig, ConnectionGroup, ConnectionId, ConnectionParams, DbKind, Environment,
-    GroupId, SafeMode, TagColor,
+    GroupId, SafeMode, SyncBackendKind, TagColor,
 };
 use fg_service::PasswordUpdate;
 use gpui_kit::test::TestWindowExt as _;
@@ -95,6 +95,105 @@ fn open(cx: &mut TestAppContext, rows: Vec<Row>) -> Fixture {
         view,
         events,
     }
+}
+
+/// Like `open`, but tall enough for the sync panel's fields and buttons
+/// to stay inside the window (the main column does not scroll).
+fn open_tall(cx: &mut TestAppContext, rows: Vec<Row>) -> Fixture {
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        bind_keys(cx);
+    });
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let log = Rc::clone(&events);
+    let (window, view) = cx.update(|cx| {
+        let bounds = Bounds {
+            origin: Point::default(),
+            size: size(px(720.), px(1100.)),
+        };
+        gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                ..Default::default()
+            },
+            cx,
+            |window, cx| cx.new(|cx| Launcher::new(window, cx)),
+        )
+        .unwrap()
+    });
+    cx.update(|cx| {
+        cx.subscribe(&view, move |_, e: &LauncherEvent, _| {
+            log.borrow_mut().push(e.clone())
+        })
+        .detach();
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.set_rows(rows, cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    Fixture {
+        window,
+        view,
+        events,
+    }
+}
+
+// ---- the sync panel --------------------------------------------------------------------------------
+
+#[gpui_kit::test]
+fn the_sync_panel_opens_switches_backends_and_emits_save_and_sync(cx: &mut TestAppContext) {
+    let f = open_tall(cx, vec![]);
+    assert!(!exists(cx, &f, "sync-panel"));
+    click(cx, &f, "sync");
+    assert!(exists(cx, &f, "sync-panel"));
+    assert!(
+        f.events
+            .borrow()
+            .iter()
+            .any(|e| matches!(e, LauncherEvent::SyncPanelOpened)),
+        "opening emits SyncPanelOpened"
+    );
+
+    // A local folder is the default backend.
+    assert!(exists(cx, &f, "sync-local-folder"));
+    assert!(!exists(cx, &f, "sync-s3-endpoint"));
+
+    // Switching backends swaps the fields.
+    click(cx, &f, "sync-backend-s3");
+    assert!(exists(cx, &f, "sync-s3-endpoint"));
+    assert!(exists(cx, &f, "sync-s3-secret-key"));
+    assert!(!exists(cx, &f, "sync-local-folder"));
+    click(cx, &f, "sync-backend-local");
+    assert!(exists(cx, &f, "sync-local-folder"));
+
+    // Typing a folder and saving emits the settings.
+    click(cx, &f, "sync-local-folder");
+    type_text(cx, &f, "/data/sync");
+    click(cx, &f, "sync-save");
+    let settings = f
+        .events
+        .borrow()
+        .iter()
+        .find_map(|e| match e {
+            LauncherEvent::SaveSyncSettings { settings, .. } => Some(settings.clone()),
+            _ => None,
+        })
+        .expect("save event");
+    assert_eq!(settings.backend, SyncBackendKind::LocalFolder);
+    assert_eq!(settings.local_folder, "/data/sync");
+
+    // Sync now and close.
+    click(cx, &f, "sync-now");
+    assert!(
+        f.events
+            .borrow()
+            .iter()
+            .any(|e| matches!(e, LauncherEvent::SyncNow)),
+        "sync-now emits SyncNow"
+    );
+    click(cx, &f, "sync-close");
+    assert!(!exists(cx, &f, "sync-panel"), "closing hides the panel");
 }
 
 fn selected(cx: &mut TestAppContext, f: &Fixture) -> Option<ConnectionId> {

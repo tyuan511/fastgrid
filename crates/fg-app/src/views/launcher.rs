@@ -162,6 +162,44 @@ pub enum LauncherEvent {
     /// Replace the bearer token. The running server reads the token
     /// per request, so this needs no restart.
     RotateMcpToken,
+    /// The sync panel opened; the controller reports the saved settings,
+    /// credential presence, setup state and devices through
+    /// `set_sync_state`.
+    SyncPanelOpened,
+    /// Persist sync settings and backend credentials. Saving settings
+    /// drops the live engine, so the vault must be created or joined
+    /// again afterwards.
+    SaveSyncSettings {
+        settings: fg_core::SyncSettings,
+        credentials: fg_store::SyncCredentials,
+    },
+    /// Create a vault on the configured backend with this password.
+    SyncSetupCreate {
+        password: String,
+    },
+    /// Join the vault on the configured backend with this password.
+    SyncSetupJoin {
+        password: String,
+    },
+    /// Push dirty records, then pull new segments.
+    SyncNow,
+    /// Capture a snapshot and clean up the segments it covers.
+    SyncSnapshot,
+    /// Re-wrap the same sync key under a new password.
+    SyncChangePassword {
+        old_password: String,
+        new_password: String,
+    },
+    /// Revoke the current key: rotate to a fresh key under a new password.
+    SyncRotateKey {
+        new_password: String,
+    },
+    /// Reset the vault: new key, remote wiped, fresh snapshot.
+    SyncReset {
+        new_password: String,
+    },
+    /// Re-list known devices from the vault.
+    SyncRefreshDevices,
     /// The diagnostics panel opened; the controller reports the current
     /// telemetry setting through `set_diagnostics_telemetry`.
     DiagnosticsOpened,
@@ -258,6 +296,36 @@ struct DiagnosticsPanel {
     status: Option<SharedString>,
 }
 
+/// The sync panel: backend choice, target parameters, backend credentials
+/// and the sync password. `settings` is `None` until the controller reports
+/// the saved values after the panel opens; the inputs start empty and are
+/// filled by that report. Credentials are never read back: the controller
+/// reports only whether any are saved, and saving overwrites them.
+struct SyncPanel {
+    settings: Option<fg_core::SyncSettings>,
+    has_credentials: bool,
+    setup_done: bool,
+    /// The backend choice being edited (from the last report, or the
+    /// default); saved only when the user clicks Save.
+    backend: fg_core::SyncBackendKind,
+    /// The enabled switch being edited, like `backend`.
+    enabled: bool,
+    status: Option<SharedString>,
+    devices: Vec<fg_service::SyncDevice>,
+    local_folder: Entity<InputState>,
+    s3_endpoint: Entity<InputState>,
+    s3_bucket: Entity<InputState>,
+    s3_region: Entity<InputState>,
+    webdav_url: Entity<InputState>,
+    s3_access_key: Entity<InputState>,
+    s3_secret_key: Entity<InputState>,
+    webdav_username: Entity<InputState>,
+    webdav_password: Entity<InputState>,
+    password: Entity<InputState>,
+    old_password: Entity<InputState>,
+    new_password: Entity<InputState>,
+}
+
 pub struct Launcher {
     rows: Vec<Row>,
     groups: Vec<ConnectionGroup>,
@@ -270,6 +338,7 @@ pub struct Launcher {
     group_editor: Option<GroupEditor>,
     backup: Option<BackupPanel>,
     mcp_http: Option<McpHttpPanel>,
+    sync: Option<SyncPanel>,
     diagnostics: Option<DiagnosticsPanel>,
     update_available: Option<SharedString>,
     confirm_delete: Option<ConnectionId>,
@@ -367,6 +436,7 @@ impl Launcher {
             group_editor: None,
             backup: None,
             mcp_http: None,
+            sync: None,
             diagnostics: None,
             update_available: None,
             confirm_delete: None,
@@ -533,6 +603,202 @@ impl Launcher {
     pub fn close_mcp_http_panel(&mut self, cx: &mut Context<Self>) {
         self.mcp_http = None;
         cx.notify();
+    }
+
+    /// Open the sync panel. The saved settings arrive from the controller
+    /// (`SyncPanelOpened`); until then the inputs start empty and the
+    /// backend choice defaults to a local folder.
+    pub fn open_sync_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sync.is_none() {
+            self.sync = Some(SyncPanel {
+                settings: None,
+                has_credentials: false,
+                setup_done: false,
+                backend: fg_core::SyncBackendKind::LocalFolder,
+                enabled: false,
+                status: None,
+                devices: Vec::new(),
+                local_folder: editor_input("Sync folder path…", "", false, window, cx),
+                s3_endpoint: editor_input("S3 endpoint…", "", false, window, cx),
+                s3_bucket: editor_input("S3 bucket…", "", false, window, cx),
+                s3_region: editor_input("S3 region…", "", false, window, cx),
+                webdav_url: editor_input("WebDAV URL…", "", false, window, cx),
+                s3_access_key: editor_input("S3 access key…", "", false, window, cx),
+                s3_secret_key: editor_input("S3 secret key…", "", true, window, cx),
+                webdav_username: editor_input("WebDAV username…", "", false, window, cx),
+                webdav_password: editor_input("WebDAV password…", "", true, window, cx),
+                password: editor_input("Sync password…", "", true, window, cx),
+                old_password: editor_input("Current sync password…", "", true, window, cx),
+                new_password: editor_input("New sync password…", "", true, window, cx),
+            });
+        }
+        cx.notify();
+    }
+
+    pub fn close_sync_panel(&mut self, cx: &mut Context<Self>) {
+        self.sync = None;
+        cx.notify();
+    }
+
+    /// The controller's report for the panel: saved settings, credential
+    /// presence, setup state, a status line, or the device list. `None`
+    /// fields leave the current value alone. A report that arrives after
+    /// the panel closed is dropped.
+    pub fn set_sync_state(
+        &mut self,
+        settings: Option<fg_core::SyncSettings>,
+        has_credentials: Option<bool>,
+        setup_done: Option<bool>,
+        status: Option<String>,
+        devices: Option<Vec<fg_service::SyncDevice>>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(panel) = self.sync.as_mut() {
+            if let Some(settings) = settings {
+                panel.backend = settings.backend;
+                panel.enabled = settings.enabled;
+                panel.settings = Some(settings);
+            }
+            if let Some(has_credentials) = has_credentials {
+                panel.has_credentials = has_credentials;
+            }
+            if let Some(setup_done) = setup_done {
+                panel.setup_done = setup_done;
+            }
+            if let Some(status) = status {
+                panel.status = Some(SharedString::from(status));
+            }
+            if let Some(devices) = devices {
+                panel.devices = devices;
+            }
+            cx.notify();
+        }
+    }
+
+    /// The settings to save: input text where the user typed something,
+    /// the saved value where they left a field empty (so changing one
+    /// field does not blank the rest). Credentials are `None` per field
+    /// where empty: the controller keeps the saved value for those.
+    ///
+    /// Click handlers below read the inputs and emit events; the
+    /// controller does the work and reports back through `set_sync_state`.
+    fn sync_save_payload(
+        &self,
+        cx: &App,
+    ) -> Option<(fg_core::SyncSettings, fg_store::SyncCredentials)> {
+        let panel = self.sync.as_ref()?;
+        let saved = panel.settings.clone().unwrap_or_default();
+        let text = |input: &Entity<InputState>| input.read(cx).value().trim().to_owned();
+        let keep = |input: &Entity<InputState>, saved: &str| {
+            let typed = text(input);
+            if typed.is_empty() {
+                saved.to_owned()
+            } else {
+                typed
+            }
+        };
+        let credential = |input: &Entity<InputState>| {
+            let typed = text(input);
+            if typed.is_empty() { None } else { Some(typed) }
+        };
+        let settings = fg_core::SyncSettings {
+            enabled: panel.enabled,
+            backend: panel.backend,
+            local_folder: keep(&panel.local_folder, &saved.local_folder),
+            s3_endpoint: keep(&panel.s3_endpoint, &saved.s3_endpoint),
+            s3_bucket: keep(&panel.s3_bucket, &saved.s3_bucket),
+            s3_region: keep(&panel.s3_region, &saved.s3_region),
+            webdav_url: keep(&panel.webdav_url, &saved.webdav_url),
+        };
+        let credentials = fg_store::SyncCredentials {
+            s3_access_key: credential(&panel.s3_access_key),
+            s3_secret_key: credential(&panel.s3_secret_key),
+            webdav_username: credential(&panel.webdav_username),
+            webdav_password: credential(&panel.webdav_password),
+        };
+        Some((settings, credentials))
+    }
+
+    fn sync_status(&mut self, status: &str, cx: &mut Context<Self>) {
+        if let Some(panel) = self.sync.as_mut() {
+            panel.status = Some(SharedString::from(status));
+            cx.notify();
+        }
+    }
+
+    fn sync_save(&mut self, cx: &mut Context<Self>) {
+        let Some((settings, credentials)) = self.sync_save_payload(cx) else {
+            return;
+        };
+        cx.emit(LauncherEvent::SaveSyncSettings {
+            settings,
+            credentials,
+        });
+    }
+
+    fn sync_password_action(&mut self, cx: &mut Context<Self>) -> Option<String> {
+        let panel = self.sync.as_ref()?;
+        let password = panel.password.read(cx).value().trim().to_owned();
+        if password.is_empty() {
+            self.sync_status("Enter a sync password.", cx);
+            return None;
+        }
+        Some(password)
+    }
+
+    fn sync_create(&mut self, cx: &mut Context<Self>) {
+        if let Some(password) = self.sync_password_action(cx) {
+            cx.emit(LauncherEvent::SyncSetupCreate { password });
+        }
+    }
+
+    fn sync_join(&mut self, cx: &mut Context<Self>) {
+        if let Some(password) = self.sync_password_action(cx) {
+            cx.emit(LauncherEvent::SyncSetupJoin { password });
+        }
+    }
+
+    fn sync_change_password(&mut self, cx: &mut Context<Self>) {
+        let Some(panel) = self.sync.as_ref() else {
+            return;
+        };
+        let old_password = panel.old_password.read(cx).value().trim().to_owned();
+        let new_password = panel.new_password.read(cx).value().trim().to_owned();
+        if old_password.is_empty() || new_password.is_empty() {
+            self.sync_status("Enter the current and the new sync password.", cx);
+            return;
+        }
+        cx.emit(LauncherEvent::SyncChangePassword {
+            old_password,
+            new_password,
+        });
+    }
+
+    fn sync_new_password_action(
+        &mut self,
+        event: fn(String) -> LauncherEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel) = self.sync.as_ref() else {
+            return;
+        };
+        let new_password = panel.new_password.read(cx).value().trim().to_owned();
+        if new_password.is_empty() {
+            self.sync_status("Enter a new sync password.", cx);
+            return;
+        }
+        cx.emit(event(new_password));
+    }
+
+    fn sync_rotate(&mut self, cx: &mut Context<Self>) {
+        self.sync_new_password_action(
+            |new_password| LauncherEvent::SyncRotateKey { new_password },
+            cx,
+        );
+    }
+
+    fn sync_reset(&mut self, cx: &mut Context<Self>) {
+        self.sync_new_password_action(|new_password| LauncherEvent::SyncReset { new_password }, cx);
     }
 
     /// Open the diagnostics panel. The telemetry value arrives from the
@@ -1775,6 +2041,18 @@ impl Render for Launcher {
                         )
                         .child(
                             tableplus_action_button(
+                                "sync",
+                                hugeicon(Hugeicon::Refresh),
+                                if is_zh { "同步" } else { "Sync" },
+                                cx,
+                            )
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_sync_panel(window, cx);
+                                cx.emit(LauncherEvent::SyncPanelOpened);
+                            })),
+                        )
+                        .child(
+                            tableplus_action_button(
                                 "diagnostics",
                                 hugeicon(Hugeicon::Info),
                                 if is_zh { "诊断" } else { "Diagnostics" },
@@ -1924,6 +2202,7 @@ impl Render for Launcher {
                     .when_some(self.render_group_editor(cx), |d, editor| d.child(editor))
                     .when_some(self.render_backup_panel(cx), |d, panel| d.child(panel))
                     .when_some(self.render_mcp_http_panel(cx), |d, panel| d.child(panel))
+                    .when_some(self.render_sync_panel(cx), |d, panel| d.child(panel))
                     .when_some(self.render_diagnostics_panel(cx), |d, panel| d.child(panel))
                     .when_some(self.update_notice(), |d, notice| d.child(notice))
                     .child(
@@ -2171,6 +2450,332 @@ impl Launcher {
                         })),
                 ),
         );
+        Some(body.into_any_element())
+    }
+
+    fn render_sync_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let panel = self.sync.as_ref()?;
+        let theme = cx.theme().clone();
+        let is_zh = is_chinese_locale();
+        let saved_summary = match &panel.settings {
+            None => {
+                if is_zh {
+                    "正在读取已保存的设置…".to_string()
+                } else {
+                    "Loading saved settings…".to_string()
+                }
+            }
+            Some(settings) => {
+                let target = match settings.backend {
+                    fg_core::SyncBackendKind::LocalFolder => {
+                        if is_zh {
+                            format!("本地文件夹 {}", settings.local_folder)
+                        } else {
+                            format!("Local folder {}", settings.local_folder)
+                        }
+                    }
+                    fg_core::SyncBackendKind::S3 => {
+                        format!("S3 {} @ {}", settings.s3_bucket, settings.s3_endpoint)
+                    }
+                    fg_core::SyncBackendKind::WebDav => {
+                        format!("WebDAV {}", settings.webdav_url)
+                    }
+                    _ => {
+                        if is_zh {
+                            "未知后端".to_string()
+                        } else {
+                            "Unknown backend".to_string()
+                        }
+                    }
+                };
+                let creds = if panel.has_credentials {
+                    if is_zh {
+                        "凭据已保存"
+                    } else {
+                        "credentials saved"
+                    }
+                } else if is_zh {
+                    "未保存凭据"
+                } else {
+                    "no credentials saved"
+                };
+                let setup = if panel.setup_done {
+                    if is_zh {
+                        "引擎已就绪"
+                    } else {
+                        "engine ready"
+                    }
+                } else if is_zh {
+                    "未设置"
+                } else {
+                    "not set up"
+                };
+                format!("{target} · {creds} · {setup}")
+            }
+        };
+        let mut body = v_flex()
+            .id("sync-panel")
+            .test_support()
+            .gap_2()
+            .p_2()
+            .rounded(px(6.))
+            .border_1()
+            .border_color(theme.border)
+            // Cap the width like the diagnostics panel: uncapped, the
+            // inputs size to their intrinsic width, the panel overflows
+            // the test window, and input centers fall outside it.
+            .max_w(px(560.))
+            .child(div().font_weight(FontWeight::SEMIBOLD).child(if is_zh {
+                "跨端同步"
+            } else {
+                "Cross-device sync"
+            }))
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(theme.muted_foreground)
+                    .child(if is_zh {
+                        "同步密码只存在内存里，重启后需要重新输入；后端凭据只保存在本机，永不同步。保存设置后需要重新创建或加入仓库。"
+                    } else {
+                        "The sync password lives only in memory; re-enter it after a restart. Backend credentials stay on this device and never sync. Saving settings drops the engine, so create or join again afterwards."
+                    }),
+            )
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(theme.foreground)
+                    .child(saved_summary),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("sync-backend-local")
+                            .label(if is_zh { "本地文件夹" } else { "Local folder" })
+                            .small()
+                            .when(
+                                panel.backend == fg_core::SyncBackendKind::LocalFolder,
+                                |b| b.disabled(true),
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(p) = this.sync.as_mut() {
+                                    p.backend = fg_core::SyncBackendKind::LocalFolder;
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("sync-backend-s3")
+                            .label("S3")
+                            .small()
+                            .when(panel.backend == fg_core::SyncBackendKind::S3, |b| {
+                                b.disabled(true)
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(p) = this.sync.as_mut() {
+                                    p.backend = fg_core::SyncBackendKind::S3;
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("sync-backend-webdav")
+                            .label("WebDAV")
+                            .small()
+                            .when(panel.backend == fg_core::SyncBackendKind::WebDav, |b| {
+                                b.disabled(true)
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(p) = this.sync.as_mut() {
+                                    p.backend = fg_core::SyncBackendKind::WebDav;
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("sync-enabled-toggle")
+                            .label(if panel.enabled {
+                                if is_zh { "同步：开" } else { "Sync: on" }
+                            } else if is_zh {
+                                "同步：关"
+                            } else {
+                                "Sync: off"
+                            })
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(p) = this.sync.as_mut() {
+                                    p.enabled = !p.enabled;
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            );
+        match panel.backend {
+            fg_core::SyncBackendKind::LocalFolder => {
+                body = body.child(Input::new(&panel.local_folder).id("sync-local-folder"));
+            }
+            fg_core::SyncBackendKind::S3 => {
+                body = body
+                    .child(Input::new(&panel.s3_endpoint).id("sync-s3-endpoint"))
+                    .child(Input::new(&panel.s3_bucket).id("sync-s3-bucket"))
+                    .child(Input::new(&panel.s3_region).id("sync-s3-region"))
+                    .child(Input::new(&panel.s3_access_key).id("sync-s3-access-key"))
+                    .child(Input::new(&panel.s3_secret_key).id("sync-s3-secret-key"));
+            }
+            fg_core::SyncBackendKind::WebDav => {
+                body = body
+                    .child(Input::new(&panel.webdav_url).id("sync-webdav-url"))
+                    .child(Input::new(&panel.webdav_username).id("sync-webdav-username"))
+                    .child(Input::new(&panel.webdav_password).id("sync-webdav-password"));
+            }
+            _ => {}
+        }
+        body = body
+            .child(Input::new(&panel.password).id("sync-password"))
+            .child(Input::new(&panel.old_password).id("sync-old-password"))
+            .child(Input::new(&panel.new_password).id("sync-new-password"))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("sync-save")
+                            .label(if is_zh {
+                                "保存设置"
+                            } else {
+                                "Save settings"
+                            })
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.sync_save(cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("sync-create")
+                            .label(if is_zh {
+                                "创建仓库"
+                            } else {
+                                "Create vault"
+                            })
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.sync_create(cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("sync-join")
+                            .label(if is_zh { "加入仓库" } else { "Join vault" })
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.sync_join(cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("sync-now")
+                            .label(if is_zh { "立即同步" } else { "Sync now" })
+                            .small()
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.emit(LauncherEvent::SyncNow);
+                            })),
+                    )
+                    .child(
+                        Button::new("sync-snapshot")
+                            .label(if is_zh { "快照" } else { "Snapshot" })
+                            .small()
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.emit(LauncherEvent::SyncSnapshot);
+                            })),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("sync-change-password")
+                            .label(if is_zh {
+                                "改密码"
+                            } else {
+                                "Change password"
+                            })
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.sync_change_password(cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("sync-rotate")
+                            .label(if is_zh {
+                                "吊销并轮换密钥"
+                            } else {
+                                "Revoke and rotate"
+                            })
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.sync_rotate(cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("sync-reset")
+                            .label(if is_zh { "重置仓库" } else { "Reset vault" })
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.sync_reset(cx);
+                            })),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("sync-refresh-devices")
+                            .label(if is_zh {
+                                "刷新设备"
+                            } else {
+                                "Refresh devices"
+                            })
+                            .small()
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.emit(LauncherEvent::SyncRefreshDevices);
+                            })),
+                    )
+                    .child(
+                        Button::new("sync-close")
+                            .label(if is_zh { "关闭" } else { "Close" })
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.close_sync_panel(cx);
+                            })),
+                    ),
+            );
+        if let Some(status) = &panel.status {
+            body = body.child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(theme.muted_foreground)
+                    .child(status.clone()),
+            );
+        }
+        for device in &panel.devices {
+            let line = if device.is_local {
+                if is_zh {
+                    format!("{}（本机）· 已同步到 {}", device.device_id, device.last_seq)
+                } else {
+                    format!(
+                        "{} (this device) · synced to {}",
+                        device.device_id, device.last_seq
+                    )
+                }
+            } else if is_zh {
+                format!("{} · 已同步到 {}", device.device_id, device.last_seq)
+            } else {
+                format!("{} · synced to {}", device.device_id, device.last_seq)
+            };
+            body = body.child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(theme.foreground)
+                    .child(line),
+            );
+        }
         Some(body.into_any_element())
     }
 
