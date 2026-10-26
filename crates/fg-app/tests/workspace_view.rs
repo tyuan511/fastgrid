@@ -844,3 +844,119 @@ fn import_wizard_previews_maps_and_requests_a_run(cx: &mut TestAppContext) {
     );
     let _ = std::fs::remove_file(&csv);
 }
+
+#[gpui_kit::test]
+fn mcp_approvals_panel_shows_and_resolves(cx: &mut TestAppContext) {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let f = open(cx);
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let log = Rc::clone(&events);
+    cx.update(|cx| {
+        cx.subscribe(&f.view, move |_, e: &WorkspaceEvent, _| {
+            if let WorkspaceEvent::McpWriteResolve { id, approved } = e {
+                log.borrow_mut().push((*id, *approved));
+            }
+        })
+        .detach();
+    });
+    let request = fg_service::McpWriteRequest {
+        id: 7,
+        client: "test-client".into(),
+        connection_id: fg_core::ConnectionId::new(),
+        connection_name: "Billing".into(),
+        sql: "DELETE FROM orders WHERE id = 1".into(),
+        statements: vec![fg_service::McpWriteStatement {
+            class: fg_core::StatementClass::Write,
+            danger: Some(fg_core::DangerReason::DeleteWithoutWhere),
+        }],
+    };
+    // Panel hidden with no pending writes, shown once one arrives.
+    cx.update_window(f.window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find_all("mcp-approvals").is_empty());
+    })
+    .unwrap();
+    cx.update_window(f.window, |_, window, cx| {
+        f.view.update(cx, |v, cx| {
+            v.set_mcp_approvals(vec![request], cx);
+        });
+        window.render_frame(cx);
+        window.click("mcp-deny-7", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(*events.borrow(), vec![(7, false)]);
+    // Resolving clears the panel when nothing remains pending.
+    cx.update_window(f.window, |_, window, cx| {
+        f.view.update(cx, |v, cx| v.set_mcp_approvals(vec![], cx));
+        window.render_frame(cx);
+        assert!(window.find_all("mcp-approvals").is_empty());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn audit_panel_shows_rows_and_requests_export(cx: &mut TestAppContext) {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let f = open(cx);
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let log = Rc::clone(&events);
+    cx.update(|cx| {
+        cx.subscribe(&f.view, move |_, e: &WorkspaceEvent, _| {
+            if let WorkspaceEvent::AuditExportRequested { path } = e {
+                log.borrow_mut().push(path.clone());
+            }
+        })
+        .detach();
+    });
+    cx.update_window(f.window, |_, window, cx| {
+        window.click("audit-btn", cx);
+        window.render_frame(cx);
+        // `find` fails the test if the panel never opened.
+        let _ = window.find("audit-panel").bounds();
+        let _ = window.find("audit-loading").bounds();
+    })
+    .unwrap();
+    let entry = fg_core::AuditEntry {
+        id: fg_core::AuditId::new(),
+        at: fg_core::UnixMillis::now(),
+        actor: fg_core::Actor::Mcp {
+            client: "http:claude".into(),
+        },
+        connection_id: None,
+        connection_name: "Billing".into(),
+        statement: "[list_tables]".into(),
+        class: fg_core::StatementClass::Read,
+        danger: None,
+        decision: fg_core::Decision::Allowed,
+        reason: None,
+        outcome: fg_core::Outcome::Ok,
+        error: None,
+        duration_ms: Some(3),
+        row_count: None,
+    };
+    cx.update_window(f.window, |_, window, cx| {
+        f.view.update(cx, |v, cx| v.set_audit(vec![entry], cx));
+        window.render_frame(cx);
+        let _ = window.find("audit-0").bounds();
+        // Typing in the filter hides the row; clearing shows it again.
+        // `input` appends, it never replaces, so clearing is select-all
+        // plus backspace on the focused input.
+        window.click("audit-search", cx);
+        window.input("nomatch", cx);
+        window.render_frame(cx);
+        assert!(window.find_all("audit-0").is_empty());
+        window.press("secondary-a", cx);
+        window.press("backspace", cx);
+        window.render_frame(cx);
+        let _ = window.find("audit-0").bounds();
+        window.click("audit-export-path", cx);
+        window.input("/tmp/fg-audit-test.csv", cx);
+        window.click("audit-export", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(*events.borrow(), vec!["/tmp/fg-audit-test.csv"]);
+}

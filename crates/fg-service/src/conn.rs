@@ -109,8 +109,11 @@ pub struct OpenConnection {
     relations: TtlCache<Option<String>, Arc<Vec<Relation>>>,
     /// Shared with the service so a settings change applies to open connections.
     pub(crate) max_cell_bytes: Arc<AtomicUsize>,
-    events: broadcast::Sender<ServiceEvent>,
+    pub(crate) events: broadcast::Sender<ServiceEvent>,
     pub(crate) recorder: Recorder,
+    /// Pending agent writes, shared with the service so the GUI can
+    /// resolve them. `run` files here before leasing a session.
+    pub(crate) mcp_writes: Arc<crate::mcp::McpWriteRegistry>,
 }
 
 impl OpenConnection {
@@ -126,6 +129,7 @@ impl OpenConnection {
         max_cell_bytes: Arc<AtomicUsize>,
         events: broadcast::Sender<ServiceEvent>,
         recorder: Recorder,
+        mcp_writes: Arc<crate::mcp::McpWriteRegistry>,
     ) -> Arc<Self> {
         Arc::new(Self {
             rt,
@@ -141,6 +145,7 @@ impl OpenConnection {
             max_cell_bytes,
             events,
             recorder,
+            mcp_writes,
         })
     }
 

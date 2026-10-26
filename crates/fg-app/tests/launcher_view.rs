@@ -914,3 +914,20 @@ fn backup_panel_validates_and_requests_an_export(cx: &mut TestAppContext) {
         other => panic!("expected ExportBackup, got: {other:?}"),
     }
 }
+
+#[gpui_kit::test]
+fn mcp_http_panel_opens_and_requests_a_start(cx: &mut TestAppContext) {
+    let f = open(cx, vec![row("billing", true)]);
+    cx.update_window(f.window, |_, window, cx| {
+        window.click("mcp-server", cx);
+        window.render_frame(cx);
+        // `find` fails the test if the panel never opened.
+        let _ = window.find("mcp-http-panel").bounds();
+        window.click("mcp-http-start", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let events = f.events.borrow();
+    assert_eq!(events.len(), 1, "expected one event, got: {events:?}");
+    assert!(matches!(events[0], LauncherEvent::StartMcpHttp));
+}

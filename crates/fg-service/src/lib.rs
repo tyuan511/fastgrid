@@ -23,6 +23,7 @@ mod conn;
 mod export;
 mod import;
 mod keychain;
+pub(crate) mod mcp;
 mod pool;
 mod run;
 mod ssh;
@@ -60,6 +61,7 @@ pub use keychain::{
     DEV_KEYRING_FILE, FileBackend, KeychainKeyProvider, MemoryBackend, OsKeychain, SecretBackend,
     account_name, default_key_provider,
 };
+pub use mcp::{MCP_WRITE_APPROVAL_TIMEOUT, McpWriteRegistry, McpWriteRequest, McpWriteStatement};
 pub use run::{PlannedStatement, PolicyRefusal, RunOptions, RunPlan, RunStream, plan};
 pub use ssh::SshTunnel;
 pub use task::{TaskCanceller, TaskStream};
@@ -151,6 +153,12 @@ pub enum ServiceEvent {
     MetadataChanged {
         connection: ConnectionId,
     },
+    /// An agent write is waiting for a person. Resolve it through
+    /// [`Service::resolve_mcp_write`]; the request also stays visible
+    /// through [`Service::pending_mcp_writes`].
+    McpWriteRequested {
+        request: McpWriteRequest,
+    },
 }
 
 pub struct ServiceOptions {
@@ -210,6 +218,7 @@ struct Inner {
     save_pause: Mutex<Option<SavePauseInner>>,
     recorder: Recorder,
     events: broadcast::Sender<ServiceEvent>,
+    mcp_writes: Arc<McpWriteRegistry>,
     max_cell_bytes: Arc<AtomicUsize>,
     max_sessions: usize,
     metadata_ttl: Duration,
@@ -265,6 +274,7 @@ impl Service {
                 save_pause: Mutex::new(None),
                 recorder,
                 events,
+                mcp_writes: Arc::new(McpWriteRegistry::new()),
                 max_cell_bytes: Arc::new(AtomicUsize::new(grid.max_cell_bytes as usize)),
                 max_sessions: options.max_sessions_per_connection,
                 metadata_ttl: options.metadata_ttl,
@@ -613,6 +623,7 @@ impl Service {
                 Arc::clone(&self.inner.max_cell_bytes),
                 self.inner.events.clone(),
                 self.inner.recorder.clone(),
+                Arc::clone(&self.inner.mcp_writes),
             );
             self.track_connecting(id, &pool);
             let ping = conn.measure_ping().await;
@@ -752,6 +763,7 @@ impl Service {
             Arc::clone(&self.inner.max_cell_bytes),
             self.inner.events.clone(),
             self.inner.recorder.clone(),
+            Arc::clone(&self.inner.mcp_writes),
         );
         conn.measure_ping().await?;
         Ok(conn)

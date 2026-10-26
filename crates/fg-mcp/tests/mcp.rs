@@ -85,7 +85,11 @@ impl Env {
     }
 
     async fn rpc(&self, message: Value) -> Value {
-        let reply = self.server.handle(&message.to_string()).await.unwrap();
+        let reply = self
+            .server
+            .handle("stdio", &message.to_string())
+            .await
+            .unwrap();
         serde_json::from_str(&reply).unwrap()
     }
 
@@ -160,7 +164,12 @@ async fn an_agent_can_list_describe_and_query() {
             "list_namespaces",
             "list_tables",
             "describe_table",
-            "run_query"
+            "run_query",
+            "explain",
+            "sample_rows",
+            "list_relations",
+            "find_references",
+            "execute_write"
         ]
     );
 
@@ -387,7 +396,10 @@ async fn protocol_edges() {
     // Notifications get no reply.
     assert!(
         env.server
-            .handle(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+            .handle(
+                "stdio",
+                r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#
+            )
             .await
             .is_none()
     );
@@ -403,19 +415,30 @@ async fn protocol_edges() {
         }
     );
 
+    // A tool that does not exist is still a protocol error.
     let unknown = env
         .rpc(json!({"jsonrpc":"2.0","id":9,"method":"tools/call",
-            "params":{"name":"execute_write","arguments":{}}}))
+            "params":{"name":"no_such_tool","arguments":{}}}))
         .await;
     assert_eq!(unknown["error"]["code"], -32602);
 
-    let missing = env
-        .rpc(json!({"jsonrpc":"2.0","id":10,"method":"resources/list"}))
+    // execute_write exists now, so a call with no arguments is a tool
+    // failure (isError), not a protocol error.
+    let no_args = env
+        .rpc(json!({"jsonrpc":"2.0","id":10,"method":"tools/call",
+            "params":{"name":"execute_write","arguments":{}}}))
         .await;
-    assert_eq!(missing["error"]["code"], -32601);
+    assert_eq!(no_args["result"]["isError"], true);
+
+    // resources/list exists now (M7): a list, not -32601.
+    let listed = env
+        .rpc(json!({"jsonrpc":"2.0","id":11,"method":"resources/list"}))
+        .await;
+    assert_eq!(listed["error"], Value::Null);
+    assert!(listed["result"]["resources"].as_array().is_some());
 
     let garbage: Value =
-        serde_json::from_str(&env.server.handle("{not json").await.unwrap()).unwrap();
+        serde_json::from_str(&env.server.handle("stdio", "{not json").await.unwrap()).unwrap();
     assert_eq!(garbage["error"]["code"], -32700);
     assert_eq!(garbage["id"], Value::Null);
 }

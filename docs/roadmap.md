@@ -302,24 +302,25 @@
 
 ---
 
-## M7 MCP 完整版（3w）
+## M7 MCP 完整版（3w）— 已完成（2026-10-26，推送后以远程为准）
 
 详见 [mcp-security.md](mcp-security.md)。
 
-- [ ] 本地 Streamable HTTP：仅监听 127.0.0.1，随机 bearer token，GUI 中可轮换
-- [ ] 复用 GUI 已建立的会话与连接（可选）
-- [ ] 工具补全：`explain`、`sample_rows`、`list_relations`、`find_references`（反向引用）、受控的 `execute_write`
-- [ ] 资源：按连接导出 schema 快照
-- [ ] 写入门控：连接级开关 + 每条语句需 GUI 确认；无头模式默认拒绝；超时自动拒绝
-- [ ] 统一策略引擎：GUI 的安全模式与 MCP 的限制合并到 `fg-service` 一处实现（只读、行数 / 超时上限、生产连接可见性）
-- [ ] 审计日志：落本地，GUI 内可查看 / 过滤 / 导出（agent、连接、语句、结果、耗时）
-- [ ] 提示注入防护：工具返回内容明确标注为「数据」；超长结果截断并提示
+- [x] 本地 Streamable HTTP：仅监听 127.0.0.1，随机 bearer token，GUI 中可轮换（`fg-mcp/src/http.rs`，JSON 响应、无 SSE；`fastgrid-cli mcp --http`；launcher 面板启动 / 停止 / 轮换）
+- [x] 复用 GUI 已建立的会话与连接（可选）：GUI 内启动的 HTTP 服务器直接用 GUI 的 `Service`（同一存储与连接）；无头 CLI 仍是独立进程
+- [x] 工具补全：`explain`（仅单条只读语句，`EXPLAIN ANALYZE` 写操作拒绝）、`sample_rows`（无 raw `WHERE`）、`list_relations`、`find_references`（反向引用）、受控的 `execute_write`
+- [x] 资源：按连接导出 schema 快照（`fastgrid://<id>/schema`，整表累加至 256 KiB 预算，截断仍为合法 JSON 并标 `truncated`）
+- [x] 写入门控：连接级 `mcp.allow_write` 开关 + 每条语句 GUI 确认（待批注册表 + `McpWriteRequested` 事件 + 审批面板）；无监听时立即拒绝（无头模式不等 5 分钟超时）；超时自动拒绝；审批永不覆盖只读拒绝
+- [x] 统一策略引擎：`fg-service::run` 的 agent 路径合并连接的 `McpAccess` 行数 / 超时上限（调用方只能调低）；只读、生产连接可见性仍由同一处实现
+- [x] 审计日志：落本地，GUI 内可查看 / 过滤 / 导出（工作区审计面板，最新 200 条，本地子串过滤，导出 CSV 与所见一致；资源读取同样审计）
+- [x] 提示注入防护：工具返回内容明确标注为「数据」；超长结果截断并提示（256 KiB 截断沿用 M2.5）
 
 **验收**
 
-- 安全测试集：试图绕过只读（多语句、注释、CTE 写入、`SELECT ... INTO`、存储过程）全部被拒绝
-- 写入未经 GUI 确认时一定失败；审计日志与实际执行一一对应
-- 用 Claude Desktop / Cursor / Claude Code 分别完成一次端到端演示
+- 安全测试集：试图绕过只读（多语句、注释、CTE 写入、`SELECT ... INTO`、存储过程）全部被拒绝（`fg-mcp/tests/safety.rs`：9 条绕过 + `execute_write` 全拒，表内 100 行完好，拒绝行与审计一一对应）
+- 写入未经 GUI 确认时一定失败；审计日志与实际执行一一对应（`fg-service/tests/mcp_policy.rs` 8/8：无开关、无监听、批准、拒绝、只读前置、行数上限合并、未知 id、待批列表）
+- [~] 用 Claude Desktop / Cursor / Claude Code 分别完成一次端到端演示：**未竟**——本机 Linux VM 上没有这三个客户端；官方 TS SDK（`@modelcontextprotocol/sdk` 1.32.2，同一协议）已对 stdio 与 HTTP 双路跑通（10 工具、资源读写、写入拒绝原因各就其位、100 行完好），留待有客户端的机器补最后一步
+- [~] 诚实缺口：GUI 审批面板与审计面板、launcher MCP 面板均有视图测试但未经真人视觉验证；HTTP 服务器无 SSE（规范允许纯 JSON 响应）；`SafeMode::Strict` 的密码重认证仍未实现（仍是更强的确认门，不是重认证）
 
 ---
 

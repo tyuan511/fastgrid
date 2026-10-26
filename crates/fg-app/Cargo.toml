@@ -21,6 +21,7 @@ fg-core.workspace = true
 fg-driver.workspace = true
 fg-service.workspace = true
 fg-lsp.workspace = true
+fg-mcp.workspace = true
 fg-sql.workspace = true
 lsp-types.workspace = true
 anyhow.workspace = true

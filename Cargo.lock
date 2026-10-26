@@ -2175,6 +2175,7 @@ dependencies = [
  "fg-core",
  "fg-driver",
  "fg-lsp",
+ "fg-mcp",
  "fg-service",
  "fg-sql",
  "fg-store",
@@ -2262,8 +2263,10 @@ name = "fg-mcp"
 version = "0.0.1"
 dependencies = [
  "fg-core",
+ "fg-crypto",
  "fg-driver",
  "fg-service",
+ "fg-sql",
  "fg-store",
  "rusqlite",
  "serde_json",

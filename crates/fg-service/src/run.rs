@@ -30,8 +30,10 @@ use tokio::runtime::Handle;
 use tokio::sync::{Notify, mpsc as async_mpsc, oneshot};
 use tokio::task::JoinHandle;
 
+use crate::ServiceEvent;
 use crate::conn::{OpenConnection, SharedRuntime};
 use crate::lock_error;
+use crate::mcp::{MCP_WRITE_APPROVAL_TIMEOUT, McpWriteStatement};
 use crate::task::TaskStream;
 
 /// Per-call knobs for [`OpenConnection::run`].
@@ -105,7 +107,10 @@ impl RunOptions {
         }
     }
 
-    /// Agent run. Cannot carry a confirmation. `client` is the audit actor, not a fixed label.
+    /// Agent run. Cannot carry a confirmation: approval for a write
+    /// comes from the service's pending-write registry, granted by a
+    /// person in the GUI, never claimed by the caller. `client` is the
+    /// audit actor, not a fixed label.
     ///
     /// An empty client id is rejected when the run starts, so a missing identity cannot hide in
     /// a row tagged `"mcp"`.
@@ -835,6 +840,25 @@ pub(crate) async fn record_blocked(
     await_record(&conn.rt.handle, ack_rx).await
 }
 
+/// Record a refused agent write, then return it as a policy denial.
+/// A standalone function, not a closure: a closure returning an async
+/// block ties the future to the closure's own borrow, which the
+/// compiler rejects here.
+async fn deny_agent_write(
+    recorder: &Recorder,
+    handle: &Handle,
+    meta: &MetaParts,
+    message: &str,
+) -> Result<RunStream> {
+    let (ack_tx, ack_rx) = mpsc::channel();
+    recorder.enqueue(
+        meta.job(Outcome::NotRun, None, Some(message.to_owned())),
+        Some(ack_tx),
+    )?;
+    await_record(handle, ack_rx).await?;
+    Err(Error::PolicyDenied(message.to_owned()))
+}
+
 impl OpenConnection {
     /// Run user or agent SQL: classify, enforce safe mode, cap rows, then stream.
     ///
@@ -896,7 +920,82 @@ impl OpenConnection {
         let settings = load_exec_settings(self).await?;
         let meta = meta_for(self, sql, &options, &planned, &settings);
 
-        if let Some(refusal) = blocking_refusal(&planned, confirmed) {
+        // Agent writes need a person, not just a policy row. This gate
+        // runs before the generic refusal so an approved write can pass
+        // an Alert/Strict confirmation demand; read-only still refuses
+        // through the generic path below, and approval never overrides
+        // it. The transport cannot claim approval: it arrives here from
+        // the service's pending-write registry, resolved in the GUI.
+        let mut agent_approved = false;
+        if let RunKind::Agent { client } = &options.kind
+            && planned.statements.iter().any(|s| s.class.may_write())
+            && self.safe_mode().effective() != SafeMode::ReadOnly
+        {
+            if !self.config.mcp.allow_write {
+                return deny_agent_write(
+                    &self.recorder,
+                    &self.rt.handle,
+                    &meta,
+                    "agent writes are not enabled for this connection",
+                )
+                .await;
+            }
+            let statements = planned
+                .statements
+                .iter()
+                .map(|s| McpWriteStatement {
+                    class: s.class,
+                    danger: s.danger,
+                })
+                .collect();
+            let (request, rx) = self.mcp_writes.request(
+                client.clone(),
+                self.config.id.clone(),
+                self.config.name.clone(),
+                sql.to_owned(),
+                statements,
+            );
+            if self.events.receiver_count() == 0 {
+                // No GUI is listening: headless, so deny at once rather
+                // than stalling the agent for the whole timeout.
+                self.mcp_writes.forget(request.id);
+                return deny_agent_write(
+                    &self.recorder,
+                    &self.rt.handle,
+                    &meta,
+                    "no GUI is attached to confirm agent writes",
+                )
+                .await;
+            }
+            let request_id = request.id;
+            let _ = self
+                .events
+                .send(ServiceEvent::McpWriteRequested { request });
+            match tokio::time::timeout(MCP_WRITE_APPROVAL_TIMEOUT, rx).await {
+                Ok(Ok(true)) => agent_approved = true,
+                Ok(Ok(false)) => {
+                    return deny_agent_write(
+                        &self.recorder,
+                        &self.rt.handle,
+                        &meta,
+                        "the agent write was denied",
+                    )
+                    .await;
+                }
+                _ => {
+                    self.mcp_writes.forget(request_id);
+                    return deny_agent_write(
+                        &self.recorder,
+                        &self.rt.handle,
+                        &meta,
+                        "the agent write was not approved in time",
+                    )
+                    .await;
+                }
+            }
+        }
+
+        if let Some(refusal) = blocking_refusal(&planned, confirmed || agent_approved) {
             let (ack_tx, ack_rx) = mpsc::channel();
             self.recorder.enqueue(
                 meta.job(Outcome::NotRun, None, Some(refusal_message(refusal))),
@@ -907,14 +1006,31 @@ impl OpenConnection {
         }
 
         let max_cell = self.max_cell_bytes.load(Ordering::Relaxed);
+        // Agent runs also merge the connection's MCP caps here, so the
+        // transport cannot loosen them by passing larger per-call
+        // numbers; the transport's own defaults stay transport-side.
+        let agent = matches!(options.kind, RunKind::Agent { .. });
+        let call_rows = if agent {
+            stricter([options.max_rows, self.config.mcp.max_rows.map(u64::from)])
+        } else {
+            options.max_rows
+        };
+        let call_timeout = if agent {
+            stricter([
+                options.statement_timeout_secs,
+                self.config.mcp.statement_timeout_secs,
+            ])
+        } else {
+            options.statement_timeout_secs
+        };
         let timeout = effective_statement_timeout(
-            options.statement_timeout_secs,
+            call_timeout,
             settings.statement_timeout_secs,
             self.config.timeouts.statement_secs,
         );
         let engine_timeout = self.capabilities().statement_timeout;
         let exec = ExecOptions {
-            max_rows: rows_cap(options.max_rows, settings.max_rows),
+            max_rows: rows_cap(call_rows, settings.max_rows),
             max_cell_bytes: (max_cell > 0).then_some(max_cell),
             statement_timeout_secs: engine_timeout.then_some(timeout).flatten(),
             ..ExecOptions::default()

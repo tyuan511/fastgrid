@@ -6,11 +6,17 @@
 //! instead of behind a macro-generated router.
 //!
 //! [`McpServer::handle`] is a pure "message in, message out" function over an [`fg_service::Service`];
-//! the byte transport (newline-delimited JSON on stdin/stdout) lives in `fg-cli`.
+//! the byte transports live elsewhere: newline-delimited JSON on stdin/stdout in `fg-cli`, and
+//! the loopback Streamable HTTP server in [`http::serve_http`].
+//!
+//! Sessions: stdio has exactly one client, HTTP has one per session id. `handle` takes the
+//! session key so two HTTP clients never share an audit identity.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod http;
 mod server;
 mod tools;
 
+pub use http::{HttpServer, rotate_http_token, serve_http};
 pub use server::McpServer;

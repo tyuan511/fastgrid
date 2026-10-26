@@ -102,6 +102,10 @@ pub enum WorkspaceEvent {
     },
     /// The import wizard's Cancel: the controller flags the run's control.
     ImportCancel,
+    /// Answer an agent write waiting in the approvals panel. The
+    /// controller resolves it through the service; the panel refreshes
+    /// from the remaining pending list.
+    McpWriteResolve { id: u64, approved: bool },
     /// Run `mode` in the query tab. The target is read from the buffer when this is handled, so
     /// what runs is what the editor holds at that moment.
     QueryRun {
@@ -129,6 +133,11 @@ pub enum WorkspaceEvent {
     QueryResultCommit { tab: Entity<QueryTab> },
     /// `⌘Y` / the history button: load the recent statements of this connection.
     HistoryRequested { search: String },
+    /// The audit button: load the newest audit rows for this connection.
+    AuditRequested,
+    /// The audit panel's Export: the controller writes the loaded rows
+    /// as CSV and reports back through `set_audit_export_status`.
+    AuditExportRequested { path: String },
     /// Put a history entry into the active query tab (the user picked it).
     HistoryPicked { sql: String },
     /// The lock button: switch the connection's guard level, and persist it.
@@ -195,10 +204,17 @@ pub struct WorkspaceView {
     history: Option<HistoryPanel>,
     /// The snippets panel (`⌘⇧S`): saved fragments, per connection plus global ones.
     snippets: Option<SnippetsPanel>,
+    /// The audit panel: agent and GUI calls, newest first, filterable
+    /// locally. Same overlay shape as history.
+    audit: Option<AuditPanel>,
     /// The export wizard (`⇧⌘E`): a panel above the tabs, not a tab.
     export_wizard: Option<ExportWizardState>,
     /// The import wizard (`⇧⌘I`): same shape, for a table tab.
     import_wizard: Option<ImportWizardState>,
+    /// Agent writes waiting for a person. The panel shows while this
+    /// is non-empty; every entry must be answered, never dismissed
+    /// unseen, because the agent's run is parked on it.
+    mcp_approvals: Vec<fg_service::McpWriteRequest>,
     /// What the connection is set to, as far as this window knows. `None` until the controller
     /// tells us; the controller is the one that persists a change.
     safe_mode: SafeMode,
@@ -262,6 +278,17 @@ enum ImportWizardStatus {
     Running,
     Done(CsvImportReport),
     Failed(String),
+}
+
+/// The open audit panel. The search filters the loaded rows locally
+/// (actor, connection, statement substring); the export writes those
+/// same rows, so what you see is what the file holds.
+struct AuditPanel {
+    search: Entity<InputState>,
+    entries: Vec<fg_core::AuditEntry>,
+    loading: bool,
+    export_path: Entity<InputState>,
+    export_status: Option<String>,
 }
 
 /// The open snippets panel. Same shape as the history one: a search box and a list.
@@ -373,8 +400,10 @@ impl WorkspaceView {
             switcher: None,
             history: None,
             snippets: None,
+            audit: None,
             export_wizard: None,
             import_wizard: None,
+            mcp_approvals: Vec::new(),
             safe_mode: config_safe_mode,
             _subscriptions: vec![on_filter, on_tree, on_details],
         }
@@ -408,6 +437,17 @@ impl WorkspaceView {
 
     pub fn close_export_wizard(&mut self, cx: &mut Context<Self>) {
         self.export_wizard = None;
+        cx.notify();
+    }
+
+    /// Replace the approvals panel with the service's current pending
+    /// list. An empty list hides the panel.
+    pub fn set_mcp_approvals(
+        &mut self,
+        list: Vec<fg_service::McpWriteRequest>,
+        cx: &mut Context<Self>,
+    ) {
+        self.mcp_approvals = list;
         cx.notify();
     }
 
@@ -674,6 +714,74 @@ impl WorkspaceView {
         if self.history.take().is_some() {
             cx.notify();
         }
+    }
+
+    // ---- audit log -------------------------------------------------------------------
+
+    pub fn audit_visible(&self) -> bool {
+        self.audit.is_some()
+    }
+
+    /// Show the panel and ask for the newest rows. The search box
+    /// filters locally: typing re-renders, it never reloads, so the
+    /// filter cannot hide rows the export would still write — the
+    /// export writes exactly the filtered list.
+    pub fn open_audit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.audit.is_some() {
+            self.close_audit(cx);
+            return;
+        }
+        let search = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Filter actor, connection, statement...")
+        });
+        let on_search = cx.subscribe(&search, |_, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        });
+        self._subscriptions.push(on_search);
+        let export_path =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Export CSV path..."));
+        self.audit = Some(AuditPanel {
+            search,
+            entries: Vec::new(),
+            loading: true,
+            export_path,
+            export_status: None,
+        });
+        cx.emit(WorkspaceEvent::AuditRequested);
+        cx.notify();
+    }
+
+    pub fn close_audit(&mut self, cx: &mut Context<Self>) {
+        if self.audit.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    pub fn set_audit(&mut self, entries: Vec<fg_core::AuditEntry>, cx: &mut Context<Self>) {
+        if let Some(panel) = self.audit.as_mut() {
+            panel.entries = entries;
+            panel.loading = false;
+        }
+        cx.notify();
+    }
+
+    pub fn set_audit_export_status(&mut self, status: String, cx: &mut Context<Self>) {
+        if let Some(panel) = self.audit.as_mut() {
+            panel.export_status = Some(status);
+        }
+        cx.notify();
+    }
+
+    /// The rows the panel currently shows, after the local filter.
+    /// The controller's export writes exactly these.
+    pub fn audit_entries(&self, cx: &App) -> Vec<fg_core::AuditEntry> {
+        let Some(panel) = self.audit.as_ref() else {
+            return Vec::new();
+        };
+        let filter = panel.search.read(cx).value().to_string();
+        filter_audit_entries(&panel.entries, &filter)
     }
 
     /// The controller's answer. Keeps the selection when the entry is still listed.
@@ -1615,6 +1723,17 @@ impl Render for WorkspaceView {
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.open_history(window, cx)
                                         })),
+                                )
+                                .child(
+                                    Button::new("audit-btn")
+                                        .icon(hugeicon(Hugeicon::Lock))
+                                        .ghost()
+                                        .with_size(TOOLBAR_ICON_BOX)
+                                        .tooltip("Audit log")
+                                        .when(self.audit.is_some(), |b| b.primary())
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.open_audit(window, cx)
+                                        })),
                                 ),
                         )
                         .child(
@@ -1750,6 +1869,7 @@ impl Render for WorkspaceView {
 
         let snippets = self.render_snippets(cx);
         let history = self.render_history(cx);
+        let audit = self.render_audit(cx);
         let overlay = self.render_quick_open(window, cx);
         v_flex()
             .id("workspace")
@@ -1827,6 +1947,7 @@ impl Render for WorkspaceView {
                     .when(self.details_visible, |d| d.child(details)),
             )
             .children(history)
+            .children(audit)
             .children(snippets)
             .children(overlay)
             .children(self.render_database_switcher(window, cx))
@@ -2040,6 +2161,89 @@ impl WorkspaceView {
 
     /// The `⌘Y` panel: recent statements, newest first, with their outcome. Drawn as an overlay
     /// like Quick Open so it does not steal space from the editor.
+    /// The agent write approvals: one row per parked run, with the
+    /// exact SQL the person is being asked to allow. Approve runs it;
+    /// Deny refuses it. There is no dismiss: leaving a row unanswered
+    /// leaves the agent parked, which is the safe default.
+    fn render_mcp_approvals_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.mcp_approvals.is_empty() {
+            return None;
+        }
+        let theme = cx.theme().clone();
+        let mut panel = v_flex()
+            .id("mcp-approvals")
+            .test_support()
+            .w_full()
+            .flex_shrink_0()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(theme.danger.opacity(0.5))
+            .bg(theme.danger.opacity(0.14))
+            .child(div().text_size(px(13.)).text_color(theme.foreground).child(
+                "An agent asked to write to this database. Approve only the exact statement shown.",
+            ));
+        for request in &self.mcp_approvals {
+            let id = request.id;
+            let summary = request
+                .statements
+                .iter()
+                .map(|s| match s.danger {
+                    Some(danger) => format!("{:?} · {danger:?}", s.class),
+                    None => format!("{:?}", s.class),
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            panel = panel.child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(theme.muted_foreground)
+                            .child(format!(
+                                "{} · {} · {summary}",
+                                request.client, request.connection_name
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(theme.foreground)
+                            .child(request.sql.clone()),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new(format!("mcp-approve-{id}"))
+                                    .label("Approve")
+                                    .small()
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        cx.emit(WorkspaceEvent::McpWriteResolve {
+                                            id,
+                                            approved: true,
+                                        });
+                                    })),
+                            )
+                            .child(
+                                Button::new(format!("mcp-deny-{id}"))
+                                    .label("Deny")
+                                    .small()
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        cx.emit(WorkspaceEvent::McpWriteResolve {
+                                            id,
+                                            approved: false,
+                                        });
+                                    })),
+                            ),
+                    ),
+            );
+        }
+        Some(panel.into_any_element())
+    }
+
     fn render_export_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let wizard = self.export_wizard.as_ref()?;
         let theme = cx.theme().clone();
@@ -2390,6 +2594,175 @@ impl WorkspaceView {
             panel = panel.child(skipped);
         }
         Some(panel.into_any_element())
+    }
+
+    fn render_audit(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let panel = self.audit.as_ref()?;
+        let theme = cx.theme().clone();
+        let entries = self.audit_entries(cx);
+        let rows: Vec<AnyElement> = if panel.loading && panel.entries.is_empty() {
+            vec![
+                div()
+                    .id("audit-loading")
+                    .test_support()
+                    .p_3()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child("Loading…")
+                    .into_any_element(),
+            ]
+        } else if entries.is_empty() {
+            vec![
+                div()
+                    .id("audit-empty")
+                    .test_support()
+                    .p_3()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child("No audit rows match.")
+                    .into_any_element(),
+            ]
+        } else {
+            entries
+                .iter()
+                .enumerate()
+                .map(|(ix, entry)| {
+                    let (ok, colour, badge) = match entry.outcome {
+                        fg_core::Outcome::Ok => (true, theme.success, "ok"),
+                        fg_core::Outcome::Error => (false, theme.danger, "error"),
+                        fg_core::Outcome::Cancelled => (false, theme.warning, "cancelled"),
+                        fg_core::Outcome::NotRun => (false, theme.muted_foreground, "not run"),
+                        _ => (false, theme.muted_foreground, "?"),
+                    };
+                    let _ = ok;
+                    let actor = match &entry.actor {
+                        fg_core::Actor::Mcp { client } => client.clone(),
+                        fg_core::Actor::User => "user".to_owned(),
+                        _ => "system".to_owned(),
+                    };
+                    let statement = entry.statement.replace('\n', " ");
+                    let when = relative_time(entry.at);
+                    let detail = match entry.duration_ms {
+                        Some(ms) => format!("{badge} · {ms} ms · {when}"),
+                        None => format!("{badge} · {when}"),
+                    };
+                    let mut detail = detail;
+                    if let Some(error) = &entry.error {
+                        detail.push_str(&format!(" · {error}"));
+                    }
+                    div()
+                        .id(SharedString::from(format!("audit-{ix}")))
+                        .test_support()
+                        .aria_label(statement.clone())
+                        .px_3()
+                        .py_1p5()
+                        .flex()
+                        .flex_col()
+                        .gap_0p5()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(format!("{actor} · {}", entry.connection_name)),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .font_family(theme.mono_font_family.clone())
+                                .text_sm()
+                                .text_color(theme.foreground)
+                                .child(statement),
+                        )
+                        .child(div().text_xs().text_color(colour).child(detail))
+                        .into_any_element()
+                })
+                .collect()
+        };
+        let export_status = panel.export_status.clone();
+        Some(
+            div()
+                .id("audit-panel")
+                .test_support()
+                .absolute()
+                .top_0()
+                .right_0()
+                .bottom_0()
+                .w(px(420.))
+                .flex()
+                .flex_col()
+                .border_l_1()
+                .border_color(theme.border)
+                .bg(theme.popover)
+                .shadow_lg()
+                .child(
+                    h_flex()
+                        .px_3()
+                        .py_2()
+                        .gap_2()
+                        .items_center()
+                        .border_b_1()
+                        .border_color(theme.border)
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child("Audit log"),
+                        )
+                        .child(div().flex_1())
+                        .child(
+                            Button::new("audit-close")
+                                .icon(hugeicon(Hugeicon::Close))
+                                .ghost()
+                                .small()
+                                .on_click(cx.listener(|this, _, _, cx| this.close_audit(cx))),
+                        ),
+                )
+                .child(Input::new(&panel.search).id("audit-search"))
+                .child(
+                    v_flex()
+                        .id("audit-list")
+                        .test_support()
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .children(rows)
+                        .into_any_element(),
+                )
+                .child(
+                    h_flex()
+                        .px_3()
+                        .py_2()
+                        .gap_2()
+                        .items_center()
+                        .border_t_1()
+                        .border_color(theme.border)
+                        .child(Input::new(&panel.export_path).id("audit-export-path"))
+                        .child(
+                            Button::new("audit-export")
+                                .label("Export CSV")
+                                .small()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let path = this
+                                        .audit
+                                        .as_ref()
+                                        .map(|p| p.export_path.read(cx).value().to_string())
+                                        .unwrap_or_default();
+                                    cx.emit(WorkspaceEvent::AuditExportRequested { path });
+                                })),
+                        ),
+                )
+                .child(
+                    div()
+                        .px_3()
+                        .pb_2()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(export_status.unwrap_or_default()),
+                )
+                .into_any_element(),
+        )
     }
 
     fn render_history(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -3196,12 +3569,14 @@ impl WorkspaceView {
 
         let export_panel = self.render_export_panel(cx);
         let import_panel = self.render_import_panel(cx);
+        let approvals_panel = self.render_mcp_approvals_panel(cx);
         v_flex()
             .flex_1()
             .min_w_0()
             .h_full()
             .children(strip)
             .children(confirm_banner)
+            .children(approvals_panel)
             .children(export_panel)
             .children(import_panel)
             .child(div().flex_1().min_h_0().child(content))
@@ -3414,6 +3789,29 @@ pub fn safe_mode_label(mode: SafeMode) -> &'static str {
 
 /// "3 min ago", "2 h ago", "12 Oct" - enough to tell two similar statements apart without a
 /// date library. Future timestamps (clock skew) read as "just now".
+/// The audit panel's local filter: actor, connection, or statement
+/// contains the text, case-insensitive. Empty means everything.
+fn filter_audit_entries(entries: &[fg_core::AuditEntry], filter: &str) -> Vec<fg_core::AuditEntry> {
+    let filter = filter.trim().to_lowercase();
+    if filter.is_empty() {
+        return entries.to_vec();
+    }
+    entries
+        .iter()
+        .filter(|e| {
+            let actor = match &e.actor {
+                fg_core::Actor::Mcp { client } => client.clone(),
+                fg_core::Actor::User => "user".to_owned(),
+                _ => "system".to_owned(),
+            };
+            format!("{} {} {}", actor, e.connection_name, e.statement)
+                .to_lowercase()
+                .contains(&filter)
+        })
+        .cloned()
+        .collect()
+}
+
 fn relative_time(at: fg_core::UnixMillis) -> String {
     let now = fg_core::UnixMillis::now().0;
     let delta = now.saturating_sub(at.0);

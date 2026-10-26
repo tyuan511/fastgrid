@@ -51,6 +51,6 @@ pub use types::{ColumnMeta, ColumnOrigin, DataType, TypeCategory, TypeParams};
 pub use value::{LargeKind, Truncated, Value};
 pub use workspace::{
     AppearanceSettings, BackupNudge, EditorSettings, ExecSettings, GridSettings,
-    KeybindingOverrides, McpSettings, PrivacySettings, RowHeight, SettingGroup, TabKind, TabState,
-    TableViewMode, TableViewState, ThemeMode, WorkspaceState,
+    KeybindingOverrides, McpHttpSettings, McpSettings, PrivacySettings, RowHeight, SettingGroup,
+    TabKind, TabState, TableViewMode, TableViewState, ThemeMode, WorkspaceState,
 };

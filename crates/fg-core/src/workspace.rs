@@ -228,6 +228,24 @@ impl SettingGroup for McpSettings {
     const KEY: &'static str = "mcp";
 }
 
+/// The local Streamable HTTP server's credentials. The token is a
+/// bearer for loopback only: anyone who can read it already shares the
+/// user's OS session, so it is stored like any other setting, not in
+/// the keychain. `port` is the port the server actually bound (0
+/// means "pick one"), written back after a successful bind so the UI
+/// can show the real URL.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct McpHttpSettings {
+    #[serde(default)]
+    pub token: Option<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
+}
+
+impl SettingGroup for McpHttpSettings {
+    const KEY: &'static str = "mcp_http";
+}
+
 /// Whether the first-launch keychain-backup banner has been dismissed. It is a setting, not
 /// session state, so a fresh install sees the guidance exactly once — until the user closes it.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]

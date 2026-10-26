@@ -154,6 +154,14 @@ pub enum LauncherEvent {
         password: String,
         path: String,
     },
+    /// Start the loopback MCP HTTP server. The controller binds it
+    /// and reports back through `set_mcp_http_state`.
+    StartMcpHttp,
+    /// Stop the loopback MCP HTTP server.
+    StopMcpHttp,
+    /// Replace the bearer token. The running server reads the token
+    /// per request, so this needs no restart.
+    RotateMcpToken,
 }
 
 type Choice = Entity<SelectState<SearchableVec<SharedString>>>;
@@ -217,6 +225,17 @@ struct BackupPanel {
     running: bool,
 }
 
+/// The loopback MCP HTTP server panel: its URL and bearer token while
+/// running, plus the last status. The token is loopback-only, so it is
+/// shown in full: anyone who can read this screen already shares the
+/// user's OS session.
+struct McpHttpPanel {
+    running: bool,
+    url: Option<String>,
+    token: Option<String>,
+    status: Option<SharedString>,
+}
+
 pub struct Launcher {
     rows: Vec<Row>,
     groups: Vec<ConnectionGroup>,
@@ -228,6 +247,7 @@ pub struct Launcher {
     editor: Option<Editor>,
     group_editor: Option<GroupEditor>,
     backup: Option<BackupPanel>,
+    mcp_http: Option<McpHttpPanel>,
     confirm_delete: Option<ConnectionId>,
     confirm_delete_group: Option<GroupId>,
     show_backup_nudge: bool,
@@ -322,6 +342,7 @@ impl Launcher {
             editor: None,
             group_editor: None,
             backup: None,
+            mcp_http: None,
             confirm_delete: None,
             confirm_delete_group: None,
             show_backup_nudge: false,
@@ -466,6 +487,61 @@ impl Launcher {
 
     pub fn close_backup(&mut self, cx: &mut Context<Self>) {
         self.backup = None;
+        cx.notify();
+    }
+
+    /// Open the MCP server panel. Starting and stopping go through
+    /// the controller, which reports back through `set_mcp_http_state`.
+    pub fn open_mcp_http_panel(&mut self, cx: &mut Context<Self>) {
+        if self.mcp_http.is_none() {
+            self.mcp_http = Some(McpHttpPanel {
+                running: false,
+                url: None,
+                token: None,
+                status: None,
+            });
+        }
+        cx.notify();
+    }
+
+    pub fn close_mcp_http_panel(&mut self, cx: &mut Context<Self>) {
+        self.mcp_http = None;
+        cx.notify();
+    }
+
+    /// Whether the panel currently shows a running server, so a token
+    /// rotation does not claim a stopped server is running.
+    pub fn is_mcp_http_running(&self) -> bool {
+        self.mcp_http.as_ref().is_some_and(|p| p.running)
+    }
+
+    /// The controller's report for the panel: a start, a stop, a
+    /// rotation, or a failure. `None` fields leave the current value
+    /// alone, so a rotation does not clear the URL.
+    pub fn set_mcp_http_state(
+        &mut self,
+        running: bool,
+        url: Option<String>,
+        token: Option<String>,
+        status: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let panel = self.mcp_http.get_or_insert(McpHttpPanel {
+            running: false,
+            url: None,
+            token: None,
+            status: None,
+        });
+        panel.running = running;
+        if url.is_some() {
+            panel.url = url;
+        }
+        if token.is_some() {
+            panel.token = token;
+        }
+        if status.is_some() {
+            panel.status = status.map(SharedString::from);
+        }
         cx.notify();
     }
 
@@ -1582,6 +1658,21 @@ impl Render for Launcher {
                         )
                         .child(
                             tableplus_action_button(
+                                "mcp-server",
+                                hugeicon(Hugeicon::Plug),
+                                if is_zh {
+                                    "MCP 服务器"
+                                } else {
+                                    "MCP Server"
+                                },
+                                cx,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.open_mcp_http_panel(cx);
+                            })),
+                        )
+                        .child(
+                            tableplus_action_button(
                                 "new-connection",
                                 hugeicon(Hugeicon::Plug),
                                 if is_zh {
@@ -1718,6 +1809,7 @@ impl Render for Launcher {
                     })
                     .when_some(self.render_group_editor(cx), |d, editor| d.child(editor))
                     .when_some(self.render_backup_panel(cx), |d, panel| d.child(panel))
+                    .when_some(self.render_mcp_http_panel(cx), |d, panel| d.child(panel))
                     .child(
                         // Headless test-support action triggers.
                         // Visual operations are right-click only (matching TablePlus).
@@ -1870,6 +1962,102 @@ impl Render for Launcher {
 }
 
 impl Launcher {
+    fn render_mcp_http_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let panel = self.mcp_http.as_ref()?;
+        let theme = cx.theme().clone();
+        let is_zh = is_chinese_locale();
+        let mut body = v_flex()
+            .id("mcp-http-panel")
+            .test_support()
+            .gap_2()
+            .p_2()
+            .rounded(px(6.))
+            .border_1()
+            .border_color(theme.border)
+            .child(div().font_weight(FontWeight::SEMIBOLD).child(if is_zh {
+                "MCP 服务器（本地 HTTP）"
+            } else {
+                "MCP server (local HTTP)"
+            }))
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(theme.muted_foreground)
+                    .child(if is_zh {
+                        "只监听本机，连接需要下面的令牌。写入仍需连接的 allow_write 与你在审批面板的确认。"
+                    } else {
+                        "Loopback only; clients need the token below. Writes still need the connection's allow_write plus your approval."
+                    }),
+            );
+        if let Some(url) = &panel.url {
+            body = body.child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(theme.foreground)
+                    .child(url.clone()),
+            );
+        }
+        if let Some(token) = &panel.token {
+            body = body.child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(theme.foreground)
+                    .child(format!("Token: {token}")),
+            );
+        }
+        if let Some(status) = &panel.status {
+            body = body.child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(theme.muted_foreground)
+                    .child(status.clone()),
+            );
+        }
+        body = body.child(
+            h_flex()
+                .gap_2()
+                .child(
+                    Button::new("mcp-http-start")
+                        .label(if is_zh { "启动" } else { "Start" })
+                        .small()
+                        .when(panel.running, |b| b.disabled(true))
+                        .on_click(cx.listener(|_, _, _, cx| {
+                            cx.emit(LauncherEvent::StartMcpHttp);
+                        })),
+                )
+                .child(
+                    Button::new("mcp-http-stop")
+                        .label(if is_zh { "停止" } else { "Stop" })
+                        .small()
+                        .when(!panel.running, |b| b.disabled(true))
+                        .on_click(cx.listener(|_, _, _, cx| {
+                            cx.emit(LauncherEvent::StopMcpHttp);
+                        })),
+                )
+                .child(
+                    Button::new("mcp-http-rotate")
+                        .label(if is_zh {
+                            "轮换令牌"
+                        } else {
+                            "Rotate token"
+                        })
+                        .small()
+                        .on_click(cx.listener(|_, _, _, cx| {
+                            cx.emit(LauncherEvent::RotateMcpToken);
+                        })),
+                )
+                .child(
+                    Button::new("mcp-http-close")
+                        .label(if is_zh { "关闭" } else { "Close" })
+                        .small()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.close_mcp_http_panel(cx);
+                        })),
+                ),
+        );
+        Some(body.into_any_element())
+    }
+
     fn render_backup_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let panel = self.backup.as_ref()?;
         let theme = cx.theme().clone();

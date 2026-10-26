@@ -22,11 +22,33 @@ fn main() {
             }
         }
         Some("mcp") => {
-            if args.next().as_deref() != Some("--stdio") {
-                eprintln!("fastgrid-cli mcp: only `--stdio` is supported; try --help");
-                std::process::exit(2);
+            let mut mode = None;
+            let mut port = 0u16;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--stdio" => mode = Some("stdio"),
+                    "--http" => mode = Some("http"),
+                    "--port" => {
+                        port = args.next().and_then(|p| p.parse().ok()).unwrap_or_else(|| {
+                            eprintln!("fastgrid-cli mcp: --port needs a number");
+                            std::process::exit(2);
+                        });
+                    }
+                    other => {
+                        eprintln!("fastgrid-cli mcp: unknown flag `{other}`; try --help");
+                        std::process::exit(2);
+                    }
+                }
             }
-            if let Err(e) = serve_mcp() {
+            let result = match mode {
+                Some("stdio") => serve_mcp(),
+                Some("http") => serve_mcp_http(port),
+                _ => {
+                    eprintln!("fastgrid-cli mcp: pass --stdio or --http; try --help");
+                    std::process::exit(2);
+                }
+            };
+            if let Err(e) = result {
                 eprintln!("fastgrid-cli mcp: {e}");
                 std::process::exit(1);
             }
@@ -40,6 +62,9 @@ fn main() {
                  Usage:\n  \
                  fastgrid-cli lsp        Serve the SQL language server over stdio (LSP)\n  \
                  fastgrid-cli mcp --stdio  Serve read-only MCP over stdio\n  \
+                 fastgrid-cli mcp --http [--port N]  Serve MCP on loopback HTTP (writes need\n  \
+                   the connection's allow_write plus a GUI approval, so a headless server\n  \
+                   denies them; the bearer token prints on start)\n  \
                  fastgrid-cli --version  Print the version\n",
                 env!("CARGO_PKG_VERSION")
             );
@@ -91,6 +116,30 @@ fn data_dir() -> PathBuf {
         .join("fastgrid")
 }
 
+/// Serve MCP on loopback HTTP. Unlike stdio this is NOT force-read-only:
+/// the same gate as the GUI applies, so a write needs the connection's
+/// allow_write plus a person's approval, and with no GUI attached the
+/// approval step denies at once. The token prints here because a
+/// headless operator has no GUI panel to read it from.
+fn serve_mcp_http(port: u16) -> io::Result<()> {
+    let data_dir = data_dir();
+    let options = ServiceOptions::new(data_dir.join("store.db"));
+    let keys = default_key_provider(&data_dir);
+    let service =
+        Service::start(options, keys.as_ref()).map_err(|e| io::Error::other(e.to_string()))?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let server = runtime.block_on(fg_mcp::serve_http(service, port))?;
+    eprintln!(
+        "fastgrid-cli mcp: listening on http://127.0.0.1:{}/mcp",
+        server.addr.port()
+    );
+    eprintln!("fastgrid-cli mcp: bearer token: {}", server.token);
+    runtime.block_on(std::future::pending::<()>());
+    Ok(())
+}
+
 /// Serve MCP over stdio: one JSON-RPC message per line in, one per line out.
 ///
 /// Every connection is opened force-read-only (engine session and classification), and refusals
@@ -116,7 +165,7 @@ fn serve_mcp() -> io::Result<()> {
         if line.trim().is_empty() {
             continue;
         }
-        if let Some(reply) = runtime.block_on(server.handle(&line)) {
+        if let Some(reply) = runtime.block_on(server.handle("stdio", &line)) {
             writeln!(output, "{reply}")?;
             output.flush()?;
         }

@@ -72,6 +72,10 @@ pub fn launcher(service: Service, window: &mut Window, cx: &mut App) -> Entity<L
     reload(&view, &service, cx);
 
     let events_service = service.clone();
+    // The running loopback MCP server, if any. The handle lives here
+    // so Stop can abort the accept loop; the server itself reads its
+    // bearer token from settings per request.
+    let mcp_server: Rc<RefCell<Option<fg_mcp::HttpServer>>> = Rc::default();
     cx.subscribe(&view, move |view, event: &LauncherEvent, cx| match event {
         LauncherEvent::Open(id) => open(&view, &events_service, id.clone(), cx),
         LauncherEvent::Save(req) => save(&view, &events_service, req.clone(), cx),
@@ -120,6 +124,56 @@ pub fn launcher(service: Service, window: &mut Window, cx: &mut App) -> Entity<L
                     Err(e) => v.set_backup_status(e.to_string(), cx),
                 });
             })
+            .detach();
+        }
+        LauncherEvent::StartMcpHttp => {
+            let (view, service, cell) = (
+                view.downgrade(),
+                events_service.clone(),
+                Rc::clone(&mcp_server),
+            );
+            cx.spawn(async move |cx| match fg_mcp::serve_http(service, 0).await {
+                Ok(server) => {
+                    let url = format!("http://127.0.0.1:{}/mcp", server.addr.port());
+                    let token = server.token.clone();
+                    *cell.borrow_mut() = Some(server);
+                    let _ = view.update(cx, |v, cx| {
+                        v.set_mcp_http_state(true, Some(url), Some(token), None, cx);
+                    });
+                }
+                Err(e) => {
+                    let _ = view.update(cx, |v, cx| {
+                        v.set_mcp_http_state(false, None, None, Some(e.to_string()), cx);
+                    });
+                }
+            })
+            .detach();
+        }
+        LauncherEvent::StopMcpHttp => {
+            if let Some(server) = mcp_server.borrow_mut().take() {
+                server.stop();
+            }
+            view.update(cx, |v, cx| {
+                v.set_mcp_http_state(false, None, None, Some("Stopped.".into()), cx);
+            });
+        }
+        LauncherEvent::RotateMcpToken => {
+            let (view, service) = (view.downgrade(), events_service.clone());
+            cx.spawn(
+                async move |cx| match fg_mcp::rotate_http_token(&service).await {
+                    Ok(token) => {
+                        let _ = view.update(cx, |v, cx| {
+                            let running = v.is_mcp_http_running();
+                            v.set_mcp_http_state(running, None, Some(token), None, cx);
+                        });
+                    }
+                    Err(e) => {
+                        let _ = view.update(cx, |v, cx| {
+                            v.set_mcp_http_state(false, None, None, Some(e.to_string()), cx);
+                        });
+                    }
+                },
+            )
             .detach();
         }
         LauncherEvent::CycleTheme => cycle_theme(&events_service, cx),
@@ -320,6 +374,25 @@ fn wire_workspace(
 ) {
     load_schema(&view, &conn, Some((window, service.clone())), cx);
 
+    // Agent write approvals: this subscription is also the listener
+    // that keeps a run from concluding "no GUI is attached" while this
+    // window lives. It outlives any panel visibility: the panel only
+    // shows while the pending list is non-empty.
+    let mut approval_events = service.subscribe();
+    let (approval_view, approval_service) = (view.downgrade(), service.clone());
+    cx.spawn(async move |cx| {
+        while let Ok(event) = approval_events.recv().await {
+            if matches!(event, fg_service::ServiceEvent::McpWriteRequested { .. }) {
+                let Some(view) = approval_view.upgrade() else {
+                    break;
+                };
+                let pending = approval_service.pending_mcp_writes();
+                view.update(cx, |view, cx| view.set_mcp_approvals(pending, cx));
+            }
+        }
+    })
+    .detach();
+
     let save_timer: Rc<RefCell<Option<Task<()>>>> = Rc::new(RefCell::new(None));
     // One draft-save timer per tab: typing in two tabs must not cancel each other's save.
     let draft_timers: Rc<RefCell<HashMap<EntityId, Task<()>>>> = Rc::default();
@@ -375,6 +448,24 @@ fn wire_workspace(
             }
             WorkspaceEvent::HistoryRequested { search } => {
                 load_history(&service, &conn, &view, search.clone(), cx);
+            }
+            WorkspaceEvent::AuditRequested => {
+                load_audit(&service, &view, cx);
+            }
+            WorkspaceEvent::AuditExportRequested { path } => {
+                let path = path.clone();
+                if path.trim().is_empty() {
+                    view.update(cx, |v, cx| {
+                        v.set_audit_export_status("Enter a file path.".into(), cx);
+                    });
+                    return;
+                }
+                // The panel's filtered list, read on the UI thread, is
+                // exactly what the file gets: no rows the user filtered
+                // out, no rows they never saw.
+                let entries = view.update(cx, |v, cx| v.audit_entries(cx));
+                let status = export_audit_csv(&entries, &path);
+                view.update(cx, |v, cx| v.set_audit_export_status(status, cx));
             }
             WorkspaceEvent::HistoryPicked { sql } => {
                 insert_into_active_query(&view, sql, window, cx);
@@ -490,6 +581,14 @@ fn wire_workspace(
                 if let Some(control) = import_control.borrow().as_ref() {
                     control.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
+            }
+            WorkspaceEvent::McpWriteResolve { id, approved } => {
+                // A stale answer is harmless: resolving an unknown id
+                // changes nothing, and the panel refreshes from the
+                // live pending list either way.
+                service.resolve_mcp_write(*id, *approved);
+                let pending = service.pending_mcp_writes();
+                view.update(cx, |v, cx| v.set_mcp_approvals(pending, cx));
             }
             WorkspaceEvent::CycleTheme => cycle_theme(&service, cx),
             WorkspaceEvent::SessionChanged => {
@@ -1492,6 +1591,75 @@ fn load_history(
 
 /// How many history entries the panel lists. Enough to scroll, small enough to decrypt quickly.
 const HISTORY_LIMIT: usize = 200;
+
+/// How many audit rows the panel lists. The log is service-wide, not
+/// per connection: agents act across connections, and the panel's
+/// filter narrows by connection name.
+const AUDIT_LIMIT: usize = 200;
+
+fn load_audit(service: &Service, view: &Entity<WorkspaceView>, cx: &mut App) {
+    let (service, view) = (service.clone(), view.downgrade());
+    cx.spawn(async move |cx| {
+        let entries = service
+            .query_audit(fg_service::AuditFilter {
+                limit: Some(AUDIT_LIMIT),
+                ..Default::default()
+            })
+            .await
+            .unwrap_or_default();
+        let _ = view.update(cx, |v, cx| v.set_audit(entries, cx));
+    })
+    .detach();
+}
+
+fn csv_field(value: &str) -> String {
+    if value.contains([',', '"', '\n']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_owned()
+    }
+}
+
+fn export_audit_csv(entries: &[fg_core::AuditEntry], path: &str) -> String {
+    let mut out =
+        String::from("at_ms,actor,connection,statement,class,decision,outcome,duration_ms,error\n");
+    for entry in entries {
+        let actor = match &entry.actor {
+            fg_core::Actor::Mcp { client } => client.clone(),
+            fg_core::Actor::User => "user".to_owned(),
+            _ => "system".to_owned(),
+        };
+        let outcome = match entry.outcome {
+            fg_core::Outcome::Ok => "ok",
+            fg_core::Outcome::Error => "error",
+            fg_core::Outcome::Cancelled => "cancelled",
+            fg_core::Outcome::NotRun => "not run",
+            _ => "?",
+        };
+        let fields = [
+            entry.at.0.to_string(),
+            actor,
+            entry.connection_name.clone(),
+            entry.statement.clone(),
+            format!("{:?}", entry.class),
+            format!("{:?}", entry.decision),
+            outcome.to_owned(),
+            entry.duration_ms.map(|m| m.to_string()).unwrap_or_default(),
+            entry.error.clone().unwrap_or_default(),
+        ];
+        let line = fields
+            .iter()
+            .map(|f| csv_field(f))
+            .collect::<Vec<_>>()
+            .join(",");
+        out.push_str(&line);
+        out.push('\n');
+    }
+    match std::fs::write(path, out) {
+        Ok(()) => format!("Exported {} rows to {path}.", entries.len()),
+        Err(e) => format!("Export failed: {e}"),
+    }
+}
 
 /// Put a statement the user picked into the active query tab, replacing what was there.
 fn insert_into_active_query(
