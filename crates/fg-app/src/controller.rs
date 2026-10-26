@@ -79,6 +79,49 @@ pub fn launcher(service: Service, window: &mut Window, cx: &mut App) -> Entity<L
             test_connection(&view, &events_service, req.clone(), cx)
         }
         LauncherEvent::Delete(id) => delete(&view, &events_service, id.clone(), cx),
+        LauncherEvent::ExportBackup {
+            options,
+            password,
+            path,
+        } => {
+            let (view, service) = (view.downgrade(), events_service.clone());
+            let (options, password, path) = (*options, password.clone(), path.clone());
+            cx.spawn(async move |cx| {
+                let outcome = (|| {
+                    let bytes = service.export_backup(&options, &password)?;
+                    std::fs::write(&path, bytes)
+                        .map_err(|e| fg_core::Error::Other(format!("backup write failed: {e}")))?;
+                    Ok::<(), fg_core::Error>(())
+                })();
+                let _ = view.update(cx, |v, cx| match outcome {
+                    Ok(()) => v.set_backup_status(format!("Backup written to {path}."), cx),
+                    Err(e) => v.set_backup_status(e.to_string(), cx),
+                });
+            })
+            .detach();
+        }
+        LauncherEvent::ImportBackup { password, path } => {
+            let (view, service) = (view.downgrade(), events_service.clone());
+            let (password, path) = (password.clone(), path.clone());
+            cx.spawn(async move |cx| {
+                let outcome = (|| {
+                    let bytes = std::fs::read(&path)
+                        .map_err(|e| fg_core::Error::Other(format!("backup read failed: {e}")))?;
+                    service.import_backup(&bytes, &password)
+                })();
+                let _ = view.update(cx, |v, cx| match outcome {
+                    Ok(report) => v.set_backup_status(
+                        format!(
+                            "Imported {} records ({} skipped as newer, {} ignored).",
+                            report.applied, report.skipped_newer_local, report.ignored_unknown_kind
+                        ),
+                        cx,
+                    ),
+                    Err(e) => v.set_backup_status(e.to_string(), cx),
+                });
+            })
+            .detach();
+        }
         LauncherEvent::CycleTheme => cycle_theme(&events_service, cx),
         LauncherEvent::DismissBackupNudge => dismiss_backup_nudge(&view, &events_service, cx),
         LauncherEvent::SaveGroup(group) => save_group(&view, &events_service, group.clone(), cx),
@@ -282,6 +325,10 @@ fn wire_workspace(
     let draft_timers: Rc<RefCell<HashMap<EntityId, Task<()>>>> = Rc::default();
     // One running statement per tab, plus its canceller so `⌘.` can reach it from the UI thread.
     let runs: Rc<RefCell<HashMap<EntityId, QueryRun>>> = Rc::default();
+    // The export wizard's current run, so Cancel can flag it.
+    let export_control: Rc<RefCell<Option<Arc<fg_service::ExportControl>>>> = Rc::default();
+    // The import wizard's current run, so Cancel can flag it.
+    let import_control: Rc<RefCell<Option<Arc<std::sync::atomic::AtomicBool>>>> = Rc::default();
     // The connection this window talks to. Switching databases replaces the
     // pool under the same id, so every event reads the current connection
     // from this cell instead of the one captured when the window opened.
@@ -341,6 +388,108 @@ fn wire_workspace(
             }
             WorkspaceEvent::SwitchDatabase { database } => {
                 switch_database(&service, &conn_cell, &view, database.clone(), cx);
+            }
+            WorkspaceEvent::ExportRequested {
+                source,
+                options,
+                path,
+            } => {
+                let control = Arc::new(fg_service::ExportControl::default());
+                *export_control.borrow_mut() = Some(Arc::clone(&control));
+                let (conn, view, source, options, path) = (
+                    conn.clone(),
+                    view.clone(),
+                    source.clone(),
+                    *options,
+                    path.clone(),
+                );
+                // Progress polling: the export runs on the service runtime,
+                // so a second task ticks the row count into the wizard.
+                // `set_export_rows` only applies while Running, so a late
+                // tick can never clobber the finished status.
+                let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let (done_poll, view_poll, control_poll) =
+                    (Arc::clone(&done), view.clone(), Arc::clone(&control));
+                cx.spawn(async move |cx| {
+                    loop {
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(300))
+                            .await;
+                        let rows = control_poll.rows.load(std::sync::atomic::Ordering::Relaxed);
+                        let finished = done_poll.load(std::sync::atomic::Ordering::Relaxed);
+                        view_poll.update(cx, |v, cx| v.set_export_rows(rows, cx));
+                        if finished {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+                cx.spawn(async move |cx| {
+                    let result = match source {
+                        crate::views::ExportSource::Table(query) => {
+                            conn.export_table_to_file(
+                                &query,
+                                &options,
+                                &control,
+                                std::path::Path::new(&path),
+                            )
+                            .await
+                        }
+                        crate::views::ExportSource::Sql(sql) => {
+                            conn.export_sql_to_file(
+                                &sql,
+                                &options,
+                                &control,
+                                std::path::Path::new(&path),
+                            )
+                            .await
+                        }
+                    };
+                    done.store(true, std::sync::atomic::Ordering::Relaxed);
+                    view.update(cx, |v, cx| {
+                        v.set_export_finished(result.map_err(|e| e.to_string()), cx);
+                    });
+                })
+                .detach();
+            }
+            WorkspaceEvent::ExportCancel => {
+                if let Some(control) = export_control.borrow().as_ref() {
+                    control
+                        .cancel
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            WorkspaceEvent::ImportRequested {
+                table,
+                mappings,
+                options,
+                path,
+            } => {
+                let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                *import_control.borrow_mut() = Some(Arc::clone(&cancel));
+                let mut options = options.clone();
+                options.cancel = Some(cancel);
+                let (conn, view, table, mappings, path) = (
+                    conn.clone(),
+                    view.clone(),
+                    table.clone(),
+                    mappings.clone(),
+                    path.clone(),
+                );
+                cx.spawn(async move |cx| {
+                    let result = conn
+                        .import_csv(&table, &mappings, &options, std::path::Path::new(&path))
+                        .await;
+                    view.update(cx, |v, cx| {
+                        v.set_import_finished(result.map_err(|e| e.to_string()), cx);
+                    });
+                })
+                .detach();
+            }
+            WorkspaceEvent::ImportCancel => {
+                if let Some(control) = import_control.borrow().as_ref() {
+                    control.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
             }
             WorkspaceEvent::CycleTheme => cycle_theme(&service, cx),
             WorkspaceEvent::SessionChanged => {
@@ -573,7 +722,31 @@ fn attach_table(
         // event stream stays exactly the intents its owner acts on.)
         // The workspace window opens the referenced table; nothing to load for this tab.
         TableTabEvent::FollowForeignKey { .. } => {}
+        TableTabEvent::FollowBackReference { .. } => {}
         TableTabEvent::ViewChanged => save_view(&reload_service, &reload_conn, &reload_tab, cx),
+        TableTabEvent::StructureRequested => {
+            let path = reload_tab.read(cx).query().path().clone();
+            let (conn, tab) = (Arc::clone(&reload_conn), reload_tab.downgrade());
+            cx.spawn(async move |cx| {
+                let detail = conn.describe(&path).await.map_err(|e| e.to_string());
+                let ddl = conn.ddl(&path).await.map_err(|e| e.to_string());
+                let _ = tab.update(cx, |t, cx| t.set_structure(detail, ddl, cx));
+            })
+            .detach();
+        }
+        TableTabEvent::StructureCommitRequested => {
+            let changes = reload_tab.read(cx).structure_changes().to_vec();
+            let path = reload_tab.read(cx).query().path().clone();
+            let (conn, tab) = (Arc::clone(&reload_conn), reload_tab.downgrade());
+            cx.spawn(async move |cx| {
+                let result = conn
+                    .apply_schema_changes(&path, &changes)
+                    .await
+                    .map_err(|e| e.to_string());
+                let _ = tab.update(cx, |t, cx| t.structure_commit_finished(result, cx));
+            })
+            .detach();
+        }
         TableTabEvent::CommitRequested => {
             let changes = reload_tab.read(cx).changes(cx);
             let path = reload_tab.read(cx).query().path().clone();
@@ -607,6 +780,12 @@ fn attach_table(
         let hidden = saved.hidden_columns.clone();
         let engine = first_conn.kind();
         let targets = foreign_key_targets(&first_conn, &path).await;
+        // Tables referencing this one, for the "referenced by" menu.
+        let back_references = first_conn
+            .relations(path.namespace.as_deref())
+            .await
+            .map(|relations| crate::model::back_references(&relations, &path))
+            .unwrap_or_default();
         // A view, or a table without a primary key, comes back empty and stays read-only.
         let primary_key: Vec<String> = first_conn
             .describe(&path)
@@ -620,6 +799,7 @@ fn attach_table(
             };
             tab.update(cx, |t, cx| {
                 t.set_foreign_keys(targets, cx);
+                t.set_back_references(back_references, cx);
                 t.set_primary_key(primary_key, cx);
                 t.set_engine(engine, cx);
                 t.restore_query(query, cx);

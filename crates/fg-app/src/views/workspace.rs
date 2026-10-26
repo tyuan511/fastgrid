@@ -9,11 +9,16 @@ use std::sync::Arc;
 
 use fg_core::{
     ConnectionConfig, ConnectionParams, ObjectInfo, ObjectKind, ObjectPath, Outcome,
-    QueryHistoryEntry, SafeMode, TabId, TabKind, TableViewMode, TableViewState, WorkspaceState,
+    QueryHistoryEntry, SafeMode, TabId, TabKind, TableQuery, TableViewMode, TableViewState,
+    WorkspaceState,
 };
-use fg_service::{OpenConnection, Service};
+use fg_service::{
+    ColumnMapping, CsvImportOptions, CsvImportReport, CsvPreview, ExportFormat, ExportOptions,
+    ExportReport, ExportScope, ImportErrorPolicy, OpenConnection, Service, preview_csv,
+};
 use gpui_kit::component::Disableable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::command::{Command, CommandItem, CommandState};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::list::ListItem;
@@ -25,10 +30,10 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::actions::{
-    CloseTab, HISTORY_CONTEXT, HistoryDismiss, HistoryNext, HistoryOpen, HistoryPrev, NewQuery,
-    NextTab, PrevTab, QuickOpen, RefreshSchema, SNIPPETS_CONTEXT, SaveSnippet, SnippetDismiss,
-    SnippetOpen, SwitchDatabase, ToggleFilters, ToggleHistory, ToggleSidebar, ToggleSnippets,
-    WORKSPACE_CONTEXT,
+    CloseTab, ExportWizard, HISTORY_CONTEXT, HistoryDismiss, HistoryNext, HistoryOpen, HistoryPrev,
+    ImportWizard, NewQuery, NextTab, PrevTab, QuickOpen, RefreshSchema, SNIPPETS_CONTEXT,
+    SaveSnippet, SnippetDismiss, SnippetOpen, SwitchDatabase, ToggleFilters, ToggleHistory,
+    ToggleSidebar, ToggleSnippets, WORKSPACE_CONTEXT,
 };
 use super::grid::{TableTab, TableTabEvent};
 use super::icons::{Hugeicon, hugeicon};
@@ -78,6 +83,25 @@ pub enum WorkspaceEvent {
     QueryOpened { tab: Entity<QueryTab> },
     /// `⌘T`: the controller creates the draft (it owns ids and timestamps) and opens the tab.
     NewQueryRequested,
+    /// The export wizard's Run: the controller owns the connection, so it
+    /// runs the export and reports back through `set_export_finished`.
+    ExportRequested {
+        source: ExportSource,
+        options: ExportOptions,
+        path: String,
+    },
+    /// The export wizard's Cancel: the controller flags the run's control.
+    ExportCancel,
+    /// The import wizard's Run: the controller owns the connection, so
+    /// it runs the import and reports back through `set_import_finished`.
+    ImportRequested {
+        table: ObjectPath,
+        mappings: Vec<ColumnMapping>,
+        options: CsvImportOptions,
+        path: String,
+    },
+    /// The import wizard's Cancel: the controller flags the run's control.
+    ImportCancel,
     /// Run `mode` in the query tab. The target is read from the buffer when this is handled, so
     /// what runs is what the editor holds at that moment.
     QueryRun {
@@ -171,10 +195,73 @@ pub struct WorkspaceView {
     history: Option<HistoryPanel>,
     /// The snippets panel (`⌘⇧S`): saved fragments, per connection plus global ones.
     snippets: Option<SnippetsPanel>,
+    /// The export wizard (`⇧⌘E`): a panel above the tabs, not a tab.
+    export_wizard: Option<ExportWizardState>,
+    /// The import wizard (`⇧⌘I`): same shape, for a table tab.
+    import_wizard: Option<ImportWizardState>,
     /// What the connection is set to, as far as this window knows. `None` until the controller
     /// tells us; the controller is the one that persists a change.
     safe_mode: SafeMode,
     _subscriptions: Vec<Subscription>,
+}
+
+/// What an export reads: a table's current query (filters and sort
+/// apply, paging does not) or one statement from a query tab.
+#[derive(Debug, Clone)]
+pub enum ExportSource {
+    Table(TableQuery),
+    Sql(String),
+}
+
+/// The export wizard's state. The panel lives above the tabs; the
+/// controller runs the export and reports back, so this state only
+/// holds the form and the latest status.
+struct ExportWizardState {
+    source: ExportSource,
+    path: Entity<InputState>,
+    format: ExportFormat,
+    scope: ExportScope,
+    gzip: bool,
+    status: ExportWizardStatus,
+    /// Rows written so far, refreshed while running.
+    rows: u64,
+    /// The file of the last finished run, for the Done message.
+    last_path: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+enum ExportWizardStatus {
+    Idle,
+    Running,
+    Done { rows: u64, bytes: u64 },
+    Failed(String),
+}
+
+/// The import wizard's state. Preview and mapping are workspace-local
+/// (the preview parses only the file's head); the run itself goes
+/// through the controller, which owns the connection.
+struct ImportWizardState {
+    table: ObjectPath,
+    /// The table's columns, snapshotted at open time for the mapping
+    /// prefill (case-insensitive match against the CSV header).
+    table_columns: Vec<String>,
+    path: Entity<InputState>,
+    has_header: bool,
+    preview: Option<CsvPreview>,
+    preview_error: Option<String>,
+    /// One target-column input per CSV column, in CSV order. Empty
+    /// means "skip this CSV column".
+    mapping_inputs: Vec<Entity<InputState>>,
+    policy: ImportErrorPolicy,
+    status: ImportWizardStatus,
+}
+
+#[derive(Debug, Clone)]
+enum ImportWizardStatus {
+    Idle,
+    Running,
+    Done(CsvImportReport),
+    Failed(String),
 }
 
 /// The open snippets panel. Same shape as the history one: a search box and a list.
@@ -286,8 +373,246 @@ impl WorkspaceView {
             switcher: None,
             history: None,
             snippets: None,
+            export_wizard: None,
+            import_wizard: None,
             safe_mode: config_safe_mode,
             _subscriptions: vec![on_filter, on_tree, on_details],
+        }
+    }
+
+    // ---- export wizard ---------------------------------------------------------------
+
+    /// Open the wizard for the active tab: a table tab exports its query,
+    /// a query tab exports its script. Anything else opens nothing.
+    pub fn open_export_wizard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let source = match self.tabs.active().and_then(|t| self.tab_views.get(&t.id)) {
+            Some(TabContent::Table(tab)) => {
+                ExportSource::Table(tab.read(cx).query().to_table_query())
+            }
+            Some(TabContent::Query(tab)) => ExportSource::Sql(tab.read(cx).script(cx)),
+            None => return,
+        };
+        let path = cx.new(|cx| InputState::new(window, cx).placeholder("File path…"));
+        self.export_wizard = Some(ExportWizardState {
+            source,
+            path,
+            format: ExportFormat::Csv,
+            scope: ExportScope::Data,
+            gzip: false,
+            status: ExportWizardStatus::Idle,
+            rows: 0,
+            last_path: None,
+        });
+        cx.notify();
+    }
+
+    pub fn close_export_wizard(&mut self, cx: &mut Context<Self>) {
+        self.export_wizard = None;
+        cx.notify();
+    }
+
+    /// Validate the form and hand the run to the controller.
+    fn run_export(&mut self, cx: &mut Context<Self>) {
+        let Some(wizard) = self.export_wizard.as_mut() else {
+            return;
+        };
+        if matches!(wizard.status, ExportWizardStatus::Running) {
+            return;
+        }
+        let path = wizard.path.read(cx).value().trim().to_owned();
+        if path.is_empty() {
+            wizard.status = ExportWizardStatus::Failed("Enter a file path.".into());
+            cx.notify();
+            return;
+        }
+        let options = ExportOptions {
+            format: wizard.format,
+            scope: wizard.scope,
+            gzip: wizard.gzip,
+            sql_batch: 100,
+        };
+        wizard.status = ExportWizardStatus::Running;
+        wizard.rows = 0;
+        wizard.last_path = Some(path.clone());
+        cx.notify();
+        cx.emit(WorkspaceEvent::ExportRequested {
+            source: wizard.source.clone(),
+            options,
+            path,
+        });
+    }
+
+    /// Rows written so far, refreshed by the controller while running.
+    pub fn set_export_rows(&mut self, rows: u64, cx: &mut Context<Self>) {
+        if let Some(wizard) = self.export_wizard.as_mut()
+            && matches!(wizard.status, ExportWizardStatus::Running)
+        {
+            wizard.rows = rows;
+            cx.notify();
+        }
+    }
+
+    /// The controller's report for the finished run.
+    pub fn set_export_finished(
+        &mut self,
+        result: std::result::Result<ExportReport, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(wizard) = self.export_wizard.as_mut() {
+            wizard.status = match result {
+                Ok(report) => ExportWizardStatus::Done {
+                    rows: report.rows,
+                    bytes: report.bytes,
+                },
+                Err(message) => ExportWizardStatus::Failed(message),
+            };
+            cx.notify();
+        }
+    }
+
+    // ---- import wizard ---------------------------------------------------------------
+
+    /// Open the wizard for the active table tab. Query tabs cannot
+    /// import: there is no target table.
+    pub fn open_import_wizard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(TabContent::Table(tab)) =
+            self.tabs.active().and_then(|t| self.tab_views.get(&t.id))
+        else {
+            return;
+        };
+        let table = tab.read(cx).query().path().clone();
+        let table_columns = tab.read(cx).column_names(cx);
+        let path = cx.new(|cx| InputState::new(window, cx).placeholder("CSV file path…"));
+        self.import_wizard = Some(ImportWizardState {
+            table,
+            table_columns,
+            path,
+            has_header: true,
+            preview: None,
+            preview_error: None,
+            mapping_inputs: Vec::new(),
+            policy: ImportErrorPolicy::Abort,
+            status: ImportWizardStatus::Idle,
+        });
+        cx.notify();
+    }
+
+    pub fn close_import_wizard(&mut self, cx: &mut Context<Self>) {
+        self.import_wizard = None;
+        cx.notify();
+    }
+
+    /// Read the file's head and build one mapping input per CSV column,
+    /// prefilled by case-insensitive match against the table's columns.
+    fn load_import_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(wizard) = self.import_wizard.as_mut() else {
+            return;
+        };
+        let path = wizard.path.read(cx).value().trim().to_owned();
+        if path.is_empty() {
+            wizard.preview_error = Some("Enter a CSV file path.".into());
+            cx.notify();
+            return;
+        }
+        let has_header = wizard.has_header;
+        match std::fs::read_to_string(&path).and_then(|text| {
+            preview_csv(&text, has_header)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+        }) {
+            Ok(preview) => {
+                let mut inputs = Vec::new();
+                for csv_name in &preview.columns {
+                    let prefill = wizard
+                        .table_columns
+                        .iter()
+                        .find(|c| c.eq_ignore_ascii_case(csv_name))
+                        .cloned()
+                        .unwrap_or_default();
+                    let input = cx.new(|cx| {
+                        let mut state = InputState::new(window, cx);
+                        if !prefill.is_empty() {
+                            state.set_value(&prefill, window, cx);
+                        }
+                        state
+                    });
+                    inputs.push(input);
+                }
+                wizard.mapping_inputs = inputs;
+                wizard.preview = Some(preview);
+                wizard.preview_error = None;
+            }
+            Err(e) => {
+                wizard.preview = None;
+                wizard.mapping_inputs = Vec::new();
+                wizard.preview_error = Some(format!("Could not preview: {e}"));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Validate the form and hand the run to the controller.
+    fn run_import(&mut self, cx: &mut Context<Self>) {
+        let Some(wizard) = self.import_wizard.as_mut() else {
+            return;
+        };
+        if matches!(wizard.status, ImportWizardStatus::Running) {
+            return;
+        }
+        let path = wizard.path.read(cx).value().trim().to_owned();
+        if path.is_empty() {
+            wizard.status = ImportWizardStatus::Failed("Enter a CSV file path.".into());
+            cx.notify();
+            return;
+        }
+        if wizard.preview.is_none() {
+            wizard.status = ImportWizardStatus::Failed("Load a preview first.".into());
+            cx.notify();
+            return;
+        }
+        let mappings = wizard
+            .mapping_inputs
+            .iter()
+            .enumerate()
+            .map(|(i, input)| {
+                let target = input.read(cx).value().trim().to_owned();
+                ColumnMapping {
+                    csv_index: i,
+                    column: if target.is_empty() {
+                        None
+                    } else {
+                        Some(target)
+                    },
+                }
+            })
+            .collect();
+        let options = CsvImportOptions {
+            has_header: wizard.has_header,
+            batch_rows: 1000,
+            error_policy: wizard.policy,
+            cancel: None,
+        };
+        wizard.status = ImportWizardStatus::Running;
+        cx.notify();
+        cx.emit(WorkspaceEvent::ImportRequested {
+            table: wizard.table.clone(),
+            mappings,
+            options,
+            path,
+        });
+    }
+
+    /// The controller's report for the finished run.
+    pub fn set_import_finished(
+        &mut self,
+        result: std::result::Result<CsvImportReport, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(wizard) = self.import_wizard.as_mut() {
+            wizard.status = match result {
+                Ok(report) => ImportWizardStatus::Done(report),
+                Err(message) => ImportWizardStatus::Failed(message),
+            };
+            cx.notify();
         }
     }
 
@@ -925,8 +1250,15 @@ impl WorkspaceView {
                     TableTabEvent::ViewChanged => {}
                     // Run by the controller, which owns the connection.
                     TableTabEvent::CommitRequested => {}
+                    // Loaded by the controller, which owns the connection.
+                    TableTabEvent::StructureRequested => {}
+                    // Applied by the controller, which owns the connection.
+                    TableTabEvent::StructureCommitRequested => {}
                     TableTabEvent::FollowForeignKey { table, filter } => {
-                        this.open_table_filtered(table, filter.clone(), window, cx);
+                        this.open_table_filtered(table, vec![filter.clone()], window, cx);
+                    }
+                    TableTabEvent::FollowBackReference { table, filters } => {
+                        this.open_table_filtered(table, filters.clone(), window, cx);
                     }
                 },
             );
@@ -992,7 +1324,7 @@ impl WorkspaceView {
     pub fn open_table_filtered(
         &mut self,
         path: &ObjectPath,
-        filter: fg_core::Filter,
+        filters: Vec<fg_core::Filter>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1001,7 +1333,7 @@ impl WorkspaceView {
             return;
         };
         if let Some(TabContent::Table(tab)) = self.tab_views.get(&id).cloned() {
-            tab.update(cx, |t, cx| t.apply_filter(filter, cx));
+            tab.update(cx, |t, cx| t.apply_filters(filters, cx));
         }
     }
 
@@ -1432,6 +1764,12 @@ impl Render for WorkspaceView {
                 this.open_database_switcher(window, cx)
             }))
             .on_action(cx.listener(|this, _: &CloseTab, _, cx| this.close_active_tab(cx)))
+            .on_action(cx.listener(|this, _: &ExportWizard, window, cx| {
+                this.open_export_wizard(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ImportWizard, window, cx| {
+                this.open_import_wizard(window, cx);
+            }))
             .on_action(
                 cx.listener(|_, _: &NewQuery, _, cx| cx.emit(WorkspaceEvent::NewQueryRequested)),
             )
@@ -1702,6 +2040,358 @@ impl WorkspaceView {
 
     /// The `⌘Y` panel: recent statements, newest first, with their outcome. Drawn as an overlay
     /// like Quick Open so it does not steal space from the editor.
+    fn render_export_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let wizard = self.export_wizard.as_ref()?;
+        let theme = cx.theme().clone();
+        let running = matches!(wizard.status, ExportWizardStatus::Running);
+        let is_sql_source = matches!(wizard.source, ExportSource::Sql(_));
+        let status_text = match &wizard.status {
+            ExportWizardStatus::Idle => "Choose a file and a format.".to_owned(),
+            ExportWizardStatus::Running => {
+                format!("Exporting… {} rows written.", wizard.rows)
+            }
+            ExportWizardStatus::Done { rows, bytes } => format!(
+                "Exported {rows} rows ({bytes} bytes) to {}.",
+                wizard.last_path.clone().unwrap_or_default()
+            ),
+            ExportWizardStatus::Failed(message) => message.clone(),
+        };
+        let format_button =
+            |id: &'static str, label: &'static str, active: bool, format: ExportFormat| {
+                Button::new(id)
+                    .label(label)
+                    .small()
+                    .when(active, |b| b.primary())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(wizard) = this.export_wizard.as_mut() {
+                            wizard.format = format;
+                            cx.notify();
+                        }
+                    }))
+            };
+        let scope_button =
+            |id: &'static str, label: &'static str, active: bool, scope: ExportScope| {
+                Button::new(id)
+                    .label(label)
+                    .small()
+                    .when(active, |b| b.primary())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(wizard) = this.export_wizard.as_mut() {
+                            wizard.scope = scope;
+                            cx.notify();
+                        }
+                    }))
+            };
+        let gzip_checked = wizard.gzip;
+        let mut row = h_flex()
+            .gap_2()
+            .items_center()
+            .child(div().text_sm().child("Export"))
+            .child(
+                div()
+                    .flex_1()
+                    .child(Input::new(&wizard.path).id("export-path")),
+            )
+            .child(format_button(
+                "export-format-csv",
+                "CSV",
+                wizard.format == ExportFormat::Csv,
+                ExportFormat::Csv,
+            ))
+            .child(format_button(
+                "export-format-json",
+                "JSON",
+                wizard.format == ExportFormat::Json,
+                ExportFormat::Json,
+            ));
+        if !is_sql_source {
+            row = row.child(format_button(
+                "export-format-sql",
+                "SQL",
+                wizard.format == ExportFormat::Sql,
+                ExportFormat::Sql,
+            ));
+        }
+        if wizard.format == ExportFormat::Sql {
+            row = row
+                .child(scope_button(
+                    "export-scope-data",
+                    "Data",
+                    wizard.scope == ExportScope::Data,
+                    ExportScope::Data,
+                ))
+                .child(scope_button(
+                    "export-scope-structure",
+                    "Structure",
+                    wizard.scope == ExportScope::Structure,
+                    ExportScope::Structure,
+                ))
+                .child(scope_button(
+                    "export-scope-both",
+                    "Both",
+                    wizard.scope == ExportScope::Both,
+                    ExportScope::Both,
+                ));
+        }
+        row = row
+            .child(
+                Checkbox::new(SharedString::from("export-gzip"))
+                    .label("gzip")
+                    .checked(gzip_checked)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(wizard) = this.export_wizard.as_mut() {
+                            wizard.gzip = !wizard.gzip;
+                            cx.notify();
+                        }
+                    })),
+            )
+            .child(
+                Button::new("export-run")
+                    .label("Run")
+                    .small()
+                    .disabled(running)
+                    .on_click(cx.listener(|this, _, _, cx| this.run_export(cx))),
+            );
+        if running {
+            row = row.child(
+                Button::new("export-cancel")
+                    .label("Cancel")
+                    .small()
+                    .on_click(cx.listener(|_, _, _, cx| {
+                        cx.emit(WorkspaceEvent::ExportCancel);
+                    })),
+            );
+        }
+        row = row.child(
+            Button::new("export-close")
+                .label("Close")
+                .small()
+                .on_click(cx.listener(|this, _, _, cx| this.close_export_wizard(cx))),
+        );
+        Some(
+            v_flex()
+                .id("export-wizard")
+                .test_support()
+                .gap_2()
+                .px_3()
+                .py_2()
+                .border_b_1()
+                .border_color(theme.border)
+                .bg(theme.background)
+                .child(row)
+                .child(
+                    div()
+                        .id("export-status")
+                        .test_support()
+                        .aria_label(status_text.clone())
+                        .text_sm()
+                        .text_color(theme.muted_foreground)
+                        .child(status_text),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_import_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let wizard = self.import_wizard.as_ref()?;
+        let theme = cx.theme().clone();
+        let running = matches!(wizard.status, ImportWizardStatus::Running);
+        let status_text = match &wizard.status {
+            ImportWizardStatus::Idle => {
+                "Choose a CSV file, load its preview, map its columns.".to_owned()
+            }
+            ImportWizardStatus::Running => "Importing…".to_owned(),
+            ImportWizardStatus::Done(report) => {
+                if report.cancelled {
+                    format!(
+                        "Import cancelled after {} rows ({} skipped).",
+                        report.inserted, report.skipped_total
+                    )
+                } else {
+                    format!(
+                        "Imported {} rows ({} skipped).",
+                        report.inserted, report.skipped_total
+                    )
+                }
+            }
+            ImportWizardStatus::Failed(message) => message.clone(),
+        };
+        let has_header = wizard.has_header;
+        let mut row = h_flex()
+            .gap_2()
+            .items_center()
+            .child(div().text_sm().child("Import"))
+            .child(
+                div()
+                    .flex_1()
+                    .child(Input::new(&wizard.path).id("import-path")),
+            )
+            .child(
+                Checkbox::new(SharedString::from("import-has-header"))
+                    .label("Header row")
+                    .checked(has_header)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(wizard) = this.import_wizard.as_mut() {
+                            wizard.has_header = !wizard.has_header;
+                            wizard.preview = None;
+                            wizard.mapping_inputs = Vec::new();
+                            cx.notify();
+                        }
+                    })),
+            )
+            .child(
+                Button::new("import-load-preview")
+                    .label("Load preview")
+                    .small()
+                    .disabled(running)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.load_import_preview(window, cx);
+                    })),
+            )
+            .child(
+                Button::new("import-policy-abort")
+                    .label("Abort on error")
+                    .small()
+                    .when(wizard.policy == ImportErrorPolicy::Abort, |b| b.primary())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(wizard) = this.import_wizard.as_mut() {
+                            wizard.policy = ImportErrorPolicy::Abort;
+                            cx.notify();
+                        }
+                    })),
+            )
+            .child(
+                Button::new("import-policy-skip")
+                    .label("Skip bad rows")
+                    .small()
+                    .when(wizard.policy == ImportErrorPolicy::SkipAndRecord, |b| {
+                        b.primary()
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(wizard) = this.import_wizard.as_mut() {
+                            wizard.policy = ImportErrorPolicy::SkipAndRecord;
+                            cx.notify();
+                        }
+                    })),
+            )
+            .child(
+                Button::new("import-run")
+                    .label("Run")
+                    .small()
+                    .disabled(running)
+                    .on_click(cx.listener(|this, _, _, cx| this.run_import(cx))),
+            );
+        if running {
+            row = row.child(
+                Button::new("import-cancel")
+                    .label("Cancel")
+                    .small()
+                    .on_click(cx.listener(|_, _, _, cx| {
+                        cx.emit(WorkspaceEvent::ImportCancel);
+                    })),
+            );
+        }
+        row = row.child(
+            Button::new("import-close")
+                .label("Close")
+                .small()
+                .on_click(cx.listener(|this, _, _, cx| this.close_import_wizard(cx))),
+        );
+        let mut panel = v_flex()
+            .id("import-wizard")
+            .test_support()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(theme.border)
+            .bg(theme.background)
+            .child(row);
+        if let Some(error) = &wizard.preview_error {
+            panel = panel.child(
+                div()
+                    .id("import-preview-error")
+                    .test_support()
+                    .aria_label(error.clone())
+                    .text_sm()
+                    .text_color(theme.danger)
+                    .child(error.clone()),
+            );
+        }
+        if let Some(preview) = &wizard.preview {
+            let header_line = preview.columns.join(",");
+            let sample_lines: Vec<String> = preview.rows.iter().map(|r| r.join(",")).collect();
+            let preview_label = if sample_lines.is_empty() {
+                header_line.clone()
+            } else {
+                format!("{header_line}\n{}", sample_lines.join("\n"))
+            };
+            panel = panel.child(
+                div()
+                    .id("import-preview")
+                    .test_support()
+                    .aria_label(preview_label)
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(header_line),
+            );
+            for (i, csv_name) in preview.columns.iter().enumerate() {
+                let mut row = h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(div().text_sm().child(csv_name.clone()));
+                if let Some(input) = wizard.mapping_inputs.get(i) {
+                    row = row.child(div().flex_1().child(
+                        Input::new(input).id(SharedString::from(format!("import-map-{i}"))),
+                    ));
+                }
+                panel = panel.child(row);
+            }
+        }
+        panel = panel.child(
+            div()
+                .id("import-status")
+                .test_support()
+                .aria_label(status_text.clone())
+                .text_sm()
+                .text_color(theme.muted_foreground)
+                .child(status_text),
+        );
+        if let ImportWizardStatus::Done(report) = &wizard.status
+            && !report.skipped.is_empty()
+        {
+            let shown = report.skipped.iter().take(20).map(|(row, reason)| {
+                div()
+                    .text_sm()
+                    .child(format!("row {row}: {reason}"))
+                    .into_any_element()
+            });
+            let mut skipped = v_flex()
+                .id("import-skipped")
+                .test_support()
+                .aria_label(
+                    report
+                        .skipped
+                        .iter()
+                        .map(|(row, reason)| format!("row {row}: {reason}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+                .gap_1();
+            for line in shown {
+                skipped = skipped.child(line);
+            }
+            if report.skipped_total as usize > report.skipped.len() {
+                skipped = skipped.child(div().text_sm().child(format!(
+                    "… and {} more skipped rows.",
+                    report.skipped_total as usize - report.skipped.len()
+                )));
+            }
+            panel = panel.child(skipped);
+        }
+        Some(panel.into_any_element())
+    }
+
     fn render_history(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let panel = self.history.as_ref()?;
         let theme = cx.theme().clone();
@@ -2504,12 +3194,16 @@ impl WorkspaceView {
                 .into_any_element(),
         };
 
+        let export_panel = self.render_export_panel(cx);
+        let import_panel = self.render_import_panel(cx);
         v_flex()
             .flex_1()
             .min_w_0()
             .h_full()
             .children(strip)
             .children(confirm_banner)
+            .children(export_panel)
+            .children(import_panel)
             .child(div().flex_1().min_h_0().child(content))
             .into_any_element()
     }

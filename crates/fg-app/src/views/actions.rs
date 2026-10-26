@@ -71,6 +71,10 @@ gpui_kit::actions!(
         RevertCell,
         PreviewChanges,
         ToggleRowDetail,
+        SwitchToData,
+        SwitchToStructure,
+        ExportWizard,
+        ImportWizard,
     ]
 );
 
@@ -98,6 +102,13 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-d", CloneRow, Some(GRID_CONTEXT)),
         KeyBinding::new("secondary-backspace", ToggleDeleteRow, Some(GRID_CONTEXT)),
         KeyBinding::new("secondary-shift-p", PreviewChanges, Some(GRID_CONTEXT)),
+        KeyBinding::new("secondary-ctrl-[", SwitchToStructure, Some(GRID_CONTEXT)),
+        KeyBinding::new("secondary-ctrl-]", SwitchToData, Some(GRID_CONTEXT)),
+        KeyBinding::new("secondary-shift-e", ExportWizard, Some(GRID_CONTEXT)),
+        KeyBinding::new("secondary-shift-e", ExportWizard, Some(RESULT_CONTEXT)),
+        // Import targets a table tab only; `secondary-i` is InsertRow, so
+        // the shifted form is free on the grid context.
+        KeyBinding::new("secondary-shift-i", ImportWizard, Some(GRID_CONTEXT)),
         // Space is not a type-to-edit key, so the grid can use it for the
         // row-detail inspector without stealing a typed character.
         KeyBinding::new("space", ToggleRowDetail, Some(GRID_CONTEXT)),

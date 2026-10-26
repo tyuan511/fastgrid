@@ -698,3 +698,149 @@ fn the_database_switcher_on_a_network_connection_asks_for_databases(cx: &mut Tes
     assert!(!switcher_exists(cx, &f, "database-switcher-loading"));
     assert!(switcher_exists(cx, &f, "database-switcher"));
 }
+
+#[gpui_kit::test]
+fn export_wizard_validates_and_requests_a_run(cx: &mut TestAppContext) {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let f = open(cx);
+    open_table(cx, &f, "orders");
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let log = Rc::clone(&events);
+    cx.update(|cx| {
+        cx.subscribe(&f.view, move |_, e: &WorkspaceEvent, _| {
+            if let WorkspaceEvent::ExportRequested { path, .. } = e {
+                log.borrow_mut().push(path.clone());
+            }
+        })
+        .detach();
+    });
+    // Empty path: Run reports the validation error, no event.
+    cx.update_window(f.window, |_, window, cx| {
+        f.view.update(cx, |v, cx| v.open_export_wizard(window, cx));
+        window.render_frame(cx);
+        window.click("export-run", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let status = cx
+        .update_window(f.window, |_, window, cx| {
+            window.render_frame(cx);
+            window.find("export-status").label().unwrap().to_owned()
+        })
+        .unwrap();
+    assert_eq!(status, "Enter a file path.");
+    assert!(events.borrow().is_empty());
+    // A path plus the JSON format: Run emits ExportRequested and shows Running.
+    cx.update_window(f.window, |_, window, cx| {
+        window.click("export-path", cx);
+        window.input("/tmp/fg-export-test.json", cx);
+        window.click("export-format-json", cx);
+        window.click("export-run", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let status = cx
+        .update_window(f.window, |_, window, cx| {
+            window.render_frame(cx);
+            window.find("export-status").label().unwrap().to_owned()
+        })
+        .unwrap();
+    assert!(status.starts_with("Exporting…"), "got: {status}");
+    assert!(
+        events
+            .borrow()
+            .iter()
+            .any(|p| p == "/tmp/fg-export-test.json"),
+        "expected an ExportRequested event, got: {:?}",
+        events.borrow()
+    );
+}
+
+#[gpui_kit::test]
+fn import_wizard_previews_maps_and_requests_a_run(cx: &mut TestAppContext) {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let f = open(cx);
+    open_table(cx, &f, "orders");
+    let csv = std::env::temp_dir().join(format!(
+        "fg-import-wizard-{}-{}.csv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::write(&csv, "Name,N\namy,7\n").unwrap();
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let log = Rc::clone(&events);
+    cx.update(|cx| {
+        cx.subscribe(&f.view, move |_, e: &WorkspaceEvent, _| {
+            if let WorkspaceEvent::ImportRequested {
+                table,
+                mappings,
+                path,
+                ..
+            } = e
+            {
+                log.borrow_mut()
+                    .push((table.name.clone(), path.clone(), mappings.clone()));
+            }
+        })
+        .detach();
+    });
+    cx.update_window(f.window, |_, window, cx| {
+        f.view.update(cx, |v, cx| v.open_import_wizard(window, cx));
+        window.render_frame(cx);
+        window.click("import-path", cx);
+        window.input(csv.to_string_lossy().as_ref(), cx);
+        window.click("import-load-preview", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let preview = cx
+        .update_window(f.window, |_, window, cx| {
+            window.render_frame(cx);
+            window.find("import-preview").label().unwrap().to_owned()
+        })
+        .unwrap();
+    assert!(preview.contains("Name,N"), "got: {preview}");
+    cx.update_window(f.window, |_, window, cx| {
+        window.click("import-map-0", cx);
+        window.input("name", cx);
+        window.click("import-map-1", cx);
+        window.input("n", cx);
+        window.click("import-run", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let status = cx
+        .update_window(f.window, |_, window, cx| {
+            window.render_frame(cx);
+            window.find("import-status").label().unwrap().to_owned()
+        })
+        .unwrap();
+    assert!(status.starts_with("Importing…"), "got: {status}");
+    let logged = events.borrow();
+    assert_eq!(
+        logged.len(),
+        1,
+        "expected one ImportRequested, got: {logged:?}"
+    );
+    assert_eq!(logged[0].0, "orders");
+    assert_eq!(logged[0].1, csv.to_string_lossy().as_ref());
+    assert_eq!(
+        logged[0].2,
+        vec![
+            fg_service::ColumnMapping {
+                csv_index: 0,
+                column: Some("name".into()),
+            },
+            fg_service::ColumnMapping {
+                csv_index: 1,
+                column: Some("n".into()),
+            },
+        ]
+    );
+    let _ = std::fs::remove_file(&csv);
+}

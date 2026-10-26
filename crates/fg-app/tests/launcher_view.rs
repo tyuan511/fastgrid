@@ -870,3 +870,47 @@ fn editing_a_connection_keeps_its_safe_mode_when_untouched(cx: &mut TestAppConte
     assert_eq!(configs.len(), 1);
     assert_eq!(configs[0].safe_mode, Some(SafeMode::Strict));
 }
+
+#[gpui_kit::test]
+fn backup_panel_validates_and_requests_an_export(cx: &mut TestAppContext) {
+    let f = open(cx, vec![row("billing", true)]);
+    cx.update_window(f.window, |_, window, cx| {
+        window.click("backup", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update_window(f.window, |_, window, cx| {
+        // `find` fails the test if the panel never opened.
+        let _ = window.find("backup-panel").bounds();
+        window.click("backup-run", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("backup-status").label().unwrap().to_owned(),
+            "Enter a backup password."
+        );
+        window.click("backup-password", cx);
+        window.input("pw", cx);
+        window.click("backup-confirm", cx);
+        window.input("pw", cx);
+        window.click("backup-path", cx);
+        window.input("/tmp/fg-backup-test.fgbak", cx);
+        window.click("backup-run", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let events = f.events.borrow();
+    assert_eq!(events.len(), 1, "expected one event, got: {events:?}");
+    match &events[0] {
+        LauncherEvent::ExportBackup {
+            options,
+            password,
+            path,
+        } => {
+            assert_eq!(options.scope, fg_service::BackupScope::Connections);
+            assert!(options.include_secrets);
+            assert_eq!(password, "pw");
+            assert_eq!(path, "/tmp/fg-backup-test.fgbak");
+        }
+        other => panic!("expected ExportBackup, got: {other:?}"),
+    }
+}

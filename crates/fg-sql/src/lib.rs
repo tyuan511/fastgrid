@@ -9,6 +9,7 @@
 mod browse;
 mod classify;
 mod comments;
+mod ddl;
 mod dml;
 mod format;
 pub mod lex;
@@ -17,6 +18,10 @@ mod split;
 pub use browse::{BuildOptions, BuiltQuery, build_count, build_select, validate_raw_where};
 pub use classify::{Analysis, StatementInfo, analyze, classify};
 pub use comments::{CommentEdit, toggle_line_comments};
+pub use ddl::{
+    SchemaChange, SchemaStatement, coerce_text, compile_schema_changes, render_create_table,
+    render_create_table_as,
+};
 pub use dml::{CellChange, DmlStatement, RowChange, compile_changes};
 pub use format::{format_sql, is_formatted};
 pub use split::{StatementSpan, split_statements, statement_at};

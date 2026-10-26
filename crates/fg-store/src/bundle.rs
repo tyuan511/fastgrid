@@ -57,7 +57,7 @@ pub enum ExportScope {
     Everything,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExportOptions {
     pub scope: ExportScope,
     /// Include passwords and passphrases. They stay inside the password-encrypted file.

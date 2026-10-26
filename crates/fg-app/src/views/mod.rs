@@ -21,7 +21,7 @@ pub use actions::{
 };
 pub use cells::CellMark;
 pub use filter_drawer::{FilterDrawer, FilterDrawerEvent};
-pub use grid::{GridDelegate, PrefetchedPage, TableTab, TableTabEvent};
+pub use grid::{GridDelegate, PrefetchedPage, StructureData, TabMode, TableTab, TableTabEvent};
 pub use icons::{FastgridAssets, Hugeicon, hugeicon};
 pub use launcher::{Launcher, LauncherEvent, Row, SaveRequest, TestConnectionRequest, rows_from};
 pub use query_tab::{
@@ -29,6 +29,6 @@ pub use query_tab::{
 };
 pub use recovery::{Recovery, RecoveryEvent, move_store_aside};
 pub use workspace::{
-    TabContent, WorkspaceEvent, WorkspaceView, next_safe_mode, open_workspace_window,
+    ExportSource, TabContent, WorkspaceEvent, WorkspaceView, next_safe_mode, open_workspace_window,
     restore_query, safe_mode_label,
 };

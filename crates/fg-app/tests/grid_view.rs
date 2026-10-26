@@ -1032,3 +1032,305 @@ fn shift_clicking_a_second_header_adds_it_to_the_sort(cx: &mut TestAppContext) {
     })
     .unwrap();
 }
+
+fn structure_detail() -> fg_core::TableDetail {
+    use fg_core::{
+        ColumnInfo, DataType, ForeignKeyInfo, IndexColumn, IndexInfo, ObjectKind,
+        ReferentialAction, TableDetail, TypeCategory,
+    };
+    let mut id = ColumnInfo::new("id", 1, DataType::new("INTEGER", TypeCategory::Integer));
+    id.nullable = false;
+    id.primary_key_position = Some(1);
+    let mut name = ColumnInfo::new("name", 2, DataType::new("TEXT", TypeCategory::Text));
+    name.nullable = true;
+    name.default = Some("'anon'".into());
+    TableDetail {
+        path: ObjectPath::new(Some("main"), "items"),
+        kind: ObjectKind::Table,
+        comment: None,
+        columns: vec![id, name],
+        indexes: vec![IndexInfo {
+            name: "items_name".into(),
+            columns: vec![IndexColumn::column("name")],
+            unique: false,
+            primary: false,
+            method: None,
+            predicate: None,
+            comment: None,
+            extra: Default::default(),
+        }],
+        foreign_keys: vec![ForeignKeyInfo {
+            name: Some("items_owner".into()),
+            columns: vec!["id".into()],
+            referenced: ObjectPath::new(Some("main"), "owners"),
+            referenced_columns: vec!["id".into()],
+            on_update: None,
+            on_delete: Some(ReferentialAction::Cascade),
+            extra: Default::default(),
+        }],
+        checks: vec![],
+        triggers: vec![],
+        row_estimate: None,
+        size_bytes: None,
+        options: Default::default(),
+    }
+}
+
+fn show_structure(cx: &mut TestAppContext, f: &Fixture, ddl: Option<&str>) {
+    use fg_app::views::TabMode;
+    cx.update_window(f.window, |_, window, cx| {
+        f.view.update(cx, |v, cx| {
+            v.set_mode(TabMode::Structure, cx);
+            v.set_structure(
+                Ok(std::sync::Arc::new(structure_detail())),
+                Ok(ddl.map(str::to_owned)),
+                cx,
+            );
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn switching_to_structure_asks_the_owner_to_load_it(cx: &mut TestAppContext) {
+    use fg_app::views::TabMode;
+    let f = open(cx);
+    cx.update_window(f.window, |_, window, cx| {
+        f.view
+            .update(cx, |v, cx| v.set_mode(TabMode::Structure, cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(*f.events.borrow(), vec![TableTabEvent::StructureRequested]);
+    cx.update_window(f.window, |_, window, cx| {
+        f.view.update(cx, |v, cx| {
+            // A second switch to the same mode asks for nothing new, and
+            // switching back needs no load either.
+            v.set_mode(TabMode::Structure, cx);
+            v.set_mode(TabMode::Data, cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(*f.events.borrow(), vec![TableTabEvent::StructureRequested]);
+    let mode = cx
+        .update_window(f.window, |_, _, cx| f.view.read(cx).mode())
+        .unwrap();
+    assert_eq!(mode, TabMode::Data);
+}
+
+#[gpui_kit::test]
+fn structure_view_shows_columns_indexes_fks_and_ddl(cx: &mut TestAppContext) {
+    let f = open(cx);
+    show_structure(
+        cx,
+        &f,
+        Some("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)"),
+    );
+    let columns = cx
+        .update_window(f.window, |_, window, cx| {
+            window.render_frame(cx);
+            window.find("structure-columns").label().unwrap().to_owned()
+        })
+        .unwrap();
+    assert!(
+        columns.contains("id INTEGER NOT NULL PK(1)"),
+        "columns label should describe the key column, got: {columns}"
+    );
+    assert!(
+        columns.contains("name TEXT DEFAULT 'anon'"),
+        "columns label should carry the default, got: {columns}"
+    );
+    let indexes = cx
+        .update_window(f.window, |_, window, _cx| {
+            window.find("structure-indexes").label().unwrap().to_owned()
+        })
+        .unwrap();
+    assert!(indexes.contains("items_name (name)"), "got: {indexes}");
+    let fks = cx
+        .update_window(f.window, |_, window, _cx| {
+            window.find("structure-fks").label().unwrap().to_owned()
+        })
+        .unwrap();
+    assert!(
+        fks.contains("items_owner: (id) -> owners (id) ON DELETE CASCADE"),
+        "got: {fks}"
+    );
+    let ddl = cx
+        .update_window(f.window, |_, window, _cx| {
+            window.find("structure-ddl").label().unwrap().to_owned()
+        })
+        .unwrap();
+    assert!(ddl.contains("CREATE TABLE items"), "got: {ddl}");
+}
+
+#[gpui_kit::test]
+fn structure_view_without_ddl_says_so(cx: &mut TestAppContext) {
+    let f = open(cx);
+    show_structure(cx, &f, None);
+    let ddl = cx
+        .update_window(f.window, |_, window, cx| {
+            window.render_frame(cx);
+            window.find("structure-ddl").label().unwrap().to_owned()
+        })
+        .unwrap();
+    assert!(ddl.contains("does not provide DDL text"), "got: {ddl}");
+}
+
+#[gpui_kit::test]
+fn clicking_the_structure_button_switches_modes(cx: &mut TestAppContext) {
+    use fg_app::views::TabMode;
+    let f = open(cx);
+    cx.update_window(f.window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("mode-structure", cx);
+    })
+    .unwrap();
+    let mode = cx
+        .update_window(f.window, |_, _, cx| f.view.read(cx).mode())
+        .unwrap();
+    assert_eq!(mode, TabMode::Structure);
+    assert_eq!(*f.events.borrow(), vec![TableTabEvent::StructureRequested]);
+}
+
+#[gpui_kit::test]
+fn structure_staging_undo_redo_and_preview(cx: &mut TestAppContext) {
+    use fg_core::DbKind;
+    use fg_sql::SchemaChange;
+    let f = open(cx);
+    show_structure(cx, &f, Some("CREATE TABLE items (id INTEGER PRIMARY KEY)"));
+    cx.update_window(f.window, |_, window, cx| {
+        f.view.update(cx, |v, cx| {
+            // The engine must be known for the preview to compile.
+            v.set_engine(DbKind::Sqlite, cx);
+            v.push_structure_change(
+                SchemaChange::AlterColumn {
+                    name: "name".into(),
+                    new_type: Some("VARCHAR(100)".into()),
+                    nullable: None,
+                    default: None,
+                },
+                cx,
+            );
+            assert_eq!(v.structure_changes().len(), 1);
+            v.undo_structure(cx);
+            assert_eq!(v.structure_changes().len(), 0);
+            v.redo_structure(cx);
+            assert_eq!(v.structure_changes().len(), 1);
+            v.toggle_structure_preview(cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let preview = cx
+        .update_window(f.window, |_, window, cx| {
+            window.render_frame(cx);
+            window.find("structure-preview").label().unwrap().to_owned()
+        })
+        .unwrap();
+    assert!(
+        preview.contains("CREATE TABLE \"main\".\"items__fg_rebuild\""),
+        "SQLite alter must preview as a rebuild, got: {preview}"
+    );
+    // The staging bar appears once something is staged.
+    cx.update_window(f.window, |_, window, cx| {
+        window.render_frame(cx);
+        window.find("structure-staging").label().unwrap().to_owned()
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn structure_drop_button_stages_a_drop(cx: &mut TestAppContext) {
+    let f = open(cx);
+    show_structure(cx, &f, None);
+    cx.update_window(f.window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("structure-drop-col-name", cx);
+    })
+    .unwrap();
+    let staged = cx
+        .update_window(f.window, |_, _, cx| {
+            f.view.read(cx).structure_changes().len()
+        })
+        .unwrap();
+    assert_eq!(staged, 1);
+}
+
+#[gpui_kit::test]
+fn structure_add_column_form_stages_an_add(cx: &mut TestAppContext) {
+    let f = open(cx);
+    // Enter through the button so the form inputs exist.
+    cx.update_window(f.window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("mode-structure", cx);
+    })
+    .unwrap();
+    show_structure(cx, &f, None);
+    cx.update_window(f.window, |_, window, cx| {
+        f.view.update(cx, |v, cx| {
+            for (id, text) in [("add-col-name", "age"), ("add-col-type", "INTEGER")] {
+                let input = v.structure_form(id).unwrap();
+                input.update(cx, |s, cx| s.set_value(text, window, cx));
+            }
+        });
+        window.render_frame(cx);
+        window.click("structure-add-col", cx);
+    })
+    .unwrap();
+    let staged = cx
+        .update_window(f.window, |_, _, cx| {
+            f.view.read(cx).structure_changes().len()
+        })
+        .unwrap();
+    assert_eq!(staged, 1);
+}
+
+#[gpui_kit::test]
+fn back_reference_menu_on_a_pk_cell_opens_the_referencing_table(cx: &mut TestAppContext) {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let f = open(cx);
+    cx.update_window(f.window, |_, _, cx| {
+        f.view.update(cx, |t, cx| {
+            t.set_primary_key(vec!["id".into()], cx);
+            t.set_back_references(
+                vec![fg_app::model::BackRef {
+                    from: fg_core::ObjectPath::new(Some("main"), "orders"),
+                    from_columns: vec!["item_id".into()],
+                    referenced_columns: vec![],
+                }],
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    load_rows(cx, &f, vec![vec![Value::Int(1), Value::Text("pen".into())]]);
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let log = Rc::clone(&events);
+    cx.update(|cx| {
+        cx.subscribe(&f.view, move |_, e: &TableTabEvent, _| {
+            log.borrow_mut().push(e.clone())
+        })
+        .detach();
+    });
+    cx.update_window(f.window, |_, window, cx| {
+        f.view.update(cx, |t, cx| t.open_cell_menu(0, 1, cx));
+        window.render_frame(cx);
+        window.click("cell-menu-backref-0-orders", cx);
+    })
+    .unwrap();
+    assert!(
+        events.borrow().iter().any(|e| matches!(
+            e,
+            TableTabEvent::FollowBackReference { table, filters }
+                if table.name == "orders"
+                    && filters.len() == 1
+                    && filters[0].column == "item_id"
+                    && filters[0].values == vec![Value::Int(1)]
+        )),
+        "expected a back-reference jump to orders filtered by item_id = 1, got: {:?}",
+        events.borrow()
+    );
+}

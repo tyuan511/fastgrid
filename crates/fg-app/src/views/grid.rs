@@ -11,10 +11,15 @@ use std::rc::Rc;
 use std::collections::{HashMap, HashSet};
 
 use fg_core::{
-    ColumnMeta, DbKind, Filter, FilterOp, ObjectPath, SafeMode, TableQuery, TableViewState,
+    ColumnInfo, ColumnMeta, DataType, DbKind, Filter, FilterOp, ForeignKeyInfo, IndexColumn,
+    IndexInfo, ObjectPath, ReferentialAction, SafeMode, TableDetail, TableQuery, TableViewState,
     TypeCategory, Value, dialect_for,
 };
-use fg_sql::{CellChange, RowChange, compile_changes};
+use fg_driver::driver_for;
+use fg_service::ApplySchemaOutcome;
+use fg_sql::{
+    CellChange, RowChange, SchemaChange, SchemaStatement, compile_changes, compile_schema_changes,
+};
 use gpui_kit::base::actions::{SelectNextColumn, SelectPrevColumn};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
@@ -29,15 +34,15 @@ use gpui_kit::*;
 use super::actions::{
     BeginEdit, CELL_EDITOR_CONTEXT, CancelCellEdit, CloneRow, CommitChanges, CopySelection,
     GRID_CONTEXT, InsertRow, PreviewChanges, RedoEdit, RevertCell, SetCellDefault, SetCellEmpty,
-    SetCellNull, ToggleDeleteRow, ToggleRowDetail, UndoEdit,
+    SetCellNull, SwitchToData, SwitchToStructure, ToggleDeleteRow, ToggleRowDetail, UndoEdit,
 };
 use super::cells::{CellMark, CellSelection};
 use super::filter_drawer::{FilterDrawer, FilterDrawerEvent};
 use super::icons::{Hugeicon, hugeicon};
 use crate::model::{
-    Align, CellKind, CellState, Changeset, Counts, DEFAULT_PAGE_SIZE, FilterDraft, GridQuery,
-    JumpTarget, PAGE_SIZES, RowId, RowState, SortState, align_for, copy_text, display,
-    parse_cell_text, to_tsv,
+    Align, BackRef, CellKind, CellState, Changeset, Counts, DEFAULT_PAGE_SIZE, FilterDraft,
+    GridQuery, JumpTarget, PAGE_SIZES, RowId, RowState, SortState, StructureChangeset, align_for,
+    copy_text, display, parse_cell_text, to_tsv,
 };
 
 /// Screen columns before the data: the row-number gutter.
@@ -617,11 +622,41 @@ pub enum TableTabEvent {
     Reload,
     /// The user clicked a foreign-key arrow: show `table` filtered to `filter`.
     FollowForeignKey { table: ObjectPath, filter: Filter },
+    /// The user clicked a "referenced by" entry on a primary-key cell: show
+    /// `table` filtered to every column pair of the referencing key.
+    FollowBackReference {
+        table: ObjectPath,
+        filters: Vec<Filter>,
+    },
     /// Something that is remembered per table but needs no new data changed (hidden columns).
     ViewChanged,
     /// The user asked to commit the staged changes (`⌘S`). The owner runs them and answers with
     /// [`TableTab::commit_finished`].
     CommitRequested,
+    /// The user switched to the structure view and it has no data yet. The
+    /// owner loads `describe` + `ddl` and answers with
+    /// [`TableTab::set_structure`].
+    StructureRequested,
+    /// The user asked to apply the staged structure changes. The owner runs
+    /// them and answers with [`TableTab::structure_commit_finished`].
+    StructureCommitRequested,
+}
+
+/// Which half of a table tab is on screen. Data is the grid; Structure is
+/// the read-only-then-editable definition (columns, indexes, foreign keys,
+/// DDL text). Both halves share the tab, its title, and its lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabMode {
+    Data,
+    Structure,
+}
+
+/// The structure view's data: the table definition plus its DDL text, when
+/// the engine provides one.
+#[derive(Debug, Clone)]
+pub struct StructureData {
+    pub detail: std::sync::Arc<TableDetail>,
+    pub ddl: Option<String>,
 }
 
 /// One page fetched ahead of time, waiting for the user to step onto it. The key is the query
@@ -661,7 +696,8 @@ pub struct TableTab {
     /// Set once the saved view state was applied; before that a jump must wait for it.
     restored: bool,
     /// A foreign-key jump that arrived before the saved filters were restored.
-    pending_filter: Option<Filter>,
+    /// A back-reference jump carries one filter per key column.
+    pending_filter: Option<Vec<Filter>>,
     query: GridQuery,
     loading: bool,
     error: Option<SharedString>,
@@ -703,8 +739,56 @@ pub struct TableTab {
     /// The page after the one on screen, fetched ahead by the controller. Served only when the
     /// tab is still on the page before it under the same query; anything else is dropped.
     prefetched: Option<PrefetchedPage>,
+    /// Data / Structure switch (roadmap M6). Structure data loads lazily
+    /// on the first switch and is cleared after a structure commit, so the
+    /// next switch reloads it.
+    mode: TabMode,
+    structure: Option<StructureData>,
+    structure_loading: bool,
+    structure_error: Option<SharedString>,
+    /// Staged structure changes (roadmap M6): the same stage → preview →
+    /// confirm → apply rhythm as the row overlay, with its own op list.
+    structure_changes: StructureChangeset,
+    structure_preview_open: bool,
+    structure_preview: Option<Result<Vec<SchemaStatement>, String>>,
+    structure_committing: bool,
+    /// The Save button was pressed and the confirm bar (with warnings) is
+    /// waiting for the second click.
+    structure_confirm: bool,
+    /// A form validation error, shown under the structure forms.
+    structure_form_error: Option<String>,
+    /// The column whose row is currently an edit form, if any.
+    edit_column: Option<String>,
+    /// The structure forms' text inputs, created on the first windowed
+    /// switch to Structure (inputs need a window). `None` in tests that
+    /// drive the tab without one: the forms simply do not render.
+    structure_forms: Option<StructureForms>,
+    /// Tables referencing this one (roadmap M6 back-references), set by the
+    /// controller at attach time.
+    back_references: Vec<BackRef>,
     _edit_subscription: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// Text inputs for the structure forms, plus their checkbox states.
+struct StructureForms {
+    add_col_name: Entity<InputState>,
+    add_col_type: Entity<InputState>,
+    add_col_default: Entity<InputState>,
+    add_col_nullable: bool,
+    edit_col_type: Entity<InputState>,
+    edit_col_default: Entity<InputState>,
+    edit_col_nullable: bool,
+    add_idx_name: Entity<InputState>,
+    add_idx_columns: Entity<InputState>,
+    add_idx_unique: bool,
+    add_fk_name: Entity<InputState>,
+    add_fk_columns: Entity<InputState>,
+    add_fk_ref_table: Entity<InputState>,
+    add_fk_ref_columns: Entity<InputState>,
+    add_fk_on_delete: Entity<InputState>,
+    add_fk_on_update: Entity<InputState>,
+    rename_table_name: Entity<InputState>,
 }
 
 impl EventEmitter<TableTabEvent> for TableTab {}
@@ -826,6 +910,19 @@ impl TableTab {
             confirm_commit: false,
             safe_mode: SafeMode::default(),
             prefetched: None,
+            mode: TabMode::Data,
+            structure: None,
+            structure_loading: false,
+            structure_error: None,
+            structure_changes: StructureChangeset::new(),
+            structure_preview_open: false,
+            structure_preview: None,
+            structure_committing: false,
+            structure_confirm: false,
+            structure_form_error: None,
+            edit_column: None,
+            structure_forms: None,
+            back_references: Vec::new(),
             _edit_subscription: None,
             _subscriptions: vec![observer, on_apply, on_table],
         }
@@ -836,14 +933,1087 @@ impl TableTab {
         let mut query = query;
         self.restored = true;
         // A foreign-key jump that arrived first wins over whatever filters were saved.
-        if let Some(filter) = self.pending_filter.take() {
-            query.set_filters(vec![filter], None);
+        if let Some(filters) = self.pending_filter.take() {
+            query.set_filters(filters, None);
         }
         let draft = FilterDraft::from_applied(&query.filters, query.raw_where.as_deref());
         self.drawer.update(cx, |d, cx| d.load(draft, cx));
         self.query = query;
         self.sync_sort(cx);
         cx.notify();
+    }
+
+    /// The half of the tab on screen.
+    pub fn mode(&self) -> TabMode {
+        self.mode
+    }
+
+    /// Switch halves. Switching to Structure with no data yet asks the
+    /// owner to load it; switching back needs nothing.
+    pub fn set_mode(&mut self, mode: TabMode, cx: &mut Context<Self>) {
+        if self.mode == mode {
+            return;
+        }
+        self.mode = mode;
+        if mode == TabMode::Structure && self.structure.is_none() && !self.structure_loading {
+            self.structure_loading = true;
+            self.structure_error = None;
+            cx.emit(TableTabEvent::StructureRequested);
+        }
+        cx.notify();
+    }
+
+    /// The structure view's data, when loaded.
+    pub fn structure(&self) -> Option<&StructureData> {
+        self.structure.as_ref()
+    }
+
+    /// Answer to `StructureRequested`: store the definition (and DDL text,
+    /// when the engine provides one) or the reason loading failed.
+    pub fn set_structure(
+        &mut self,
+        detail: Result<std::sync::Arc<TableDetail>, String>,
+        ddl: Result<Option<String>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.structure_loading = false;
+        match (detail, ddl) {
+            (Ok(detail), Ok(ddl)) => {
+                self.structure = Some(StructureData { detail, ddl });
+                self.structure_error = None;
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                self.structure_error = Some(e.into());
+            }
+        }
+        cx.notify();
+    }
+
+    /// Drop the structure data, so the next switch reloads it. The
+    /// controller calls this after a structure commit.
+    pub fn clear_structure(&mut self, cx: &mut Context<Self>) {
+        self.structure = None;
+        self.structure_error = None;
+        cx.notify();
+    }
+
+    // ---- Structure editing (M6) ----
+
+    /// The staged structure changes, in order.
+    pub fn structure_changes(&self) -> &[SchemaChange] {
+        self.structure_changes.changes()
+    }
+
+    /// Stage one structure change. The preview, if open, goes stale and is
+    /// recomputed on the next toggle.
+    pub fn push_structure_change(&mut self, change: SchemaChange, cx: &mut Context<Self>) {
+        self.structure_changes.push(change);
+        self.structure_preview = None;
+        self.structure_confirm = false;
+        cx.notify();
+    }
+
+    pub fn discard_structure_changes(&mut self, cx: &mut Context<Self>) {
+        self.structure_changes.clear();
+        self.structure_preview = None;
+        self.structure_confirm = false;
+        self.edit_column = None;
+        cx.notify();
+    }
+
+    pub fn undo_structure(&mut self, cx: &mut Context<Self>) {
+        if self.structure_changes.undo() {
+            self.structure_preview = None;
+            cx.notify();
+        }
+    }
+
+    pub fn redo_structure(&mut self, cx: &mut Context<Self>) {
+        if self.structure_changes.redo() {
+            self.structure_preview = None;
+            cx.notify();
+        }
+    }
+
+    /// The compiled preview, when the panel is open.
+    pub fn structure_preview(&self) -> Option<&Result<Vec<SchemaStatement>, String>> {
+        self.structure_preview.as_ref()
+    }
+
+    pub fn toggle_structure_preview(&mut self, cx: &mut Context<Self>) {
+        if self.structure_preview_open {
+            self.structure_preview_open = false;
+        } else {
+            self.structure_preview = Some(self.compile_structure());
+            self.structure_preview_open = true;
+        }
+        cx.notify();
+    }
+
+    fn compile_structure(&self) -> Result<Vec<SchemaStatement>, String> {
+        let Some(data) = &self.structure else {
+            return Err("No structure loaded.".into());
+        };
+        let Some(engine) = self.engine else {
+            return Err("The engine for this tab is unknown.".into());
+        };
+        let Some(dialect) = dialect_for(engine) else {
+            return Err("The engine for this tab is unknown.".into());
+        };
+        compile_schema_changes(
+            self.query.path(),
+            &data.detail,
+            self.structure_changes.changes(),
+            dialect,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    /// Warnings for the confirm bar, computed locally from the staged
+    /// changes and the compiled preview: dropping a table, DDL that cannot
+    /// roll back, and table rebuilds. The service computes the same set for
+    /// its own callers.
+    pub fn structure_warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if self
+            .structure_changes
+            .changes()
+            .iter()
+            .any(|c| matches!(c, SchemaChange::DropTable))
+        {
+            warnings.push("Dropping a table cannot be undone.".into());
+        }
+        if let Some(engine) = self.engine
+            && let Ok(driver) = driver_for(engine)
+            && !driver.capabilities().transactional_ddl
+        {
+            warnings.push(
+                "DDL on this engine cannot be rolled back: if a later statement fails, \
+                 earlier ones stay applied."
+                    .into(),
+            );
+        }
+        if let Ok(steps) = self.compile_structure()
+            && steps
+                .iter()
+                .any(|s| s.description.contains("via table rebuild"))
+        {
+            warnings.push(
+                "One or more changes rebuild the table: a new table is created, rows are \
+                 copied, the old table is dropped, and the new one is renamed back. Indexes \
+                 and triggers are recreated from their stored definitions."
+                    .into(),
+            );
+        }
+        warnings
+    }
+
+    /// Ask the owner to apply the staged changes. Guarded like the data
+    /// commit: a second Save while one runs is ignored.
+    pub fn request_structure_commit(&mut self, cx: &mut Context<Self>) {
+        if self.structure_committing || self.structure_changes.is_empty() {
+            return;
+        }
+        self.structure_confirm = false;
+        self.structure_committing = true;
+        cx.emit(TableTabEvent::StructureCommitRequested);
+        cx.notify();
+    }
+
+    /// Answer to `StructureCommitRequested`. A partial failure (engines
+    /// without transactional DDL) keeps the staged changes and reports
+    /// which statement failed; a full success clears the staging and
+    /// reloads the structure.
+    pub fn structure_commit_finished(
+        &mut self,
+        result: Result<ApplySchemaOutcome, String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.structure_committing = false;
+        match result {
+            Ok(outcome) => match outcome.failed {
+                Some(failed) => {
+                    self.structure_error = Some(failed.into());
+                }
+                None => {
+                    self.structure_changes.clear();
+                    self.structure_preview = None;
+                    self.structure_preview_open = false;
+                    self.reload_structure(cx);
+                    return;
+                }
+            },
+            Err(e) => {
+                self.structure_error = Some(e.into());
+            }
+        }
+        cx.notify();
+    }
+
+    /// Reload the structure data on the next switch-independent load: used
+    /// after a successful commit.
+    pub fn reload_structure(&mut self, cx: &mut Context<Self>) {
+        self.structure = None;
+        self.structure_loading = true;
+        self.structure_error = None;
+        cx.emit(TableTabEvent::StructureRequested);
+        cx.notify();
+    }
+
+    /// One of the structure forms' text inputs, by id, for tests and for
+    /// reading values in handlers.
+    pub fn structure_form(&self, name: &str) -> Option<Entity<InputState>> {
+        let f = self.structure_forms.as_ref()?;
+        Some(match name {
+            "add-col-name" => f.add_col_name.clone(),
+            "add-col-type" => f.add_col_type.clone(),
+            "add-col-default" => f.add_col_default.clone(),
+            "edit-col-type" => f.edit_col_type.clone(),
+            "edit-col-default" => f.edit_col_default.clone(),
+            "add-idx-name" => f.add_idx_name.clone(),
+            "add-idx-columns" => f.add_idx_columns.clone(),
+            "add-fk-name" => f.add_fk_name.clone(),
+            "add-fk-columns" => f.add_fk_columns.clone(),
+            "add-fk-ref-table" => f.add_fk_ref_table.clone(),
+            "add-fk-ref-columns" => f.add_fk_ref_columns.clone(),
+            "add-fk-on-delete" => f.add_fk_on_delete.clone(),
+            "add-fk-on-update" => f.add_fk_on_update.clone(),
+            "rename-table-name" => f.rename_table_name.clone(),
+            _ => return None,
+        })
+    }
+
+    fn ensure_structure_forms(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.structure_forms.is_some() {
+            return;
+        }
+        let mk =
+            |window: &mut Window, cx: &mut Context<Self>| cx.new(|cx| InputState::new(window, cx));
+        self.structure_forms = Some(StructureForms {
+            add_col_name: mk(window, cx),
+            add_col_type: mk(window, cx),
+            add_col_default: mk(window, cx),
+            add_col_nullable: true,
+            edit_col_type: mk(window, cx),
+            edit_col_default: mk(window, cx),
+            edit_col_nullable: true,
+            add_idx_name: mk(window, cx),
+            add_idx_columns: mk(window, cx),
+            add_idx_unique: false,
+            add_fk_name: mk(window, cx),
+            add_fk_columns: mk(window, cx),
+            add_fk_ref_table: mk(window, cx),
+            add_fk_ref_columns: mk(window, cx),
+            add_fk_on_delete: mk(window, cx),
+            add_fk_on_update: mk(window, cx),
+            rename_table_name: mk(window, cx),
+        });
+    }
+
+    fn form_value(&self, name: &str, cx: &App) -> String {
+        self.structure_form(name)
+            .map(|input| input.read(cx).value().to_string())
+            .unwrap_or_default()
+    }
+
+    fn set_form_error(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
+        self.structure_form_error = Some(message.into());
+        cx.notify();
+    }
+
+    fn clear_input(&self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(input) = self.structure_form(name) {
+            input.update(cx, |s, cx| s.set_value("", window, cx));
+        }
+    }
+
+    fn add_structure_column(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let name = self.form_value("add-col-name", cx);
+        let ty = self.form_value("add-col-type", cx);
+        let default = self.form_value("add-col-default", cx);
+        if name.trim().is_empty() {
+            self.set_form_error("A column needs a name.", cx);
+            return;
+        }
+        if ty.trim().is_empty() {
+            self.set_form_error("A column needs a type.", cx);
+            return;
+        }
+        let nullable = self
+            .structure_forms
+            .as_ref()
+            .is_some_and(|f| f.add_col_nullable);
+        let ordinal = self
+            .structure
+            .as_ref()
+            .map(|d| d.detail.columns.len() as u32 + 1)
+            .unwrap_or(1);
+        let mut column = ColumnInfo::new(
+            name.trim(),
+            ordinal,
+            DataType::new(ty.trim(), TypeCategory::Other),
+        );
+        column.nullable = nullable;
+        column.default = if default.is_empty() {
+            None
+        } else {
+            Some(default)
+        };
+        self.structure_form_error = None;
+        self.push_structure_change(SchemaChange::AddColumn { column }, cx);
+        self.clear_input("add-col-name", window, cx);
+        self.clear_input("add-col-type", window, cx);
+        self.clear_input("add-col-default", window, cx);
+    }
+
+    fn begin_structure_edit(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(column) = self
+            .structure
+            .as_ref()
+            .and_then(|d| d.detail.column(name))
+            .cloned()
+        else {
+            return;
+        };
+        self.edit_column = Some(name.to_owned());
+        if let Some(forms) = self.structure_forms.as_mut() {
+            forms.edit_col_nullable = column.nullable;
+        }
+        if let Some(input) = self.structure_form("edit-col-type") {
+            let ty = column.data_type.native.clone();
+            input.update(cx, |s, cx| s.set_value(ty, window, cx));
+        }
+        if let Some(input) = self.structure_form("edit-col-default") {
+            let default = column.default.clone().unwrap_or_default();
+            input.update(cx, |s, cx| s.set_value(default, window, cx));
+        }
+        cx.notify();
+    }
+
+    fn save_structure_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(name) = self.edit_column.clone() else {
+            return;
+        };
+        let ty = self.form_value("edit-col-type", cx);
+        let default = self.form_value("edit-col-default", cx);
+        if ty.trim().is_empty() {
+            self.set_form_error("A column needs a type.", cx);
+            return;
+        }
+        let nullable = self
+            .structure_forms
+            .as_ref()
+            .is_some_and(|f| f.edit_col_nullable);
+        self.structure_form_error = None;
+        self.edit_column = None;
+        // Empty default means "drop the default" when one exists; the
+        // compiler filters it back to a no-op when there is none.
+        let default = if default.is_empty() {
+            None
+        } else {
+            Some(default)
+        };
+        self.push_structure_change(
+            SchemaChange::AlterColumn {
+                name,
+                new_type: Some(ty.trim().to_owned()),
+                nullable: Some(nullable),
+                default: Some(default),
+            },
+            cx,
+        );
+    }
+
+    fn drop_structure_column(&mut self, name: &str, cx: &mut Context<Self>) {
+        self.edit_column = None;
+        self.push_structure_change(SchemaChange::DropColumn { name: name.into() }, cx);
+    }
+
+    fn drop_structure_index(&mut self, name: &str, cx: &mut Context<Self>) {
+        self.push_structure_change(SchemaChange::DropIndex { name: name.into() }, cx);
+    }
+
+    fn drop_structure_fk(&mut self, name: &str, cx: &mut Context<Self>) {
+        self.push_structure_change(SchemaChange::DropForeignKey { name: name.into() }, cx);
+    }
+
+    fn add_structure_index(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let name = self.form_value("add-idx-name", cx);
+        let columns = self.form_value("add-idx-columns", cx);
+        if name.trim().is_empty() {
+            self.set_form_error("An index needs a name.", cx);
+            return;
+        }
+        let cols: Vec<IndexColumn> = columns
+            .split(',')
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .map(IndexColumn::column)
+            .collect();
+        if cols.is_empty() {
+            self.set_form_error("An index needs at least one column.", cx);
+            return;
+        }
+        let unique = self
+            .structure_forms
+            .as_ref()
+            .is_some_and(|f| f.add_idx_unique);
+        let index = IndexInfo {
+            name: name.trim().to_owned(),
+            columns: cols,
+            unique,
+            primary: false,
+            method: None,
+            predicate: None,
+            comment: None,
+            extra: Default::default(),
+        };
+        self.structure_form_error = None;
+        self.push_structure_change(SchemaChange::AddIndex { index }, cx);
+        self.clear_input("add-idx-name", window, cx);
+        self.clear_input("add-idx-columns", window, cx);
+    }
+
+    fn add_structure_fk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let name = self.form_value("add-fk-name", cx);
+        let columns = self.form_value("add-fk-columns", cx);
+        let ref_table = self.form_value("add-fk-ref-table", cx);
+        let ref_columns = self.form_value("add-fk-ref-columns", cx);
+        let on_delete = self.form_value("add-fk-on-delete", cx);
+        let on_update = self.form_value("add-fk-on-update", cx);
+        let cols: Vec<String> = columns
+            .split(',')
+            .map(|c| c.trim().to_owned())
+            .filter(|c| !c.is_empty())
+            .collect();
+        if cols.is_empty() {
+            self.set_form_error("A foreign key needs at least one column.", cx);
+            return;
+        }
+        if ref_table.trim().is_empty() {
+            self.set_form_error("A foreign key needs a referenced table.", cx);
+            return;
+        }
+        let namespace = self.query.path().namespace.clone();
+        let fk = ForeignKeyInfo {
+            name: if name.trim().is_empty() {
+                None
+            } else {
+                Some(name.trim().to_owned())
+            },
+            columns: cols,
+            referenced: ObjectPath::new(namespace.as_deref(), ref_table.trim()),
+            referenced_columns: ref_columns
+                .split(',')
+                .map(|c| c.trim().to_owned())
+                .filter(|c| !c.is_empty())
+                .collect(),
+            on_update: if on_update.trim().is_empty() {
+                None
+            } else {
+                Some(ReferentialAction::parse(&on_update))
+            },
+            on_delete: if on_delete.trim().is_empty() {
+                None
+            } else {
+                Some(ReferentialAction::parse(&on_delete))
+            },
+            extra: Default::default(),
+        };
+        self.structure_form_error = None;
+        self.push_structure_change(SchemaChange::AddForeignKey { fk }, cx);
+        for id in [
+            "add-fk-name",
+            "add-fk-columns",
+            "add-fk-ref-table",
+            "add-fk-ref-columns",
+            "add-fk-on-delete",
+            "add-fk-on-update",
+        ] {
+            self.clear_input(id, window, cx);
+        }
+    }
+
+    fn rename_structure_table(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let name = self.form_value("rename-table-name", cx);
+        if name.trim().is_empty() {
+            self.set_form_error("A table needs a name.", cx);
+            return;
+        }
+        self.structure_form_error = None;
+        self.push_structure_change(
+            SchemaChange::RenameTable {
+                new_name: name.trim().to_owned(),
+            },
+            cx,
+        );
+        self.clear_input("rename-table-name", window, cx);
+    }
+
+    fn drop_structure_table(&mut self, cx: &mut Context<Self>) {
+        self.push_structure_change(SchemaChange::DropTable, cx);
+    }
+
+    /// The structure half's content: four sections (columns, indexes,
+    /// foreign keys, DDL text), each with an `aria_label` carrying its
+    /// lines for tests and readers. Loading and error states get their own
+    /// panels instead.
+    fn structure_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.structure_loading {
+            return div()
+                .id("structure-loading")
+                .test_support()
+                .aria_label("Loading structure…")
+                .px_3()
+                .py_2()
+                .text_sm()
+                .child("Loading…")
+                .into_any_element();
+        }
+        let Some(data) = &self.structure else {
+            if let Some(error) = &self.structure_error {
+                return div()
+                    .id("structure-error")
+                    .test_support()
+                    .aria_label(error.clone())
+                    .px_3()
+                    .py_2()
+                    .text_sm()
+                    .child(error.clone())
+                    .into_any_element();
+            }
+            return div()
+                .id("structure-empty")
+                .test_support()
+                .aria_label("No structure loaded.")
+                .px_3()
+                .py_2()
+                .text_sm()
+                .child("No structure loaded.")
+                .into_any_element();
+        };
+        let detail = &data.detail;
+        let columns: Vec<String> = detail
+            .columns
+            .iter()
+            .map(|c| {
+                let mut line = format!("{} {}", c.name, c.data_type.native);
+                if !c.nullable {
+                    line.push_str(" NOT NULL");
+                }
+                if let Some(pos) = c.primary_key_position {
+                    line.push_str(&format!(" PK({pos})"));
+                }
+                if c.auto_increment {
+                    line.push_str(" AUTO_INCREMENT");
+                }
+                if let Some(default) = &c.default {
+                    line.push_str(&format!(" DEFAULT {default}"));
+                }
+                line
+            })
+            .collect();
+        let indexes: Vec<String> = detail
+            .indexes
+            .iter()
+            .map(|ix| {
+                let cols = ix
+                    .columns
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let mut line = format!("{} ({cols})", ix.name);
+                if ix.unique {
+                    line.push_str(" UNIQUE");
+                }
+                if ix.primary {
+                    line.push_str(" PRIMARY");
+                }
+                line
+            })
+            .collect();
+        let fks: Vec<String> = detail
+            .foreign_keys
+            .iter()
+            .map(|fk| {
+                let cols = fk.columns.join(", ");
+                let mut line = format!(
+                    "{}: ({cols}) -> {}",
+                    fk.name.clone().unwrap_or_default(),
+                    fk.referenced.name
+                );
+                if !fk.referenced_columns.is_empty() {
+                    line.push_str(&format!(" ({})", fk.referenced_columns.join(", ")));
+                }
+                if let Some(action) = &fk.on_delete {
+                    line.push_str(&format!(" ON DELETE {}", action.sql()));
+                }
+                if let Some(action) = &fk.on_update {
+                    line.push_str(&format!(" ON UPDATE {}", action.sql()));
+                }
+                line
+            })
+            .collect();
+        let ddl = data
+            .ddl
+            .clone()
+            .unwrap_or_else(|| "This engine does not provide DDL text.".into());
+        let mut panel = v_flex()
+            .id("structure-view")
+            .test_support()
+            .gap_4()
+            .px_1()
+            .py_2()
+            .overflow_y_scroll();
+        if let Some(error) = &self.structure_error {
+            panel = panel.child(
+                div()
+                    .id("structure-commit-error")
+                    .test_support()
+                    .aria_label(error.clone())
+                    .px_3()
+                    .py_2()
+                    .text_sm()
+                    .child(error.clone()),
+            );
+        }
+        // Columns, with per-row Alter / Drop and an add form.
+        let mut col_section = div()
+            .id("structure-columns")
+            .test_support()
+            .aria_label(if columns.is_empty() {
+                "Columns: none".to_owned()
+            } else {
+                columns.join("\n")
+            })
+            .px_3()
+            .py_2()
+            .child(div().text_sm().child("Columns"));
+        for (line, column) in columns.iter().zip(detail.columns.iter()) {
+            let name = column.name.clone();
+            if self.edit_column.as_deref() == Some(name.as_str()) {
+                let mut row = h_flex()
+                    .gap_2()
+                    .child(div().text_sm().child(format!("{name}:")));
+                if let Some(input) = self.structure_form("edit-col-type") {
+                    row = row.child(
+                        div()
+                            .flex_1()
+                            .child(Input::new(&input).id("structure-edit-col-type")),
+                    );
+                }
+                if let Some(input) = self.structure_form("edit-col-default") {
+                    row = row.child(
+                        div()
+                            .flex_1()
+                            .child(Input::new(&input).id("structure-edit-col-default")),
+                    );
+                }
+                if let Some(forms) = &self.structure_forms {
+                    let checked = forms.edit_col_nullable;
+                    row = row.child(
+                        Checkbox::new(SharedString::from("structure-edit-col-nullable"))
+                            .label("Nullable")
+                            .checked(checked)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(forms) = this.structure_forms.as_mut() {
+                                    forms.edit_col_nullable = !forms.edit_col_nullable;
+                                }
+                                cx.notify();
+                            })),
+                    );
+                }
+                row = row.child(
+                    Button::new("structure-save-col-edit")
+                        .label("Save")
+                        .small()
+                        .on_click(cx.listener(|this, _, _, cx| this.save_structure_edit(cx))),
+                );
+                row = row.child(
+                    Button::new("structure-cancel-col-edit")
+                        .label("Cancel")
+                        .small()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.edit_column = None;
+                            cx.notify();
+                        })),
+                );
+                col_section = col_section.child(row);
+            } else {
+                let drop_name = name.clone();
+                let alter_name = name.clone();
+                col_section = col_section.child(
+                    h_flex()
+                        .gap_2()
+                        .child(div().text_sm().child(line.clone()))
+                        .child(
+                            Button::new(SharedString::from(format!("structure-alter-col-{name}")))
+                                .label("Alter")
+                                .small()
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.begin_structure_edit(&alter_name, window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!("structure-drop-col-{name}")))
+                                .label("Drop")
+                                .small()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.drop_structure_column(&drop_name, cx);
+                                })),
+                        ),
+                );
+            }
+        }
+        if let Some(forms) = &self.structure_forms {
+            let add_col_name = forms.add_col_name.clone();
+            let add_col_type = forms.add_col_type.clone();
+            let add_col_default = forms.add_col_default.clone();
+            let nullable = forms.add_col_nullable;
+            col_section = col_section.child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(Input::new(&add_col_name).id("structure-add-col-name")),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(Input::new(&add_col_type).id("structure-add-col-type")),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(Input::new(&add_col_default).id("structure-add-col-default")),
+                    )
+                    .child(
+                        Checkbox::new(SharedString::from("structure-add-col-nullable"))
+                            .label("Nullable")
+                            .checked(nullable)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(forms) = this.structure_forms.as_mut() {
+                                    forms.add_col_nullable = !forms.add_col_nullable;
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("structure-add-col")
+                            .label("Add column")
+                            .small()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.add_structure_column(window, cx);
+                            })),
+                    ),
+            );
+        }
+        panel = panel.child(col_section);
+        // Indexes, with per-row Drop and an add form.
+        let mut idx_section = div()
+            .id("structure-indexes")
+            .test_support()
+            .aria_label(if indexes.is_empty() {
+                "Indexes: none".to_owned()
+            } else {
+                indexes.join("\n")
+            })
+            .px_3()
+            .py_2()
+            .child(div().text_sm().child("Indexes"));
+        for (line, index) in indexes.iter().zip(detail.indexes.iter()) {
+            let name = index.name.clone();
+            idx_section = idx_section.child(
+                h_flex()
+                    .gap_2()
+                    .child(div().text_sm().child(line.clone()))
+                    .child(
+                        Button::new(SharedString::from(format!("structure-drop-idx-{name}")))
+                            .label("Drop")
+                            .small()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.drop_structure_index(&name, cx);
+                            })),
+                    ),
+            );
+        }
+        if let Some(forms) = &self.structure_forms {
+            let add_idx_name = forms.add_idx_name.clone();
+            let add_idx_columns = forms.add_idx_columns.clone();
+            let unique = forms.add_idx_unique;
+            idx_section = idx_section.child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(Input::new(&add_idx_name).id("structure-add-idx-name")),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(Input::new(&add_idx_columns).id("structure-add-idx-columns")),
+                    )
+                    .child(
+                        Checkbox::new(SharedString::from("structure-add-idx-unique"))
+                            .label("Unique")
+                            .checked(unique)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(forms) = this.structure_forms.as_mut() {
+                                    forms.add_idx_unique = !forms.add_idx_unique;
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("structure-add-idx")
+                            .label("Add index")
+                            .small()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.add_structure_index(window, cx);
+                            })),
+                    ),
+            );
+        }
+        panel = panel.child(idx_section);
+        // Foreign keys, with per-row Drop and an add form.
+        let mut fk_section = div()
+            .id("structure-fks")
+            .test_support()
+            .aria_label(if fks.is_empty() {
+                "Foreign keys: none".to_owned()
+            } else {
+                fks.join("\n")
+            })
+            .px_3()
+            .py_2()
+            .child(div().text_sm().child("Foreign keys"));
+        for (i, (line, fk)) in fks.iter().zip(detail.foreign_keys.iter()).enumerate() {
+            let Some(name) = fk.name.clone() else {
+                continue;
+            };
+            let drop_id = format!("structure-drop-fk-{name}");
+            let _ = i;
+            fk_section = fk_section.child(
+                h_flex()
+                    .gap_2()
+                    .child(div().text_sm().child(line.clone()))
+                    .child(
+                        Button::new(SharedString::from(drop_id))
+                            .label("Drop")
+                            .small()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.drop_structure_fk(&name, cx);
+                            })),
+                    ),
+            );
+        }
+        if let Some(forms) = &self.structure_forms {
+            let add_fk_name = forms.add_fk_name.clone();
+            let add_fk_columns = forms.add_fk_columns.clone();
+            let add_fk_ref_table = forms.add_fk_ref_table.clone();
+            let add_fk_ref_columns = forms.add_fk_ref_columns.clone();
+            let add_fk_on_delete = forms.add_fk_on_delete.clone();
+            let add_fk_on_update = forms.add_fk_on_update.clone();
+            fk_section =
+                fk_section.child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .child(Input::new(&add_fk_name).id("structure-add-fk-name")),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .child(Input::new(&add_fk_columns).id("structure-add-fk-columns")),
+                        )
+                        .child(
+                            div().flex_1().child(
+                                Input::new(&add_fk_ref_table).id("structure-add-fk-ref-table"),
+                            ),
+                        )
+                        .child(div().flex_1().child(
+                            Input::new(&add_fk_ref_columns).id("structure-add-fk-ref-columns"),
+                        ))
+                        .child(
+                            div().flex_1().child(
+                                Input::new(&add_fk_on_delete).id("structure-add-fk-on-delete"),
+                            ),
+                        )
+                        .child(
+                            div().flex_1().child(
+                                Input::new(&add_fk_on_update).id("structure-add-fk-on-update"),
+                            ),
+                        )
+                        .child(
+                            Button::new("structure-add-fk")
+                                .label("Add foreign key")
+                                .small()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.add_structure_fk(window, cx);
+                                })),
+                        ),
+                );
+        }
+        panel = panel.child(fk_section);
+        // Table actions: rename and drop.
+        if let Some(forms) = &self.structure_forms {
+            let rename_table_name = forms.rename_table_name.clone();
+            panel =
+                panel.child(
+                    h_flex()
+                        .gap_2()
+                        .px_3()
+                        .py_2()
+                        .child(div().flex_1().child(
+                            Input::new(&rename_table_name).id("structure-rename-table-name"),
+                        ))
+                        .child(
+                            Button::new("structure-rename-table")
+                                .label("Rename table")
+                                .small()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.rename_structure_table(window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("structure-drop-table")
+                                .label("Drop table")
+                                .small()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.drop_structure_table(cx);
+                                })),
+                        ),
+                );
+        }
+        // DDL text, as reported by the engine.
+        panel = panel.child(
+            div()
+                .id("structure-ddl")
+                .test_support()
+                .aria_label(ddl.clone())
+                .px_3()
+                .py_2()
+                .child(div().text_sm().child("DDL"))
+                .child(div().text_sm().child(ddl)),
+        );
+        // Form validation errors.
+        if let Some(error) = &self.structure_form_error {
+            panel = panel.child(
+                div()
+                    .id("structure-form-error")
+                    .test_support()
+                    .aria_label(error.clone())
+                    .px_3()
+                    .py_2()
+                    .text_sm()
+                    .child(error.clone()),
+            );
+        }
+        // Staging bar, preview, and confirm bar.
+        let staged = self.structure_changes.len();
+        if staged > 0 {
+            panel = panel.child(
+                h_flex()
+                    .id("structure-staging")
+                    .test_support()
+                    .aria_label(format!("{staged} staged structure change(s)"))
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .child(div().text_sm().child(format!("{staged} staged change(s)")))
+                    .child(
+                        Button::new("structure-preview-toggle")
+                            .label("Preview")
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.toggle_structure_preview(cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("structure-save")
+                            .label("Save")
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.structure_confirm = true;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("structure-discard")
+                            .label("Discard")
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.discard_structure_changes(cx);
+                            })),
+                    ),
+            );
+        }
+        if self.structure_preview_open {
+            let preview_text = match &self.structure_preview {
+                Some(Ok(steps)) => steps
+                    .iter()
+                    .map(|s| s.sql.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                Some(Err(e)) => e.clone(),
+                None => String::new(),
+            };
+            panel = panel.child(
+                div()
+                    .id("structure-preview")
+                    .test_support()
+                    .aria_label(preview_text.clone())
+                    .px_3()
+                    .py_2()
+                    .child(div().text_sm().child("Preview"))
+                    .child(div().text_sm().child(preview_text)),
+            );
+        }
+        if self.structure_confirm {
+            let warnings = self.structure_warnings();
+            let joined = if warnings.is_empty() {
+                "No warnings.".to_owned()
+            } else {
+                warnings.join("\n")
+            };
+            panel = panel.child(
+                v_flex()
+                    .id("structure-confirm")
+                    .test_support()
+                    .aria_label(joined.clone())
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .child(div().text_sm().child(joined))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new("structure-apply")
+                                    .label("Apply")
+                                    .small()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.request_structure_commit(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("structure-cancel-confirm")
+                                    .label("Cancel")
+                                    .small()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.structure_confirm = false;
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            );
+        }
+        panel.into_any_element()
     }
 
     pub fn query(&self) -> &GridQuery {
@@ -1945,6 +3115,13 @@ impl TableTab {
         });
     }
 
+    /// The tables referencing this one, for the "referenced by" menu on
+    /// primary-key cells. Set by the controller alongside the forward jumps.
+    pub fn set_back_references(&mut self, refs: Vec<BackRef>, cx: &mut Context<Self>) {
+        self.back_references = refs;
+        cx.notify();
+    }
+
     pub fn has_foreign_key(&self, column: &str, cx: &App) -> bool {
         self.table.read(cx).delegate().jumps.contains_key(column)
     }
@@ -1972,11 +3149,18 @@ impl TableTab {
     /// Show only the rows matching `filter` (used when arriving through a foreign key). If the
     /// tab's saved view state has not been restored yet, the filter is applied right after it.
     pub fn apply_filter(&mut self, filter: Filter, cx: &mut Context<Self>) {
+        self.apply_filters(vec![filter], cx);
+    }
+
+    /// Show only the rows matching every filter (used when arriving through
+    /// a back-reference, where one key column means one filter). Same
+    /// pending rule as [`TableTab::apply_filter`].
+    pub fn apply_filters(&mut self, filters: Vec<Filter>, cx: &mut Context<Self>) {
         if !self.restored {
-            self.pending_filter = Some(filter);
+            self.pending_filter = Some(filters);
             return;
         }
-        self.query.set_filters(vec![filter], None);
+        self.query.set_filters(filters, None);
         let draft = FilterDraft::from_applied(&self.query.filters, None);
         self.drawer.update(cx, |d, cx| d.load(draft, cx));
         cx.emit(TableTabEvent::Reload);
@@ -2602,6 +3786,64 @@ impl Render for TableTab {
                 format!("Cell: row {} · {column}", row + 1)
             };
             let button = |id: &'static str, label: String| Button::new(id).label(label).small();
+            // Back-references, only on a primary-key cell: every table
+            // referencing this one, each opening filtered to this row's key.
+            // Filters resolve now, while the row is on screen; a key whose
+            // columns do not line up offers no button.
+            let backref_buttons: Vec<AnyElement> = {
+                let delegate = self.table.read(cx).delegate();
+                let pk = delegate.key_columns.clone();
+                if pk.contains(&column) && !self.back_references.is_empty() {
+                    let metas: Vec<String> =
+                        delegate.metas.iter().map(|m| m.name.clone()).collect();
+                    let row_values: Vec<Value> =
+                        delegate.rows.get(row).cloned().unwrap_or_default();
+                    self.back_references
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, backref)| {
+                            let ref_cols = if backref.referenced_columns.is_empty() {
+                                pk.clone()
+                            } else {
+                                backref.referenced_columns.clone()
+                            };
+                            if ref_cols.len() != backref.from_columns.len() {
+                                return None;
+                            }
+                            let mut filters = Vec::new();
+                            for (from_col, ref_col) in
+                                backref.from_columns.iter().zip(ref_cols.iter())
+                            {
+                                let ix = metas.iter().position(|m| m == ref_col)?;
+                                let value = row_values.get(ix)?.clone();
+                                filters.push(Filter {
+                                    column: from_col.clone(),
+                                    op: FilterOp::Eq,
+                                    values: vec![value],
+                                    enabled: true,
+                                });
+                            }
+                            let table = backref.from.clone();
+                            let id = format!("cell-menu-backref-{i}-{}", backref.from.name);
+                            Some(
+                                Button::new(SharedString::from(id))
+                                    .label(format!("Referenced by {}", backref.from.name))
+                                    .small()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.close_cell_menu(cx);
+                                        cx.emit(TableTabEvent::FollowBackReference {
+                                            table: table.clone(),
+                                            filters: filters.clone(),
+                                        });
+                                    }))
+                                    .into_any_element(),
+                            )
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            };
             v_flex()
                 .id("cell-menu")
                 .test_support()
@@ -2706,6 +3948,7 @@ impl Render for TableTab {
                                 this.close_cell_menu(cx);
                             })),
                         )
+                        .children(backref_buttons)
                         .child(
                             button(
                                 "cell-menu-close",
@@ -2913,8 +4156,20 @@ impl Render for TableTab {
             .on_action(
                 cx.listener(|this, _: &CommitChanges, window, cx| this.request_commit(window, cx)),
             )
-            .on_action(cx.listener(|this, _: &UndoEdit, _, cx| this.undo_edit(cx)))
-            .on_action(cx.listener(|this, _: &RedoEdit, _, cx| this.redo_edit(cx)))
+            .on_action(cx.listener(|this, _: &UndoEdit, _, cx| {
+                if this.mode == TabMode::Structure {
+                    this.undo_structure(cx);
+                } else {
+                    this.undo_edit(cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &RedoEdit, _, cx| {
+                if this.mode == TabMode::Structure {
+                    this.redo_structure(cx);
+                } else {
+                    this.redo_edit(cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &BeginEdit, window, cx| this.begin_edit(window, cx)))
             .on_action(
                 cx.listener(|this, _: &CancelCellEdit, window, cx| this.cancel_edit(window, cx)),
@@ -2955,7 +4210,39 @@ impl Render for TableTab {
             .on_action(cx.listener(|this, _: &ToggleRowDetail, window, cx| {
                 this.toggle_detail(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &SwitchToData, _, cx| {
+                this.set_mode(TabMode::Data, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SwitchToStructure, window, cx| {
+                this.set_mode(TabMode::Structure, cx);
+                this.ensure_structure_forms(window, cx);
+            }))
             .bg(theme.background)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .child(
+                        Button::new("mode-data")
+                            .label("Data")
+                            .small()
+                            .when(self.mode == TabMode::Data, |b| b.primary())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_mode(TabMode::Data, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("mode-structure")
+                            .label("Structure")
+                            .small()
+                            .when(self.mode == TabMode::Structure, |b| b.primary())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.set_mode(TabMode::Structure, cx);
+                                this.ensure_structure_forms(window, cx);
+                            })),
+                    ),
+            )
             .when_some(self.error.clone(), |d, e| {
                 d.child(
                     div()
@@ -2970,14 +4257,20 @@ impl Render for TableTab {
                 )
             })
             .child(
-                div().flex_1().min_h_0().child(
-                    DataTable::new(&self.table)
-                        .with_size(px(22.))
-                        .bordered(false)
-                        .fixed_cols_border(false)
-                        .header_row_height(px(24.))
-                        .stripe(true),
-                ),
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(if self.mode == TabMode::Structure {
+                        self.structure_panel(cx)
+                    } else {
+                        DataTable::new(&self.table)
+                            .with_size(px(22.))
+                            .bordered(false)
+                            .fixed_cols_border(false)
+                            .header_row_height(px(24.))
+                            .stripe(true)
+                            .into_any_element()
+                    }),
             )
             .when(self.drawer_open, |d| d.child(self.drawer.clone()))
             .children(column_panel)

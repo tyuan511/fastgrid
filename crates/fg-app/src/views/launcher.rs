@@ -140,6 +140,20 @@ pub enum LauncherEvent {
     SaveGroup(ConnectionGroup),
     /// Delete a group; its connections move to the top level (done by the store).
     DeleteGroup(GroupId),
+    /// Write an encrypted backup file. The controller writes the bytes
+    /// and reports back through `set_backup_status`.
+    ExportBackup {
+        options: fg_service::BackupOptions,
+        password: String,
+        path: String,
+    },
+    /// Read an encrypted backup file. The controller reports the
+    /// backend's result (or its error, verbatim) through
+    /// `set_backup_status`.
+    ImportBackup {
+        password: String,
+        path: String,
+    },
 }
 
 type Choice = Entity<SelectState<SearchableVec<SharedString>>>;
@@ -189,6 +203,20 @@ struct GroupEditor {
     error: Option<SharedString>,
 }
 
+/// The backup form: export or import an encrypted backup file. The
+/// scope and secrets toggles only apply to exports; the password and
+/// path are shared by both modes.
+struct BackupPanel {
+    export: bool,
+    scope: fg_service::BackupScope,
+    include_secrets: bool,
+    password: Entity<InputState>,
+    confirm: Entity<InputState>,
+    path: Entity<InputState>,
+    status: Option<SharedString>,
+    running: bool,
+}
+
 pub struct Launcher {
     rows: Vec<Row>,
     groups: Vec<ConnectionGroup>,
@@ -199,6 +227,7 @@ pub struct Launcher {
     search: Entity<InputState>,
     editor: Option<Editor>,
     group_editor: Option<GroupEditor>,
+    backup: Option<BackupPanel>,
     confirm_delete: Option<ConnectionId>,
     confirm_delete_group: Option<GroupId>,
     show_backup_nudge: bool,
@@ -292,6 +321,7 @@ impl Launcher {
             search,
             editor: None,
             group_editor: None,
+            backup: None,
             confirm_delete: None,
             confirm_delete_group: None,
             show_backup_nudge: false,
@@ -417,6 +447,84 @@ impl Launcher {
             self.collapsed.insert(id);
         }
         cx.notify();
+    }
+
+    /// Open the backup form: export mode, or import mode for restores.
+    pub fn open_backup(&mut self, export: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.backup = Some(BackupPanel {
+            export,
+            scope: fg_service::BackupScope::Connections,
+            include_secrets: true,
+            password: editor_input("Backup password", "", true, window, cx),
+            confirm: editor_input("Confirm password", "", true, window, cx),
+            path: editor_input("Backup file path…", "", false, window, cx),
+            status: None,
+            running: false,
+        });
+        cx.notify();
+    }
+
+    pub fn close_backup(&mut self, cx: &mut Context<Self>) {
+        self.backup = None;
+        cx.notify();
+    }
+
+    /// Validate the form and hand the run to the controller. The
+    /// controller reports back through `set_backup_status`.
+    fn run_backup(&mut self, cx: &mut Context<Self>) {
+        let Some(panel) = self.backup.as_mut() else {
+            return;
+        };
+        if panel.running {
+            return;
+        }
+        let password = panel.password.read(cx).value().trim().to_owned();
+        let path = panel.path.read(cx).value().trim().to_owned();
+        if password.is_empty() {
+            panel.status = Some("Enter a backup password.".into());
+            cx.notify();
+            return;
+        }
+        if path.is_empty() {
+            panel.status = Some("Enter a backup file path.".into());
+            cx.notify();
+            return;
+        }
+        if panel.export {
+            let confirm = panel.confirm.read(cx).value().trim().to_owned();
+            if confirm != password {
+                panel.status = Some("Passwords do not match.".into());
+                cx.notify();
+                return;
+            }
+            let options = fg_service::BackupOptions {
+                scope: panel.scope,
+                include_secrets: panel.include_secrets,
+            };
+            panel.running = true;
+            panel.status = None;
+            cx.notify();
+            cx.emit(LauncherEvent::ExportBackup {
+                options,
+                password,
+                path,
+            });
+        } else {
+            panel.running = true;
+            panel.status = None;
+            cx.notify();
+            cx.emit(LauncherEvent::ImportBackup { password, path });
+        }
+    }
+
+    /// The controller's report for the finished run: a success line, or
+    /// the backend's error verbatim (wrong password, newer version…).
+    pub fn set_backup_status(&mut self, status: String, cx: &mut Context<Self>) {
+        if let Some(panel) = self.backup.as_mut() {
+            panel.running = false;
+            panel.status = Some(status.into());
+            cx.notify();
+        }
     }
 
     /// Open the new-group form.
@@ -1442,26 +1550,36 @@ impl Render for Launcher {
                         .gap_2p5()
                         .w_full()
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .child(tableplus_action_button(
-                            "backup-db",
-                            hugeicon(Hugeicon::Backup),
-                            if is_zh {
-                                "备份数据库"
-                            } else {
-                                "Backup Database"
-                            },
-                            cx,
-                        ))
-                        .child(tableplus_action_button(
-                            "restore-db",
-                            hugeicon(Hugeicon::Restore),
-                            if is_zh {
-                                "恢复数据库"
-                            } else {
-                                "Restore Database"
-                            },
-                            cx,
-                        ))
+                        .child(
+                            tableplus_action_button(
+                                "backup-db",
+                                hugeicon(Hugeicon::Backup),
+                                if is_zh {
+                                    "备份数据库"
+                                } else {
+                                    "Backup Database"
+                                },
+                                cx,
+                            )
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_backup(true, window, cx);
+                            })),
+                        )
+                        .child(
+                            tableplus_action_button(
+                                "restore-db",
+                                hugeicon(Hugeicon::Restore),
+                                if is_zh {
+                                    "恢复数据库"
+                                } else {
+                                    "Restore Database"
+                                },
+                                cx,
+                            )
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_backup(false, window, cx);
+                            })),
+                        )
                         .child(
                             tableplus_action_button(
                                 "new-connection",
@@ -1532,6 +1650,17 @@ impl Render for Launcher {
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.new_group(window, cx);
                                     })),
+                                )
+                                .child(
+                                    tableplus_circle_button(
+                                        "backup",
+                                        hugeicon(Hugeicon::Backup),
+                                        if is_zh { "备份" } else { "Backup" },
+                                        cx,
+                                    )
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_backup(true, window, cx);
+                                    })),
                                 ),
                         )
                         .child(
@@ -1588,6 +1717,7 @@ impl Render for Launcher {
                         )
                     })
                     .when_some(self.render_group_editor(cx), |d, editor| d.child(editor))
+                    .when_some(self.render_backup_panel(cx), |d, panel| d.child(panel))
                     .child(
                         // Headless test-support action triggers.
                         // Visual operations are right-click only (matching TablePlus).
@@ -1740,6 +1870,151 @@ impl Render for Launcher {
 }
 
 impl Launcher {
+    fn render_backup_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let panel = self.backup.as_ref()?;
+        let theme = cx.theme().clone();
+        let is_zh = is_chinese_locale();
+        let title = if panel.export {
+            if is_zh {
+                "导出备份"
+            } else {
+                "Export backup"
+            }
+        } else if is_zh {
+            "导入备份"
+        } else {
+            "Import backup"
+        };
+        let mut body = v_flex()
+            .id("backup-panel")
+            .test_support()
+            .gap_2()
+            .p_2()
+            .rounded(px(6.))
+            .border_1()
+            .border_color(theme.border)
+            .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("backup-mode-export")
+                            .label(if is_zh { "导出" } else { "Export" })
+                            .small()
+                            .when(panel.export, |b| b.primary())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(panel) = this.backup.as_mut() {
+                                    panel.export = true;
+                                    panel.status = None;
+                                    cx.notify();
+                                }
+                            })),
+                    )
+                    .child(
+                        Button::new("backup-mode-import")
+                            .label(if is_zh { "导入" } else { "Import" })
+                            .small()
+                            .when(!panel.export, |b| b.primary())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(panel) = this.backup.as_mut() {
+                                    panel.export = false;
+                                    panel.status = None;
+                                    cx.notify();
+                                }
+                            })),
+                    ),
+            );
+        if panel.export {
+            body = body
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("backup-scope-connections")
+                                .label(if is_zh { "连接" } else { "Connections" })
+                                .small()
+                                .when(panel.scope == fg_service::BackupScope::Connections, |b| {
+                                    b.primary()
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(panel) = this.backup.as_mut() {
+                                        panel.scope = fg_service::BackupScope::Connections;
+                                        cx.notify();
+                                    }
+                                })),
+                        )
+                        .child(
+                            Button::new("backup-scope-everything")
+                                .label(if is_zh { "全部" } else { "Everything" })
+                                .small()
+                                .when(panel.scope == fg_service::BackupScope::Everything, |b| {
+                                    b.primary()
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(panel) = this.backup.as_mut() {
+                                        panel.scope = fg_service::BackupScope::Everything;
+                                        cx.notify();
+                                    }
+                                })),
+                        )
+                        .child(
+                            Checkbox::new(SharedString::from("backup-include-secrets"))
+                                .label(if is_zh {
+                                    "包含密码"
+                                } else {
+                                    "Include passwords"
+                                })
+                                .checked(panel.include_secrets)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(panel) = this.backup.as_mut() {
+                                        panel.include_secrets = !panel.include_secrets;
+                                        cx.notify();
+                                    }
+                                })),
+                        ),
+                )
+                .child(Input::new(&panel.confirm).id("backup-confirm"));
+        }
+        body = body
+            .child(Input::new(&panel.password).id("backup-password"))
+            .child(Input::new(&panel.path).id("backup-path"))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .justify_end()
+                    .child(
+                        Button::new("backup-close")
+                            .label(if is_zh { "关闭" } else { "Close" })
+                            .ghost()
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.close_backup(cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("backup-run")
+                            .label(if is_zh { "开始" } else { "Run" })
+                            .primary()
+                            .small()
+                            .disabled(panel.running)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.run_backup(cx);
+                            })),
+                    ),
+            );
+        if let Some(status) = &panel.status {
+            body = body.child(
+                div()
+                    .id("backup-status")
+                    .test_support()
+                    .aria_label(status.clone())
+                    .text_color(theme.muted_foreground)
+                    .child(status.clone()),
+            );
+        }
+        Some(body.into_any_element())
+    }
+
     fn render_group_editor(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let e = self.group_editor.as_ref()?;
         let theme = cx.theme().clone();

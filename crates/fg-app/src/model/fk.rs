@@ -1,9 +1,9 @@
 //! Following a foreign key: which columns of a table can be clicked through, and to where.
 //!
-//! Only single-column keys are offered. A composite key needs several values to find the
-//! referenced row; that comes with the reverse-reference work in M6.
+//! Only single-column keys are offered for the forward jump. A composite key needs several
+//! values to find the referenced row; that comes with the reverse-reference work in M6.
 
-use fg_core::{ObjectPath, TableDetail};
+use fg_core::{ObjectPath, Relation, TableDetail};
 
 /// A column whose value identifies a row of another table.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +39,31 @@ pub fn jump_targets(
                 table: fk.referenced.clone(),
                 referenced_column,
             })
+        })
+        .collect()
+}
+
+/// A table that references another: the reverse of [`JumpTarget`]. `referenced_columns`
+/// is empty when the key names no column, i.e. it refers to the target's primary key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackRef {
+    pub from: ObjectPath,
+    pub from_columns: Vec<String>,
+    pub referenced_columns: Vec<String>,
+}
+
+/// Every table in `relations` that references `table`: the "referenced by"
+/// list for a primary-key cell. Composite keys stay whole — the caller
+/// turns every column pair into a filter, so no single-column restriction
+/// applies here.
+pub fn back_references(relations: &[Relation], table: &ObjectPath) -> Vec<BackRef> {
+    relations
+        .iter()
+        .filter(|r| r.key.referenced == *table)
+        .map(|r| BackRef {
+            from: r.from.clone(),
+            from_columns: r.key.columns.clone(),
+            referenced_columns: r.key.referenced_columns.clone(),
         })
         .collect()
 }
@@ -120,6 +145,44 @@ mod tests {
             fk(&["c"], "no_single_pk", &[]),
         ]);
         assert!(jump_targets(&d, |_| None).is_empty());
+    }
+
+    #[test]
+    fn back_references_keep_composite_keys_whole() {
+        use fg_core::Relation;
+        let relations = vec![
+            // References to other tables are not back-references of books.
+            Relation {
+                from: ObjectPath::new(Some("main"), "books"),
+                key: fk(&["author_id"], "authors", &["id"]),
+            },
+            Relation {
+                from: ObjectPath::new(Some("main"), "reviews"),
+                key: fk(&["book_id"], "books", &[]),
+            },
+            Relation {
+                from: ObjectPath::new(Some("main"), "copies"),
+                key: fk(&["book_a", "book_b"], "books", &["id", "seq"]),
+            },
+        ];
+        let refs = back_references(&relations, &ObjectPath::new(Some("main"), "books"));
+        assert_eq!(
+            refs,
+            vec![
+                BackRef {
+                    from: ObjectPath::new(Some("main"), "reviews"),
+                    from_columns: vec!["book_id".into()],
+                    referenced_columns: vec![],
+                },
+                BackRef {
+                    from: ObjectPath::new(Some("main"), "copies"),
+                    from_columns: vec!["book_a".into(), "book_b".into()],
+                    referenced_columns: vec!["id".into(), "seq".into()],
+                },
+            ]
+        );
+        // A table nobody references has no back-references.
+        assert!(back_references(&relations, &ObjectPath::new(Some("main"), "nobody")).is_empty());
     }
 
     #[test]

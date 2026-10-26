@@ -15,9 +15,13 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+mod backup;
 mod cache;
 mod commit;
+mod commit_schema;
 mod conn;
+mod export;
+mod import;
 mod keychain;
 mod pool;
 mod run;
@@ -36,13 +40,22 @@ use fg_core::{
     Result, SafeMode, SecretKind, SettingGroup, Snippet, SnippetId, TableViewState, WorkspaceState,
 };
 use fg_driver::driver_for;
-use fg_store::{DeviceKeyProvider, Store, StoredConnection, StoredDocument, StoredSnippet};
+use fg_store::{DeviceKeyProvider, Store, StoredDocument, StoredSnippet};
 use tokio::runtime::Handle;
 use tokio::sync::broadcast;
 
 pub use commit::CommitOutcome;
+pub use commit_schema::{ApplySchemaOutcome, SchemaPreview};
 pub use conn::{BrowseOptions, OpenConnection, Refresh};
+pub use export::{ExportControl, ExportFormat, ExportOptions, ExportReport, ExportScope};
 pub use fg_store::AuditFilter;
+pub use fg_store::{
+    ExportOptions as BackupOptions, ExportScope as BackupScope, ImportReport as BackupReport,
+    StoredConnection,
+};
+pub use import::{
+    ColumnMapping, CsvImportOptions, CsvImportReport, CsvPreview, ImportErrorPolicy, preview_csv,
+};
 pub use keychain::{
     DEV_KEYRING_FILE, FileBackend, KeychainKeyProvider, MemoryBackend, OsKeychain, SecretBackend,
     account_name, default_key_provider,

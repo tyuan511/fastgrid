@@ -9,6 +9,7 @@ pub mod format;
 pub mod fuzzy;
 pub mod grid_query;
 pub mod query_tab;
+pub mod structure;
 pub mod tabs;
 pub mod tree;
 
@@ -28,7 +29,7 @@ pub use filter_draft::{
     Applied, DraftRow, FilterDraft, OPERATORS, RowError, op_from_label, op_label, parse_cell_text,
     value_slots,
 };
-pub use fk::{JumpTarget, jump_targets, tables_needing_primary_key};
+pub use fk::{BackRef, JumpTarget, back_references, jump_targets, tables_needing_primary_key};
 pub use fuzzy::{FuzzyMatch, fuzzy_match, rank};
 pub use grid_query::{
     DEFAULT_PAGE_SIZE, DEFAULT_RESULT_PAGE_SIZE, GridQuery, PAGE_SIZES, PageState,
@@ -38,6 +39,7 @@ pub use query_tab::{
     ErrorSpan, QueryDocumentState, QueryResults, RefusalInfo, ResultSetState, RunFailure, RunMode,
     RunStatus, RunTarget, run_target,
 };
+pub use structure::StructureChangeset;
 pub use tabs::{TabSet, table_title};
 pub use tree::{
     NodeKind, QuickItem, TreeNode, build_tree, compact_count, quick_items, quick_search,
