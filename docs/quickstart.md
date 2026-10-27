@@ -1,8 +1,8 @@
 # 快速开始
 
 fastgrid 是跨平台数据库客户端（对标 TablePlus 的交互），内嵌 MCP
-server。当前 pre-alpha：SQLite、PostgreSQL、MySQL/MariaDB 三个引擎
-可用，MCP 默认只读。
+server。当前 pre-alpha：SQLite、PostgreSQL、MySQL/MariaDB、SQL Server
+四个引擎可用，MCP 默认只读。
 
 ## 安装与运行
 

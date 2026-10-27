@@ -18,6 +18,14 @@ mysql = [
     "dep:chrono",
 ]
 sqlite = ["dep:rusqlite", "dep:fallible-iterator"]
+mssql = [
+    "dep:tiberius",
+    "dep:tokio-util",
+    "dep:fg-sql",
+    "dep:futures",
+    "dep:rustls",
+    "dep:chrono",
+]
 postgres = [
     "dep:tokio-postgres",
     "dep:postgres-types",
@@ -75,3 +83,5 @@ mysql_async = { version = "0.37", features = [
     "ring",
 ], optional = true }
 mysql_common = { version = "0.37", optional = true }
+tiberius = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }

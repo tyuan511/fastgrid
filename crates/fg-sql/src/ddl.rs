@@ -219,7 +219,7 @@ fn compile_one(
                 return Ok(Vec::new());
             }
             let description = format!("Alter column `{name}`");
-            if let Some(sql) = dialect.alter_column_sql(
+            if let Some(sqls) = dialect.alter_column_sqls(
                 &table,
                 &current,
                 new_type.as_deref(),
@@ -227,7 +227,10 @@ fn compile_one(
                 default.as_ref().map(|d| d.as_deref()),
             ) {
                 apply_alter(working, name, new_type, nullable, default);
-                return Ok(vec![stmt(sql, description)]);
+                return Ok(sqls
+                    .into_iter()
+                    .map(|sql| stmt(sql, description.clone()))
+                    .collect());
             }
             if dialect.supports_table_rebuild() {
                 let mut new_detail = working.clone();

@@ -82,6 +82,11 @@ pub fn build_select(
     if let Some(order) = order_by(q, dialect, &options.tie_breaker) {
         sql.push_str(" ORDER BY ");
         sql.push_str(&order);
+    } else if dialect.limit_requires_order_by() {
+        // SQL Server rejects OFFSET/FETCH without an ORDER BY. A constant
+        // ordering is the only key available when the user sorted on nothing
+        // and the table has no primary key; paging is unstable either way.
+        sql.push_str(" ORDER BY (SELECT NULL)");
     }
     sql.push(' ');
     sql.push_str(&dialect.limit_clause(q.limit, q.offset));
@@ -251,11 +256,11 @@ fn order_by(q: &TableQuery, d: &dyn Dialect, tie_breaker: &[String]) -> Option<S
             (Some(NullsOrder::Last), true) => keys.push(format!("{col} {dir} NULLS LAST")),
             // MySQL: sort on "is null" first (1 for NULL), then on the value.
             (Some(NullsOrder::First), false) => {
-                keys.push(format!("({col} IS NULL) DESC"));
+                keys.push(format!("{} DESC", d.null_sort_key(&col)));
                 keys.push(format!("{col} {dir}"));
             }
             (Some(NullsOrder::Last), false) => {
-                keys.push(format!("({col} IS NULL) ASC"));
+                keys.push(format!("{} ASC", d.null_sort_key(&col)));
                 keys.push(format!("{col} {dir}"));
             }
             _ => keys.push(format!("{col} {dir}")),
@@ -344,7 +349,9 @@ pub fn validate_raw_where(expr: &str, dialect: &dyn Dialect) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use fg_core::{MySqlDialect, ObjectPath, PostgresDialect, SortKey, SqliteDialect};
+    use fg_core::{
+        MsSqlDialect, MySqlDialect, ObjectPath, PostgresDialect, SortKey, SqliteDialect,
+    };
 
     use super::*;
 
@@ -524,6 +531,65 @@ mod tests {
         )
         .unwrap();
         assert!(stable.sql.contains(r#"ORDER BY "id" ASC"#));
+    }
+
+    #[test]
+    fn sql_server_paging_always_has_an_order_by() {
+        // T-SQL rejects OFFSET/FETCH without an ORDER BY, so a query with no
+        // sort keys and no tie-breaker still has to emit one.
+        let sql = build(&q(), &MsSqlDialect).sql;
+        assert_eq!(
+            sql,
+            "SELECT * FROM [public].[users] ORDER BY (SELECT NULL) OFFSET 0 ROWS FETCH NEXT 50 ROWS ONLY"
+        );
+        let mut paged = q();
+        paged.offset = 100;
+        assert!(
+            build(&paged, &MsSqlDialect)
+                .sql
+                .ends_with("OFFSET 100 ROWS FETCH NEXT 50 ROWS ONLY")
+        );
+        // With a sort key the constant ordering must not appear.
+        let mut sorted = q();
+        sorted.sort = vec![SortKey {
+            column: "name".into(),
+            descending: false,
+            nulls: None,
+        }];
+        let sql = build(&sorted, &MsSqlDialect).sql;
+        assert!(sql.contains("ORDER BY [name] ASC OFFSET"), "{sql}");
+        assert!(!sql.contains("SELECT NULL"), "{sql}");
+    }
+
+    #[test]
+    fn sql_server_sorts_nulls_with_case_because_is_null_is_not_a_value() {
+        let mut query = q();
+        query.sort = vec![SortKey {
+            column: "score".into(),
+            descending: true,
+            nulls: Some(NullsOrder::First),
+        }];
+        let sql = build(&query, &MsSqlDialect).sql;
+        assert!(
+            sql.contains("ORDER BY CASE WHEN [score] IS NULL THEN 1 ELSE 0 END DESC, [score] DESC"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn sql_server_placeholders_are_at_p_n() {
+        let mut query = q();
+        query.filters = vec![
+            filter("a", FilterOp::Eq, vec![Value::Int(1)]),
+            filter("b", FilterOp::Eq, vec![Value::Int(2)]),
+        ];
+        let built = build(&query, &MsSqlDialect);
+        assert!(
+            built.sql.contains("WHERE [a] = @P1 AND [b] = @P2"),
+            "{}",
+            built.sql
+        );
+        assert_eq!(built.params, vec![Value::Int(1), Value::Int(2)]);
     }
 
     #[test]

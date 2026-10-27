@@ -2,7 +2,10 @@
 
 ## 范围
 
-**一期（v0.x → v1.0）支持三个引擎：SQLite、PostgreSQL、MySQL（含 MariaDB）。** 其他引擎不在一期范围内。
+**一期（v0.x → v1.0）支持四个引擎：SQLite、PostgreSQL、MySQL（含 MariaDB）、SQL Server。** 其他引擎不在一期范围内。
+
+> 2026-10-27 范围扩张：SQL Server 作为第四个引擎接入（M10）。目标是对齐 TablePlus 的引擎面，
+> 而 SQL Server 是它支持、且能用纯 Rust + rustls 驱动（tiberius）实现的一个。
 
 定位：对标 TablePlus 的原生速度与交互手感（调研见 [tableplus-interaction-research.md](tableplus-interaction-research.md)），
 加上开源免费，以及面向外部 agent 的 MCP。
@@ -22,6 +25,7 @@
 | M7 | MCP 完整版 | 3w | 24.5w |
 | M8 | 打磨与发布（v1.0） | 3w | 27.5w |
 | M9 | 加密跨端同步（v1.x） | 4w | 31.5w |
+| M10 | SQL Server（第四个引擎） | 2w | — |
 
 一期（到 v1.0）约 27 周（6 个多月）；M9 是发布之后的增量，数据结构与加密从 M1 起就按它设计，M9 只补同步后端与协议。排序的原因：先用最简单的引擎（SQLite，无网络、无认证）把 UI 与交互打磨到位，
 再接入网络型引擎，这样 M4/M5 只是在已验证的抽象上新增驱动，而不是同时调试驱动和界面。
@@ -358,7 +362,7 @@
 
 **发布门槛**
 
-- 三端 CI 全绿（待 CI 跑；本地 fmt / clippy / 测试 / deny 已绿）；三个引擎的行为测试全绿（本地已绿）
+- 三端 CI 全绿（待 CI 跑；本地 fmt / clippy / 测试 / deny 已绿）；四个引擎的行为测试全绿（本地已绿）
 - 无已知的数据丢失 / 误写类缺陷
 - 第一次启动到浏览第一张表 < 1 分钟（有真人试用记录）——未验证，无真人试用记录
 
@@ -388,6 +392,50 @@
 
 ---
 
+## M10 SQL Server（第四个引擎）
+
+目标：把 SQL Server 接成第四个引擎，契约与前三者完全一致（`Driver` / `Session` / `Dialect`，上层不
+`match DbKind`），行为测试与 `tests/sqlite.rs` 同一组场景。驱动用 `tiberius`（纯 Rust，TDS 7.3+，
+`rustls` 后端，不引 OpenSSL）。
+
+- [x] `fg-core`：`DbKind::MsSql`、`MsSqlDialect`（`[ident]` 引用、`@Pn` 占位、`OFFSET/FETCH` 分页、
+      `IDENTITY(1,1)`、`sp_rename` 改表/列、`0x..` 字节字面量、`CAST(.. AS NVARCHAR(MAX))`）；
+      新增四个方言钩子（`null_sort_key`、`limit_requires_order_by`、`supports_index_method`、
+      `alter_column_sqls`）与三个事务拼写（`begin_transaction_sql` / `commit_sql` / `rollback_sql`）
+- [x] `fg-sql`：`Flavor::MsSql`（`[..]` 引用标识符、`N'..'` 前缀、`--` 注释），`GO` 批分隔符
+      （独占一行才算，且从不下发），`BEGIN..END` 体保留分号；分页无排序时补 `ORDER BY (SELECT NULL)`
+- [x] `fg-driver/src/mssql/`：`mod.rs`（连接 + 驱动内只读护栏）、`run.rs`（`simple_query` 走 Batch 以
+      保住会话状态与临时表，带参数走 RPC；`@@ROWCOUNT` 探针拿 affected count，模块定义语句不带探针）、
+      `types.rs`（全部 TDS 类型 ↔ `Value`，`datetimeoffset` 按 UTC 还原成本地墙钟）、`meta.rs`
+      （`sys.objects` / `sys.columns` / `sys.indexes` / `sys.foreign_keys` / `sys.check_constraints` /
+      `sys.triggers`，主键从主索引反推）、`tls.rs`（`TlsMode` → `EncryptionLevel`）
+- [x] 取消：`KILL <spid>` 走旁路连接（tiberius 的 `cancel_query` 实测会让连接失步后静默返回 0 行，
+      不可用）；KILL 失败则把会话标记为不可复用并返回 `Error::Connection`，让池丢弃它
+- [x] `fg-service`：`is_session_setting` 的 MsSql 白名单（`SET <option> <value>`、
+      `SET TRANSACTION ISOLATION LEVEL`、`USE <db>`）；三处裸 `"BEGIN"` 改为方言生成
+- [x] `fg-app` / `fg-lsp`：引擎卡片、连接表单（默认端口 1433、`sqlserver://` URL 解析）、
+      EXPLAIN 明确不支持（SQL Server 没有 `EXPLAIN`，`SET SHOWPLAN_XML` 会让会话无法再执行）
+- [x] 行为测试 `crates/fg-driver/tests/mssql.rs`：20 个（多语句、参数绑定、流式分批、行数上限、
+      单元格截断、结构化错误、元数据与关系、视图 DDL、只读拒绝、取消、语句超时、事务回滚、
+      临时表、自增键回读、类型矩阵、空结果集、`GO`、数据库列表），在本地 SQL Server 2022 上全绿
+
+**M10 诚实缺口**
+
+- 只读模式（`SafeMode::ReadOnly`）在 SQL Server 上靠驱动内的语句分类护栏，不是引擎层只读事务：
+  SQL Server 没有会话级只读开关（`Config::readonly` 只是登录记录里的 ApplicationIntent 提示），
+  而用 `begin_transaction` + 回滚去模拟会和用户自己发的事务冲突。`Capabilities::read_only_session`
+  因此为 `false`，`set_read_only` 是驱动内部标志。
+- 取消依赖 `KILL`，需要 sysadmin 或 `ALTER ANY CONNECTION` 权限；低权限登录无法取消（实测
+  `fglimited` 报 code 6102），此时退化为「丢弃连接」而不是立即停下。
+- 结果列没有来源信息（tiberius 的 `Column` 只有名字与类型），`Capabilities::column_origin = false`，
+  可编辑查询结果在 SQL Server 上不可用。
+- 事务语句只能走 Batch 路径：`execute()`（sp_executesql）发 `BEGIN TRANSACTION` 会报 code 266。
+- 只在本地 SQL Server 2022（Linux 容器，CU27）上实测；SQL Server 2017 / 2019 与 Windows 实例未验证。
+- 元数据的长尾：`sys.indexes` 的 include 列放进 `IndexInfo::extra["included"]` 而不是 `columns`；
+  分区、列存储索引、内存优化表未做专门处理。
+
+---
+
 ## 贯穿所有里程碑的要求
 
 | 方面 | 要求 |
@@ -401,7 +449,7 @@
 
 ## 一期明确不做
 
-其他数据库引擎、托管的云服务与账号体系（M9 的同步使用自带存储，不需要账号）、团队协作、插件系统、应用内 AI 对话（NL2SQL，计划二期）、
+其他数据库引擎（Oracle、Redis、MongoDB、DuckDB、ClickHouse、Snowflake、BigQuery 等）、托管的云服务与账号体系（M9 的同步使用自带存储，不需要账号）、团队协作、插件系统、应用内 AI 对话（NL2SQL，计划二期）、
 分屏与标签拖出为新窗口、图片 / 日期选择等检查器模式、分区与触发器管理、用户与权限管理、ER 图、数据对比。
 
 ## 主要风险

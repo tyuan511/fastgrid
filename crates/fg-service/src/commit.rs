@@ -88,6 +88,9 @@ impl OpenConnection {
             }
         }
         let statements = compile_changes(path, changes, self.dialect())?;
+        let begin = self.dialect().begin_transaction_sql().to_owned();
+        let commit = self.dialect().commit_sql().to_owned();
+        let rollback = self.dialect().rollback_sql().to_owned();
         let changes = changes.to_vec();
 
         let this = Arc::clone(self);
@@ -109,7 +112,7 @@ impl OpenConnection {
                     }
                 };
 
-                run("BEGIN".into(), Vec::new()).await?;
+                run(begin.clone(), Vec::new()).await?;
                 let mut affected = 0;
                 let mut returned_rows = Vec::new();
                 let mut failure = None;
@@ -255,11 +258,11 @@ impl OpenConnection {
                     }
                 }
                 let finish = if failure.is_some() {
-                    "ROLLBACK"
+                    rollback.clone()
                 } else {
-                    "COMMIT"
+                    commit.clone()
                 };
-                if let Err(e) = run(finish.into(), Vec::new()).await {
+                if let Err(e) = run(finish, Vec::new()).await {
                     // A session in an unknown transaction state must not go back to the pool.
                     lease.mark_broken();
                     return Err(failure.unwrap_or(e));

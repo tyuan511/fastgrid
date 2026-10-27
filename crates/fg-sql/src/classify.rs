@@ -193,6 +193,7 @@ fn explain_class(sql: &str, flavor: Flavor, s: &Stream) -> StatementClass {
                 Flavor::Sqlite => DbKind::Sqlite,
                 Flavor::Postgres => DbKind::Postgres,
                 Flavor::MySql => DbKind::MySql,
+                Flavor::MsSql => DbKind::MsSql,
             };
             classify(&sql[t.start..], kind).class
         }

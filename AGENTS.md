@@ -10,7 +10,7 @@
 ## 1. 项目是什么
 
 Rust workspace，一个跨平台的数据库客户端（对标 TablePlus 交互）+ 内嵌 MCP server，跑在 GPUI Kit 上。
-一期只做三个引擎：**SQLite → PostgreSQL → MySQL/MariaDB**。当前处于 pre-alpha，按里程碑推进。
+一期做四个引擎：**SQLite → PostgreSQL → MySQL/MariaDB → SQL Server**。当前处于 pre-alpha，按里程碑推进。
 
 必读文档（改之前先看，别凭印象动手）：
 
@@ -222,12 +222,32 @@ BREAKING CHANGE: persisted workspace files from older builds need a store migrat
 
 ---
 
-## 9. 快照（会过期，2026-10-20）
+## 9. 快照（会过期，2026-10-27）
 
-- M0 已完成；M1 的无界面部分（`fg-sql`、`fg-service`、加密存储）和界面主体（启动页、工作区、只读网格、过滤抽屉、Quick Open、快捷键）已完成并有无头测试；详见 `docs/roadmap.md` 的勾选状态。
+- **M0–M10 全部落地**：数据层、应用外壳、只读网格、SQL 编辑器 + `fg-lsp`、安全模式、暂存变更与数据编辑、
+  PostgreSQL、MySQL/MariaDB、结构管理 + 导入导出、MCP 完整版（stdio + 本地 HTTP + 写入门控 + 审批 + 审计）、
+  打磨与三端打包脚本、加密跨端同步，以及 **M10 的 SQL Server 驱动**（第四个引擎）。roadmap 里唯一还没勾的
+  一项是 M8 的「Beta 发布 → 收集反馈 → v1.0」；版本号仍是 `0.0.1`，一个 tag 都没打，发布流程尚未启动。
+- **SQL Server 的已知限制**（都在 `docs/connections/mssql.md` 与 roadmap 的 M10 诚实缺口里）：只读模式靠驱动内
+  语句分类而非引擎事务（`Capabilities::read_only_session = false`）；取消用 `KILL`，低权限登录会失败并退化为
+  丢弃连接；结果列没有来源信息（`column_origin = false`）；EXPLAIN 不支持；只在本地 SQL Server 2022 容器上实测。
 - **界面的视觉效果从未被人眼验证过**，只验证了行为；改视觉相关的东西请让用户本地看一眼。
-- 未完成：启动页的编辑 / 分组 / 搜索、侧栏拖拽调宽、外键跳转、`⌘K` 切换、主题切换界面；M2 起的 SQL 编辑器；同步是 M9。
-- 三端 CI：macOS / Ubuntu 已过；Windows 只在 `fg-store` 的落盘测试上失败过（文件占用 + 迁移校验和），deny 只在
-  GPUI Kit 传递依赖的 `unmaintained` 通告上失败过，两者都已在 `deny.toml` / 测试里修掉，待 CI 复跑确认。
+- 剩下的是细节与验证缺口（不是功能缺失）：范围（矩形）选区 gpui-kit 不支持；分隔条双击复位；MySQL 的 `USE`
+  免重连切换；网格暂存编辑（Changeset）不在崩溃恢复的会话状态里；Claude Desktop / Cursor / Claude Code 三个真
+  客户端的 MCP 端到端演示未跑（官方 TS SDK 已把 stdio + HTTP 双路跑通）；PG 12–17 与 MySQL 5.7/8.0/8.4、
+  MariaDB 10.6/11 的 testcontainers 矩阵未跑（本地实测只有 PG 16.2 与 MariaDB 10.11.7）；macOS 与 Windows 的
+  打包 CI 任务从未跑过（第一个 tag 就是首测）；自动更新只检查不下载；同步的 S3 / WebDAV 未经真实服务器验证、
+  同步密码只存内存、没有后台自动同步；图标按钮的无障碍名称被上游 `gpui-component` 挡住。
+- 三端 CI：`deny` / macOS / Ubuntu 绿。Windows 失败过两次原因：早前是 `fg-store` 的落盘测试（文件占用 + 迁移
+  校验和，已在测试与 `deny.toml` 里修掉）；最近一段时间是 `crates/fg-service/src/ssh.rs` 顶部的两个 russh agent
+  import 在 Windows 上是死导入（`SshAuth::Agent` 的实现被 `#[cfg(unix)]` 包住，Windows 走 `Unsupported` 早退），
+  2026-10-27 给那两行 `use` 加了 `#[cfg(unix)]`，待 CI 复跑确认。**注意本机只有 `aarch64-apple-darwin` target，
+  Windows 路径无法本地验证**，改 `#[cfg]` 分支时要把「推送后 CI 复跑」当作验收的一部分。
+- deny 只在 GPUI Kit 传递依赖的 `unmaintained` 通告上失败过，已逐条忽略。
 - `cargo deny`（本机 0.20.2）可跑；新增依赖若带来 `unmaintained` 通告，在 `deny.toml` 里**逐条**忽略并写清来源，
   不要把 `unmaintained` 整体降级成 warning。
+- 三条硬门槛最近一次本地实测（2026-10-27，SQL Server 接入后）：fmt 干净；`clippy --workspace --all-targets
+  -- -D warnings` 零告警；`cargo test --workspace` 937 passed / 0 failed / 2 ignored（ignored 是钥匙串实测与
+  百万行性能）。网络引擎的行为测试要显式开 feature 才编：`cargo test -p fg-driver --features mssql --test mssql`
+  （本地 SQL Server 2022 容器上 20 passed），MySQL/PG 同理；默认 feature 只有 `sqlite`，所以 `--workspace`
+  不会跑它们。

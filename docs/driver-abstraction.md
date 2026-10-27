@@ -57,7 +57,9 @@ fg-service pooling, SSH tunnel / TLS, policy (read-only, limits), metadata cache
    encrypted store) and is never part of `ConnectionConfig`.
 10. **Read-only is layered.** `Session::set_read_only` is the engine-level guard; engines that
     can't offer it return `Unsupported` and `fg-service` relies on `fg-sql` statement
-    classification as well (see `mcp-security.md`).
+    classification as well (see `mcp-security.md`). SQL Server has no session-level read-only
+    switch, so its driver keeps the flag itself and refuses write statements before sending them,
+    and reports `Capabilities::read_only_session = false`.
 
 ## Adding a driver (checklist)
 
@@ -71,9 +73,31 @@ fg-service pooling, SSH tunnel / TLS, policy (read-only, limits), metadata cache
    params, streaming batches, `max_rows`, structured errors, metadata, read-only, cancel).
    Network engines run them against testcontainers.
 
+### What SQL Server (M10) had to add to the contract
+
+Four engines in, the abstractions held: no upper layer matches on `DbKind`, and everything
+SQL Server needed became a dialect hook or a driver-local decision. The additions are worth
+knowing before writing the fifth driver:
+
+- `Dialect::null_sort_key` — T-SQL has no `NULLS FIRST/LAST`, and `(col IS NULL)` is not a value
+  there, so the sort key is a `CASE` expression the dialect supplies.
+- `Dialect::limit_requires_order_by` — `OFFSET n ROWS FETCH NEXT m ROWS ONLY` is a syntax error
+  without `ORDER BY`, so the browse compiler appends a constant ordering when the user sorted nothing.
+- `Dialect::supports_index_method` — MySQL emits `USING BTREE`, SQL Server has no such clause.
+- `Dialect::alter_column_sqls` — one logical column change can need several statements (T-SQL
+  restates the whole type, then drops and re-adds the named default constraint).
+- `Dialect::{begin_transaction_sql, commit_sql, rollback_sql}` — bare `BEGIN` is a statement block
+  in T-SQL, not a transaction; `fg-service` now asks the dialect instead of hardcoding one spelling.
+- `Flavor::MsSql` in `fg-sql`, including the `GO` batch separator: it splits like a terminator but is
+  never sent to the server, and only counts when it is alone on its line.
+- Cancellation: tiberius's `cancel_query` (TDS Attention) leaves the connection desynchronised and
+  then silently returns zero rows, so the driver issues `KILL <spid>` on a side connection. When the
+  server refuses the kill the session reports `Error::Connection`, which is what makes the pool
+  discard it (`Lease::mark_broken`).
+
 ## Known gaps (decide when the second driver lands)
 
-- Async engines (PG/MySQL) need an async variant of the send helpers; the SQLite driver uses
+- Async engines (PG/MySQL/SQL Server) need an async variant of the send helpers; the SQLite driver uses
   `blocking_send` from the blocking pool.
 - Large cells: `ExecOptions::max_cell_bytes` turns oversized text/bytes/JSON into `Value::Truncated`
   (preview + full size) in the shared `Batcher`. Loading the full value on demand is `fg-service`'s job (M3 inspector).

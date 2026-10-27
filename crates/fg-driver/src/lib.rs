@@ -18,6 +18,9 @@ pub mod postgres;
 #[cfg(feature = "mysql")]
 pub mod mysql;
 
+#[cfg(feature = "mssql")]
+pub mod mssql;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -115,6 +118,8 @@ pub fn driver_for(kind: DbKind) -> Result<Arc<dyn Driver>> {
         DbKind::Postgres => Ok(Arc::new(postgres::PostgresDriver)),
         #[cfg(feature = "mysql")]
         DbKind::MySql => Ok(Arc::new(mysql::MysqlDriver)),
+        #[cfg(feature = "mssql")]
+        DbKind::MsSql => Ok(Arc::new(mssql::MsSqlDriver)),
         other => Err(Error::Unsupported(format!(
             "{} driver is not available in this build",
             other.display_name()

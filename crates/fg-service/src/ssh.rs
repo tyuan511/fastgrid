@@ -18,7 +18,12 @@ use std::time::Duration;
 use fg_core::{Error, Result, SshAuth, SshConfig};
 use russh::client;
 use russh::client::{AuthResult, Config, Handler};
+// The agent client is only reachable on Unix (it talks to the environment's
+// socket), so these imports would be dead on Windows, where `SshAuth::Agent`
+// compiles to an `Unsupported` early return.
+#[cfg(unix)]
 use russh::keys::agent::AgentIdentity;
+#[cfg(unix)]
 use russh::keys::agent::client::AgentClient;
 use russh::keys::{
     HashAlg, PrivateKeyWithHashAlg, PublicKeyOrCertificate, decode_secret_key, known_hosts,

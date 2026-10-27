@@ -35,7 +35,8 @@ The multi-database contracts (Driver / Session / Dialect / Capabilities) are des
 1. **Runtimes**: GPUI keeps its own executor. Database IO runs on a dedicated tokio runtime owned by
    `fg-service`; results return to the UI over channels. The UI thread only renders and applies
    small state updates.
-2. **Drivers**: SQLite first (`rusqlite`, bundled), then native `tokio-postgres` and `mysql_async` rather than sqlx. We need streaming rows
+2. **Drivers**: SQLite first (`rusqlite`, bundled), then native `tokio-postgres`, `mysql_async` and
+   `tiberius` (TDS, rustls backend) rather than sqlx. We need streaming rows
    and exact control over dynamic type decoding, not compile-time checked queries.
 3. **Result sets**: typed `Value` cells, streamed in batches so the first rows render quickly.
    Large blobs / long text are loaded lazily.
@@ -44,8 +45,9 @@ The multi-database contracts (Driver / Session / Dialect / Capabilities) are des
 5. **Cancellation**: every query is a task. `TaskCanceller` forwards the driver's cancel only while that
    task is running, so a late cancel cannot hit the next lease of the session. Dropping an unfinished
    `TaskStream` or `RunStream` cancels it. PostgreSQL: cancel token / `pg_cancel_backend`. MySQL:
-   `KILL QUERY`. SQLite: `sqlite3_interrupt`, plus a generation flag so a cancel issued before the
-   statement starts is not cleared by `reset`. A statement timeout is not the same mechanism: when
+   `KILL QUERY`. SQL Server: `KILL <spid>` on a side connection (TDS Attention desynchronises the
+   connection and then silently returns zero rows, so it is not used). SQLite: `sqlite3_interrupt`,
+   plus a generation flag so a cancel issued before the statement starts is not cleared by `reset`. A statement timeout is not the same mechanism: when
    `Capabilities::statement_timeout` is false, `fg-service::run` arms its own per-statement timer
    (reset at each `ResultStart`; time waiting on the consumer is not counted) and cancels that
    statement. Engines that enforce a timeout themselves still receive one value for the script.
@@ -78,7 +80,7 @@ used on production paths.
 
 ## Testing
 
-- Integration tests against real servers with testcontainers: MySQL 5.7 / 8.x, MariaDB, PostgreSQL 12-17.
+- Integration tests against real servers with testcontainers: MySQL 5.7 / 8.x, MariaDB, PostgreSQL 12-17, SQL Server 2017 / 2019 / 2022.
 - Property tests for value decoding (numeric, timestamptz, json, arrays, enums, bit, geometry).
 - Benchmarks (criterion) for decoding; fixed-dataset scroll and memory checks run in CI.
 - UI tests via `gpui_kit::test` (headless).

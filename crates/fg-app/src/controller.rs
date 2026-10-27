@@ -11,8 +11,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use fg_core::{
-    AppearanceSettings, DbKind, GridSettings, ObjectInfo, ObjectPath, QueryDocument, Result,
-    SafeMode, StatementClass, TabKind, UnixMillis, WorkspaceState,
+    AppearanceSettings, DbKind, Error as CoreError, GridSettings, ObjectInfo, ObjectPath,
+    QueryDocument, Result, SafeMode, StatementClass, TabKind, UnixMillis, WorkspaceState,
 };
 use fg_driver::Event;
 use fg_service::{
@@ -2332,7 +2332,22 @@ fn explain(
     }
     // `EXPLAIN QUERY PLAN` on SQLite; the other engines take a bare `EXPLAIN`. The prefix is added
     // here rather than by the service because it is a presentation choice, not a policy one.
-    let prefixed = explain_prefix(conn.kind(), &sql);
+    let Some(prefixed) = explain_sql(conn.kind(), &sql) else {
+        // Better an honest refusal than a `SET SHOWPLAN_XML` that quietly stops the session
+        // from executing anything else.
+        tab.update(cx, |t, cx| {
+            let generation = t.begin_run(target.clone(), sql.clone(), cx);
+            t.fail_run(
+                generation,
+                &CoreError::Unsupported(
+                    "SQL Server has no EXPLAIN; use the execution plan in SSMS".into(),
+                ),
+                cx,
+            );
+            cx.notify();
+        });
+        return;
+    };
     // The plan query is what gets planned and run, so the service judges `EXPLAIN ...` (a read)
     // rather than the statement inside it. That is what makes explaining a write possible on a
     // read-only connection.
@@ -2398,12 +2413,16 @@ fn explain(
     );
 }
 
-/// The plan query for this engine. SQLite spells it `EXPLAIN QUERY PLAN`; PostgreSQL and MySQL take
-/// a bare `EXPLAIN`, and MySQL needs `FORMAT=JSON` avoided so the output stays rows.
-fn explain_prefix(kind: DbKind, sql: &str) -> String {
+/// The plan query for this engine, or `None` when the engine has no statement-level plan
+/// prefix. SQLite spells it `EXPLAIN QUERY PLAN`; PostgreSQL and MySQL take a bare `EXPLAIN`,
+/// and MySQL needs `FORMAT=JSON` avoided so the output stays rows. SQL Server has no `EXPLAIN`
+/// at all: plans come from `SET SHOWPLAN_XML ON`, which is a session switch, so asking for one
+/// here would leave the session unable to execute anything.
+fn explain_sql(kind: DbKind, sql: &str) -> Option<String> {
     match kind {
-        DbKind::Sqlite => format!("EXPLAIN QUERY PLAN {sql}"),
-        _ => format!("EXPLAIN {sql}"),
+        DbKind::Sqlite => Some(format!("EXPLAIN QUERY PLAN {sql}")),
+        DbKind::MsSql => None,
+        _ => Some(format!("EXPLAIN {sql}")),
     }
 }
 

@@ -65,6 +65,11 @@ Read-only, and only when the effective safe mode is already read-only, is enforc
   and on every `acquire`. What stops a header or durability write is not that re-assert. Startup
   SQL is an allow-list of session settings. Anything else (SQLite `synchronous`, `journal_mode`,
   `user_version`, and any `query_only`) is `PolicyDenied` before it is sent.
+- SQL Server has no session-level read-only switch (its login-record `ApplicationIntent=ReadOnly`
+  is a hint, not a guard), so `Capabilities::read_only_session` is `false` there and the driver
+  keeps the flag itself: it classifies every statement with `fg-sql` and refuses the ones that may
+  write with `PolicyDenied` before sending them. The guarantee is the same one layer down; the
+  engine is not the thing enforcing it.
 
 Caps are the strictest `Some`: the per-call `RunOptions`, `ExecSettings` (settings key `exec`:
 `max_rows`, `statement_timeout_secs`, `history_keep`), and the connection's

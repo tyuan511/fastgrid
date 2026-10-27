@@ -414,6 +414,7 @@ impl Server {
             self.config.kind = match kind.to_ascii_lowercase().as_str() {
                 "postgres" | "postgresql" => DbKind::Postgres,
                 "mysql" | "mariadb" => DbKind::MySql,
+                "mssql" | "sqlserver" | "sql_server" => DbKind::MsSql,
                 _ => DbKind::Sqlite,
             };
         }

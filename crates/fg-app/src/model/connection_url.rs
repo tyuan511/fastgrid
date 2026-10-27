@@ -1,8 +1,10 @@
 //! Parse a database connection URL into form fields.
 //!
 //! Accepts `postgres://` and `postgresql://` URLs the way libpq spells them
-//! (`postgres://user:password@host:port/database?sslmode=verify-full`) and
-//! `mysql://` URLs (`mysql://user:password@host:port/database?sslMode=VERIFY_CA`).
+//! (`postgres://user:password@host:port/database?sslmode=verify-full`),
+//! `mysql://` URLs (`mysql://user:password@host:port/database?sslMode=VERIFY_CA`),
+//! and `sqlserver://` (or `mssql://`) URLs
+//! (`sqlserver://sa:password@host:1433/database?encrypt=true`).
 //! Only the parts the connection form shows are extracted; anything else in
 //! the query is ignored. Percent-decoding applies to the user, password and
 //! database (a `+` stays a `+`: it is not a space outside form encoding).
@@ -28,6 +30,11 @@ pub fn parse_postgres_url(input: &str) -> Result<ParsedNetworkUrl, String> {
 /// Parse `input` or explain why it is not a usable MySQL URL.
 pub fn parse_mysql_url(input: &str) -> Result<ParsedNetworkUrl, String> {
     parse_network_url(input, &["mysql://"], "mysql://")
+}
+
+/// Parse `input` or explain why it is not a usable SQL Server URL.
+pub fn parse_mssql_url(input: &str) -> Result<ParsedNetworkUrl, String> {
+    parse_network_url(input, &["sqlserver://", "mssql://"], "sqlserver://")
 }
 
 fn parse_network_url(
@@ -230,6 +237,22 @@ mod tests {
         assert_eq!(parsed.password.as_deref(), Some("fgtest"));
         assert_eq!(parsed.database.as_deref(), Some("app"));
         assert_eq!(parsed.tls_mode, Some(TlsMode::VerifyCa));
+    }
+
+    #[test]
+    fn sql_server_urls_accept_both_spellings() {
+        let parsed =
+            parse_mssql_url("sqlserver://sa:Fastgrid!Pass123@127.0.0.1:14330/app?sslmode=require")
+                .unwrap();
+        assert_eq!(parsed.host, "127.0.0.1");
+        assert_eq!(parsed.port, Some(14330));
+        assert_eq!(parsed.user, "sa");
+        assert_eq!(parsed.password.as_deref(), Some("Fastgrid!Pass123"));
+        assert_eq!(parsed.database.as_deref(), Some("app"));
+        assert_eq!(parsed.tls_mode, Some(TlsMode::Require));
+        let short = parse_mssql_url("mssql://sa:pw@host/db").unwrap();
+        assert_eq!(short.port, None);
+        assert!(parse_mssql_url("mysql://host/db").is_err());
     }
 
     #[test]

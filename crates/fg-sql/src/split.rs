@@ -18,6 +18,19 @@ use fg_core::DbKind;
 
 use crate::lex::{Flavor, Kind, Token, lex};
 
+fn line_end(sql: &str, from: usize) -> usize {
+    sql[from..].find('\n').map_or(sql.len(), |p| from + p)
+}
+
+/// Whether the word at `tok` is alone on its line, which is what makes a `GO` a batch separator
+/// rather than an identifier (`SELECT go FROM t`).
+fn go_alone_on_line(sql: &str, tok: &Token) -> bool {
+    let line_start = sql[..tok.start].rfind('\n').map_or(0, |p| p + 1);
+    let before = sql[line_start..tok.start].trim();
+    let after = &sql[tok.end..line_end(sql, tok.end)];
+    before.is_empty() && after.trim().is_empty()
+}
+
 /// One statement of a script.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatementSpan {
@@ -65,7 +78,7 @@ pub fn split_statements(sql: &str, kind: DbKind) -> Vec<StatementSpan> {
     let mut after_end = false; // the next word completes a two-word closer
     let mut delimiter = ";".to_owned();
     let mut skip_until = 0usize; // byte offset: tokens starting before it are ignored
-    let bodies_have_blocks = matches!(flavor, Flavor::Sqlite | Flavor::MySql);
+    let bodies_have_blocks = matches!(flavor, Flavor::Sqlite | Flavor::MySql | Flavor::MsSql);
 
     for (idx, tok) in tokens.iter().enumerate() {
         if tok.start < skip_until {
@@ -129,6 +142,35 @@ pub fn split_statements(sql: &str, kind: DbKind) -> Vec<StatementSpan> {
             }
             extent_start = tok.end;
             skip_until = tok.end;
+            first_any = None;
+            first_sig = None;
+            last_sig = None;
+            words.clear();
+            compound = false;
+            stack.clear();
+            after_end = false;
+            continue;
+        }
+
+        // SQL Server's `GO` is a client-side batch separator, not a statement:
+        // it must split like a terminator but is never sent to the server. It
+        // only counts when it is the whole line, because `GO` is also a legal
+        // identifier.
+        let is_go = flavor == Flavor::MsSql
+            && tok.kind == Kind::Word
+            && tok.text(sql).eq_ignore_ascii_case("go")
+            && stack.is_empty()
+            && go_alone_on_line(sql, tok);
+        if is_go {
+            if let (Some(f), Some(l)) = (first_any.filter(|_| first_sig.is_some()), last_sig) {
+                out.push(StatementSpan {
+                    text: tokens[f].start..tokens[l].end,
+                    extent: extent_start..tok.end,
+                });
+            }
+            let line_end = line_end(sql, tok.end);
+            extent_start = line_end;
+            skip_until = line_end;
             first_any = None;
             first_sig = None;
             last_sig = None;
@@ -463,6 +505,39 @@ mod tests {
         assert_eq!(spans[0].sql(sql), "SELECT 'é;世界'");
         assert_eq!(&sql[spans[0].extent.clone()], "SELECT 'é;世界';");
         assert_eq!(spans[1].sql(sql), "SELECT 2");
+    }
+
+    #[test]
+    fn go_separates_batches_and_is_never_a_statement() {
+        let sql = "SELECT 1\nGO\nSELECT 2\nGO\n";
+        let t = texts(sql, DbKind::MsSql);
+        assert_eq!(t, ["SELECT 1", "SELECT 2"]);
+    }
+
+    #[test]
+    fn go_counts_only_when_it_is_alone_on_its_line() {
+        // `go` is also a legal identifier, and `GOTO` is a keyword: only a
+        // bare word on its own line ends a batch.
+        let t = texts("SELECT go FROM t\nGO\nSELECT goto FROM u", DbKind::MsSql);
+        assert_eq!(t, ["SELECT go FROM t", "SELECT goto FROM u"]);
+        assert_eq!(texts("SELECT 1 GO", DbKind::MsSql), ["SELECT 1 GO"]);
+    }
+
+    #[test]
+    fn go_is_sql_server_only() {
+        // Other engines read `GO` as an ordinary word, so it stays part of
+        // the statement and the server reports the syntax error.
+        let t = texts("SELECT 1\nGO\nSELECT 2", DbKind::Postgres);
+        assert_eq!(t.len(), 1, "{t:?}");
+    }
+
+    #[test]
+    fn sql_server_bodies_keep_their_semicolons() {
+        let sql = "CREATE PROCEDURE p AS BEGIN SELECT 1; SELECT 2; END\nGO\nSELECT 3";
+        let t = texts(sql, DbKind::MsSql);
+        assert_eq!(t.len(), 2, "{t:?}");
+        assert!(t[0].starts_with("CREATE PROCEDURE") && t[0].ends_with("END"));
+        assert_eq!(t[1], "SELECT 3");
     }
 
     #[test]

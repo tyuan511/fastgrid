@@ -29,7 +29,7 @@ fg-mcp = { path = "crates/fg-mcp" }
 
 # external (versions pinned as each crate starts using them)
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 async-trait = "0.1"
@@ -38,6 +38,11 @@ uuid = { version = "1", features = ["v7"] }
 keyring = "4.2"
 dirs = "7"
 rusqlite = { version = "0.40", features = ["bundled", "column_decltype", "column_metadata"] }
+# SQL Server (TDS). rustls only: the default feature set would pull in
+# native-tls and the Windows-only integrated-auth shim.
+tiberius = { version = "0.13", default-features = false, features = ["rustls", "tds80"] }
+# tiberius takes a tokio stream wrapped in futures' AsyncWrite.
+tokio-util = { version = "0.7", features = ["compat"] }
 # Benches only (fg-sql, fg-driver); never a runtime dependency.
 criterion = "0.8"
 

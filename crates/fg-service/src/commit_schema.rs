@@ -101,6 +101,9 @@ impl OpenConnection {
         let statements = self.compile_schema(path, changes).await?;
         let statements = statements.into_iter().map(|s| s.sql).collect::<Vec<_>>();
         let transactional = self.capabilities().transactional_ddl;
+        let begin = self.dialect().begin_transaction_sql().to_owned();
+        let commit = self.dialect().commit_sql().to_owned();
+        let rollback = self.dialect().rollback_sql().to_owned();
         let path = path.clone();
 
         let this = Arc::clone(self);
@@ -119,7 +122,7 @@ impl OpenConnection {
                     }
                 };
                 if transactional {
-                    run("BEGIN".into()).await?;
+                    run(begin.clone()).await?;
                     let mut failure = None;
                     for (i, sql) in statements.iter().enumerate() {
                         if let Err(e) = run(sql.clone()).await {
@@ -133,11 +136,11 @@ impl OpenConnection {
                         }
                     }
                     let finish = if failure.is_some() {
-                        "ROLLBACK"
+                        rollback.clone()
                     } else {
-                        "COMMIT"
+                        commit.clone()
                     };
-                    if let Err(e) = run(finish.into()).await {
+                    if let Err(e) = run(finish).await {
                         lease.mark_broken();
                         return Err(failure.map(Error::Other).unwrap_or(e));
                     }

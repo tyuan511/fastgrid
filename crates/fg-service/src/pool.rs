@@ -288,6 +288,7 @@ fn is_session_setting(sql: &str, kind: fg_core::DbKind) -> bool {
         fg_core::DbKind::Sqlite => sqlite_session_setting(sql),
         fg_core::DbKind::Postgres => postgres_session_setting(sql),
         fg_core::DbKind::MySql => mysql_session_setting(sql),
+        fg_core::DbKind::MsSql => mssql_session_setting(sql),
         fg_core::DbKind::Unknown => false,
         _ => false,
     }
@@ -372,6 +373,26 @@ const MYSQL_SESSION_SETTINGS: &[&str] = &[
     "character_set_results",
     "character_set_connection",
     "collation_connection",
+];
+
+const MSSQL_SESSION_SETTINGS: &[&str] = &[
+    "ansi_nulls",
+    "ansi_padding",
+    "ansi_warnings",
+    "arithabort",
+    "concat_null_yields_null",
+    "datefirst",
+    "dateformat",
+    "deadlock_priority",
+    "fmtonly",
+    "implicit_transactions",
+    "language",
+    "lock_timeout",
+    "nocount",
+    "numeric_roundabort",
+    "quoted_identifier",
+    "textsize",
+    "transaction_isolation",
 ];
 
 struct PragmaCall {
@@ -498,6 +519,41 @@ fn mysql_session_setting(sql: &str) -> bool {
         return false;
     };
     MYSQL_SESSION_SETTINGS.contains(&name.to_ascii_lowercase().as_str())
+}
+
+/// `SET <session option> <value>` for the options that only affect this
+/// session. `SET IDENTITY_INSERT` and the `SHOWPLAN` family are excluded on
+/// purpose: the first writes, and the second silently stops statements from
+/// executing.
+fn mssql_session_setting(sql: &str) -> bool {
+    let cleaned = strip_comments(sql);
+    let rest = cleaned.trim();
+    let Some((word, rest)) = parse_ident(rest) else {
+        return false;
+    };
+    if word.eq_ignore_ascii_case("use") {
+        let Some((db, after)) = parse_ident(rest.trim_start()) else {
+            return false;
+        };
+        return !db.is_empty() && after.trim().is_empty();
+    }
+    if !word.eq_ignore_ascii_case("set") {
+        return false;
+    }
+    let rest = rest.trim_start();
+    let Some((name, after)) = parse_ident(rest) else {
+        return false;
+    };
+    if name.eq_ignore_ascii_case("transaction") {
+        // `SET TRANSACTION ISOLATION LEVEL <level>`.
+        let upper = after.trim().to_ascii_uppercase();
+        return upper.starts_with("ISOLATION LEVEL ") && upper.len() > "ISOLATION LEVEL ".len();
+    }
+    if !MSSQL_SESSION_SETTINGS.contains(&name.to_ascii_lowercase().as_str()) {
+        return false;
+    }
+    // The option needs a value: `SET NOCOUNT ON`, `SET LOCK_TIMEOUT 5000`.
+    !after.trim().is_empty()
 }
 
 fn parse_ident(input: &str) -> Option<(&str, &str)> {
@@ -691,5 +747,60 @@ impl Drop for Lease {
         }
         // The permit is released after the session is back, so the next acquirer finds it.
         drop(self.permit.take());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sql_server_startup_sql_accepts_session_options_only() {
+        for sql in [
+            "SET QUOTED_IDENTIFIER ON",
+            "SET ANSI_NULLS OFF",
+            "SET NOCOUNT ON",
+            "set lock_timeout 5000",
+            "SET DATEFIRST 1",
+            "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+            "USE master",
+            "SET LANGUAGE us_english",
+        ] {
+            assert!(is_session_setting(sql, fg_core::DbKind::MsSql), "{sql}");
+        }
+    }
+
+    #[test]
+    fn sql_server_startup_sql_refuses_writes_and_plan_switches() {
+        for sql in [
+            "SET IDENTITY_INSERT t ON",
+            "SET SHOWPLAN_ALL ON",
+            "SET SHOWPLAN_XML ON",
+            "DELETE FROM t",
+            "EXEC sp_configure 'show advanced options', 1",
+            "SET NOCOUNT",
+            "SET SOMETHING_ELSE 1",
+            "USE",
+            "USE master; DROP TABLE t",
+        ] {
+            assert!(!is_session_setting(sql, fg_core::DbKind::MsSql), "{sql}");
+        }
+    }
+
+    #[test]
+    fn every_engine_has_its_own_transaction_spelling() {
+        let sqlite = fg_core::dialect_for(fg_core::DbKind::Sqlite).unwrap();
+        let postgres = fg_core::dialect_for(fg_core::DbKind::Postgres).unwrap();
+        let mysql = fg_core::dialect_for(fg_core::DbKind::MySql).unwrap();
+        let mssql = fg_core::dialect_for(fg_core::DbKind::MsSql).unwrap();
+        assert_eq!(sqlite.begin_transaction_sql(), "BEGIN");
+        assert_eq!(postgres.begin_transaction_sql(), "BEGIN");
+        // Bare `BEGIN` is not valid T-SQL.
+        assert_eq!(mssql.begin_transaction_sql(), "BEGIN TRANSACTION");
+        assert_eq!(mysql.begin_transaction_sql(), "START TRANSACTION");
+        for d in [sqlite, postgres, mysql, mssql] {
+            assert_eq!(d.commit_sql(), "COMMIT");
+            assert_eq!(d.rollback_sql(), "ROLLBACK");
+        }
     }
 }

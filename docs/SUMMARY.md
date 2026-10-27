@@ -8,6 +8,7 @@
 - [SQLite 连接指南](connections/sqlite.md)
 - [PostgreSQL 连接指南](connections/postgres.md)
 - [MySQL / MariaDB 连接指南](connections/mysql.md)
+- [SQL Server 连接指南](connections/mssql.md)
 - [快捷键规范](shortcuts.md)
 - [诊断、日志与隐私](diagnostics.md)
 - [打包与发布](packaging.md)

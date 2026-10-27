@@ -29,7 +29,10 @@ pub use connection::{
     ConnectionConfig, ConnectionGroup, ConnectionParams, DbKind, McpAccess, SshAuth, SshConfig,
     Timeouts, TlsConfig, TlsMode,
 };
-pub use dialect::{Dialect, MySqlDialect, PostgresDialect, SqliteDialect, dialect_for};
+pub use dialect::{
+    DEFAULT_CONSTRAINT_KEY, Dialect, MsSqlDialect, MySqlDialect, PostgresDialect, SqliteDialect,
+    dialect_for,
+};
 pub use edit::{CellValue, Changeset, RowChange, RowKey};
 pub use error::{Error, QueryError, Result};
 pub use id::{

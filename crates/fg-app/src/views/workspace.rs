@@ -3943,7 +3943,7 @@ impl WorkspaceView {
                     .child(
                         div()
                             .absolute()
-                            .left_1()
+                            .right_1()
                             .opacity(0.)
                             .group_hover("tab", |s| s.opacity(1.))
                             .child(

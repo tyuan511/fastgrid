@@ -249,19 +249,22 @@ impl OpenConnection {
         report: &mut CsvImportReport,
     ) -> Result<()> {
         let mut lease = self.pool.acquire().await?;
-        run_simple(&mut lease, "BEGIN").await?;
+        let begin = self.dialect().begin_transaction_sql();
+        let commit = self.dialect().commit_sql();
+        let rollback = self.dialect().rollback_sql();
+        run_simple(&mut lease, begin).await?;
         let target = ImportTarget { path, plan };
         let outcome = self
             .run_batch_rows(&mut lease, &target, batch, batch_start, options, report)
             .await;
         match outcome {
             Ok(inserted) => {
-                run_simple(&mut lease, "COMMIT").await?;
+                run_simple(&mut lease, commit).await?;
                 report.inserted += inserted;
                 Ok(())
             }
             Err(e) => {
-                let _ = run_simple(&mut lease, "ROLLBACK").await;
+                let _ = run_simple(&mut lease, rollback).await;
                 Err(e)
             }
         }

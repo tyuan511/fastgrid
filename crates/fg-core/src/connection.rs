@@ -12,6 +12,8 @@ pub enum DbKind {
     Sqlite,
     MySql,
     Postgres,
+    /// Microsoft SQL Server (TDS).
+    MsSql,
     /// A connection saved by a newer version for an engine this build does not know.
     /// It is kept (never deleted) and shown as unsupported.
     #[serde(other)]
@@ -24,6 +26,7 @@ impl DbKind {
             DbKind::Sqlite => "SQLite",
             DbKind::MySql => "MySQL",
             DbKind::Postgres => "PostgreSQL",
+            DbKind::MsSql => "SQL Server",
             DbKind::Unknown => "Unsupported engine",
         }
     }

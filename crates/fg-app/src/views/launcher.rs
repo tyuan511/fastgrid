@@ -28,9 +28,9 @@ use super::icons::{Hugeicon, hugeicon};
 use super::style::environment_color;
 use crate::model::{
     ConnectionDraft, ENVIRONMENTS, SAFE_MODES, SSH_AUTHS, SshAuthChoice, TAG_COLORS, TLS_MODES,
-    color_from_label, duplicate, environment_from_label, environment_label, parse_mysql_url,
-    parse_postgres_url, rank, safe_mode_from_label, safe_mode_label, ssh_auth_from_label,
-    tls_mode_from_label,
+    color_from_label, duplicate, environment_from_label, environment_label, parse_mssql_url,
+    parse_mysql_url, parse_postgres_url, rank, safe_mode_from_label, safe_mode_label,
+    ssh_auth_from_label, tls_mode_from_label,
 };
 
 /// One entry of the rendered launcher list.
@@ -1129,17 +1129,17 @@ impl Launcher {
             s.set_value(draft.path.clone(), window, cx);
             s
         });
-        let url_placeholder = if draft.kind == DbKind::MySql {
-            "mysql://user:password@host:port/database"
-        } else {
-            "postgres://user:password@host:port/database"
+        let url_placeholder = match draft.kind {
+            DbKind::MySql => "mysql://user:password@host:port/database",
+            DbKind::MsSql => "sqlserver://user:password@host:port/database",
+            _ => "postgres://user:password@host:port/database",
         };
         let url = editor_input(url_placeholder, &draft.url, false, window, cx);
         let host = editor_input("localhost", &draft.host, false, window, cx);
-        let port_placeholder = if draft.kind == DbKind::MySql {
-            "3306"
-        } else {
-            "5432"
+        let port_placeholder = match draft.kind {
+            DbKind::MySql => "3306",
+            DbKind::MsSql => "1433",
+            _ => "5432",
         };
         let port = editor_input(port_placeholder, &draft.port, false, window, cx);
         let user = editor_input("User", &draft.user, false, window, cx);
@@ -1457,6 +1457,8 @@ impl Launcher {
         let trimmed = url.trim();
         let parsed = if trimmed.starts_with("mysql://") {
             parse_mysql_url(&url).map(|p| (DbKind::MySql, p))
+        } else if trimmed.starts_with("sqlserver://") || trimmed.starts_with("mssql://") {
+            parse_mssql_url(&url).map(|p| (DbKind::MsSql, p))
         } else {
             parse_postgres_url(&url).map(|p| (DbKind::Postgres, p))
         };
@@ -1565,6 +1567,7 @@ const ENGINES: &[(DbKind, &str, &str, f32, f32, f32)] = &[
         0.40,
     ),
     (DbKind::MySql, "MySQL", "Ms", 32.0 / 360.0, 0.85, 0.55),
+    (DbKind::MsSql, "SQL Server", "Ss", 214.0 / 360.0, 0.80, 0.46),
 ];
 
 pub fn is_chinese_locale() -> bool {
@@ -1683,6 +1686,7 @@ impl Render for Launcher {
                     let (badge_text, badge_color) = match row.kind {
                         DbKind::Postgres => ("Pg", hsla(205.0 / 360.0, 0.90, 0.48, 1.0)),
                         DbKind::MySql => ("Ms", hsla(28.0 / 360.0, 0.95, 0.52, 1.0)),
+                        DbKind::MsSql => ("Ss", hsla(214.0 / 360.0, 0.80, 0.46, 1.0)),
                         DbKind::Sqlite => ("Sl", hsla(262.0 / 360.0, 0.83, 0.58, 1.0)),
                         _ => ("Db", theme.muted_foreground),
                     };
@@ -3165,7 +3169,10 @@ impl Launcher {
         };
         let error = e.error.clone();
         let active_engine = e.selected_engine;
-        let is_network = matches!(active_engine, DbKind::Postgres | DbKind::MySql);
+        let is_network = matches!(
+            active_engine,
+            DbKind::Postgres | DbKind::MySql | DbKind::MsSql
+        );
         let ssh_auth_now = e
             .ssh_auth
             .read(cx)

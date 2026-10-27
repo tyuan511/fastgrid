@@ -310,13 +310,14 @@ impl ConnectionDraft {
                     Self::default_name_for(path),
                 )
             }
-            DbKind::Postgres | DbKind::MySql => {
+            DbKind::Postgres | DbKind::MySql | DbKind::MsSql => {
                 let host = self.host.trim();
                 if host.is_empty() {
                     return Err("Enter a host.".into());
                 }
                 let default_port = match self.kind {
                     DbKind::MySql => 3306,
+                    DbKind::MsSql => 1433,
                     _ => 5432,
                 };
                 let port = parse_port_field(&self.port, default_port)?;
@@ -376,7 +377,7 @@ impl ConnectionDraft {
                     config.options.remove("create");
                 }
             }
-            DbKind::Postgres | DbKind::MySql => {
+            DbKind::Postgres | DbKind::MySql | DbKind::MsSql => {
                 config.options.remove("create");
                 let tls = TlsConfig {
                     mode: self.tls_mode,
@@ -696,6 +697,29 @@ mod tests {
         assert_eq!(d.password, "pw");
         assert_eq!(d.database, "db");
         assert_eq!(d.tls_mode, TlsMode::Disable);
+    }
+
+    #[test]
+    fn sql_server_draft_defaults_to_port_1433() {
+        let mut d = ConnectionDraft::blank();
+        let parsed = crate::model::parse_mssql_url("sqlserver://sa:pw@127.0.0.1/app").unwrap();
+        d.apply_url(DbKind::MsSql, &parsed);
+        assert_eq!(d.kind, DbKind::MsSql);
+        d.port = String::new();
+        let c = d.to_config(None).unwrap();
+        assert_eq!(
+            c.params,
+            ConnectionParams::Network {
+                host: "127.0.0.1".into(),
+                port: 1433,
+                user: "sa".into(),
+                database: Some("app".into()),
+                socket: None,
+            }
+        );
+        // A network engine keeps the TLS/SSH block, like PostgreSQL and MySQL.
+        assert!(c.tls.is_none());
+        assert!(c.ssh.is_none());
     }
 
     #[test]

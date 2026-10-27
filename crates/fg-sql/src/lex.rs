@@ -15,6 +15,7 @@ pub enum Flavor {
     Sqlite,
     Postgres,
     MySql,
+    MsSql,
 }
 
 impl From<DbKind> for Flavor {
@@ -22,6 +23,7 @@ impl From<DbKind> for Flavor {
         match kind {
             DbKind::Sqlite => Flavor::Sqlite,
             DbKind::MySql => Flavor::MySql,
+            DbKind::MsSql => Flavor::MsSql,
             // Unknown engines get PostgreSQL's (strictest, standard-like) lexing.
             _ => Flavor::Postgres,
         }
@@ -133,7 +135,7 @@ pub fn lex(sql: &str, flavor: Flavor) -> Vec<Token> {
         } else if c == '`' {
             let (end, unterminated) = quoted(sql, i, '`', false);
             (Kind::QuotedIdent, end, unterminated)
-        } else if c == '[' && flavor == Flavor::Sqlite {
+        } else if c == '[' && matches!(flavor, Flavor::Sqlite | Flavor::MsSql) {
             match sql[i..].find(']') {
                 Some(p) => (Kind::QuotedIdent, i + p + 1, false),
                 None => (Kind::QuotedIdent, sql.len(), true),
@@ -366,6 +368,29 @@ mod tests {
         assert!(t.last().is_some_and(|t| t.unterminated));
         let c = lex("SELECT /* oops", Flavor::Sqlite);
         assert!(c.last().is_some_and(|t| t.unterminated));
+    }
+
+    #[test]
+    fn sql_server_brackets_identifiers_too() {
+        let k = kinds("SELECT [a;b] FROM t", Flavor::MsSql);
+        assert!(k.contains(&(Kind::QuotedIdent, "[a;b]")));
+        // Brackets are not a string, so a stray `'` inside stays literal text
+        // of the identifier.
+        let k = kinds("SELECT [o'brien]", Flavor::MsSql);
+        assert!(k.contains(&(Kind::QuotedIdent, "[o'brien]")));
+    }
+
+    #[test]
+    fn sql_server_comments_and_unicode_literals() {
+        // `--` needs no trailing whitespace in T-SQL.
+        let k = kinds("SELECT 1 --x\nSELECT 2", Flavor::MsSql);
+        assert!(k.iter().any(|t| t.0 == Kind::LineComment && t.1 == "--x"));
+        // `N'..'` is a Word `N` followed by a normal string.
+        let k = kinds("SELECT N'a;b'", Flavor::MsSql);
+        assert!(k.contains(&(Kind::String, "'a;b'")));
+        // `#` is not a comment here; it stays punctuation.
+        let k = kinds("SELECT #t", Flavor::MsSql);
+        assert!(k.iter().any(|t| t.0 == Kind::Punct && t.1 == "#"));
     }
 
     #[test]
