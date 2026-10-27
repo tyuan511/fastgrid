@@ -1142,12 +1142,6 @@ fn structure_view_shows_columns_indexes_fks_and_ddl(cx: &mut TestAppContext) {
         columns.contains("name TEXT DEFAULT 'anon'"),
         "columns label should carry the default, got: {columns}"
     );
-    let indexes = cx
-        .update_window(f.window, |_, window, _cx| {
-            window.find("structure-indexes").label().unwrap().to_owned()
-        })
-        .unwrap();
-    assert!(indexes.contains("items_name (name)"), "got: {indexes}");
     let fks = cx
         .update_window(f.window, |_, window, _cx| {
             window.find("structure-fks").label().unwrap().to_owned()
@@ -1176,6 +1170,16 @@ fn structure_view_without_ddl_says_so(cx: &mut TestAppContext) {
         })
         .unwrap();
     assert!(ddl.contains("does not provide DDL text"), "got: {ddl}");
+    // Indexes live in their own Index view.
+    let indexes = cx
+        .update_window(f.window, |_, window, cx| {
+            f.view
+                .update(cx, |v, cx| v.set_mode(fg_app::views::TabMode::Index, cx));
+            window.render_frame(cx);
+            window.find("structure-indexes").label().unwrap().to_owned()
+        })
+        .unwrap();
+    assert!(indexes.contains("items_name (name)"), "got: {indexes}");
 }
 
 #[gpui_kit::test]
@@ -1246,8 +1250,10 @@ fn structure_drop_button_stages_a_drop(cx: &mut TestAppContext) {
     let f = open(cx);
     show_structure(cx, &f, None);
     cx.update_window(f.window, |_, window, cx| {
+        // Pick the `name` column in the list, then drop it.
+        f.view.update(cx, |v, cx| v.select_structure_column(1, cx));
         window.render_frame(cx);
-        window.click("structure-drop-col-name", cx);
+        window.click("structure-drop-col", cx);
     })
     .unwrap();
     let staged = cx

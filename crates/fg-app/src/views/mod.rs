@@ -5,6 +5,7 @@ pub mod cells;
 mod filter_drawer;
 mod grid;
 pub mod icons;
+mod info_grid;
 mod launcher;
 mod query_tab;
 mod recovery;

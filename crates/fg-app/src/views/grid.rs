@@ -39,6 +39,7 @@ use super::actions::{
 use super::cells::{CellMark, CellSelection};
 use super::filter_drawer::{FilterDrawer, FilterDrawerEvent};
 use super::icons::{Hugeicon, hugeicon};
+use super::info_grid::InfoDelegate;
 use crate::model::{
     Align, BackRef, CellKind, CellState, Changeset, Counts, DEFAULT_PAGE_SIZE, FilterDraft,
     GridQuery, JumpTarget, PAGE_SIZES, RowId, RowState, SortState, StructureChangeset, align_for,
@@ -649,6 +650,7 @@ pub enum TableTabEvent {
 pub enum TabMode {
     Data,
     Structure,
+    Index,
 }
 
 /// The structure view's data: the table definition plus its DDL text, when
@@ -744,6 +746,10 @@ pub struct TableTab {
     /// next switch reloads it.
     mode: TabMode,
     structure: Option<StructureData>,
+    /// The structure and index views' lists, in the same grid widget as the data.
+    col_grid: Entity<TableState<InfoDelegate>>,
+    idx_grid: Entity<TableState<InfoDelegate>>,
+    fk_grid: Entity<TableState<InfoDelegate>>,
     structure_loading: bool,
     structure_error: Option<SharedString>,
     /// Staged structure changes (roadmap M6): the same stage → preview →
@@ -812,6 +818,54 @@ impl TableTab {
                 .cell_selectable(true)
                 .row_header(false)
         });
+        let info_grid = |headers: &[(&'static str, f32)],
+                         empty: &'static str,
+                         window: &mut Window,
+                         cx: &mut Context<Self>| {
+            let delegate = InfoDelegate::new(headers, empty);
+            cx.new(|cx| {
+                TableState::new(delegate, window, cx)
+                    .cell_selectable(true)
+                    .row_header(false)
+            })
+        };
+        let col_grid = info_grid(
+            &[
+                ("Column", 180.),
+                ("Type", 140.),
+                ("Nullable", 80.),
+                ("Key", 70.),
+                ("Default", 160.),
+                ("Extra", 140.),
+            ],
+            "No columns.",
+            window,
+            cx,
+        );
+        let idx_grid = info_grid(
+            &[
+                ("Index", 220.),
+                ("Columns", 280.),
+                ("Unique", 80.),
+                ("Primary", 80.),
+            ],
+            "No indexes.",
+            window,
+            cx,
+        );
+        let fk_grid = info_grid(
+            &[
+                ("Name", 180.),
+                ("Columns", 160.),
+                ("References", 160.),
+                ("Referenced columns", 180.),
+                ("On delete", 110.),
+                ("On update", 110.),
+            ],
+            "No foreign keys.",
+            window,
+            cx,
+        );
         let drawer = cx.new(|cx| FilterDrawer::new(window, cx));
         let on_apply = cx.subscribe(&drawer, |this, _, event: &FilterDrawerEvent, cx| {
             let FilterDrawerEvent::Apply(applied) = event;
@@ -912,6 +966,9 @@ impl TableTab {
             prefetched: None,
             mode: TabMode::Data,
             structure: None,
+            col_grid,
+            idx_grid,
+            fk_grid,
             structure_loading: false,
             structure_error: None,
             structure_changes: StructureChangeset::new(),
@@ -955,12 +1012,103 @@ impl TableTab {
             return;
         }
         self.mode = mode;
-        if mode == TabMode::Structure && self.structure.is_none() && !self.structure_loading {
+        if mode != TabMode::Data && self.structure.is_none() && !self.structure_loading {
             self.structure_loading = true;
             self.structure_error = None;
             cx.emit(TableTabEvent::StructureRequested);
         }
         cx.notify();
+    }
+
+    /// Fill the three lists from the loaded definition.
+    fn sync_info_grids(&mut self, cx: &mut Context<Self>) {
+        let Some(data) = &self.structure else {
+            return;
+        };
+        let detail = &data.detail;
+        let yes = |b: bool| if b { "YES" } else { "NO" }.to_owned();
+        let cols = detail
+            .columns
+            .iter()
+            .map(|c| {
+                vec![
+                    c.name.clone(),
+                    c.data_type.native.clone(),
+                    yes(c.nullable),
+                    c.primary_key_position
+                        .map(|p| format!("PK({p})"))
+                        .unwrap_or_default(),
+                    c.default.clone().unwrap_or_default(),
+                    if c.auto_increment {
+                        "AUTO_INCREMENT".to_owned()
+                    } else {
+                        String::new()
+                    },
+                ]
+            })
+            .collect();
+        let idx = detail
+            .indexes
+            .iter()
+            .map(|ix| {
+                vec![
+                    ix.name.clone(),
+                    ix.columns
+                        .iter()
+                        .map(|c| c.name.clone())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    yes(ix.unique),
+                    yes(ix.primary),
+                ]
+            })
+            .collect();
+        let fks = detail
+            .foreign_keys
+            .iter()
+            .map(|fk| {
+                vec![
+                    fk.name.clone().unwrap_or_default(),
+                    fk.columns.join(", "),
+                    fk.referenced.name.clone(),
+                    fk.referenced_columns.join(", "),
+                    fk.on_delete
+                        .as_ref()
+                        .map(|a| a.sql().to_owned())
+                        .unwrap_or_default(),
+                    fk.on_update
+                        .as_ref()
+                        .map(|a| a.sql().to_owned())
+                        .unwrap_or_default(),
+                ]
+            })
+            .collect();
+        self.col_grid.update(cx, |t, cx| {
+            t.delegate_mut().replace(cols);
+            t.refresh(cx);
+        });
+        self.idx_grid.update(cx, |t, cx| {
+            t.delegate_mut().replace(idx);
+            t.refresh(cx);
+        });
+        self.fk_grid.update(cx, |t, cx| {
+            t.delegate_mut().replace(fks);
+            t.refresh(cx);
+        });
+    }
+
+    /// The row picked in one of the structure lists.
+    fn info_selection(grid: &Entity<TableState<InfoDelegate>>, cx: &App) -> Option<usize> {
+        match grid.read(cx).selection() {
+            TableSelection::Cell(r, _) | TableSelection::Row(r) => Some(r),
+            _ => None,
+        }
+    }
+
+    /// Pick a row of the column list, as a click would (for tests).
+    pub fn select_structure_column(&mut self, row: usize, cx: &mut Context<Self>) {
+        self.col_grid
+            .update(cx, |t, cx| t.set_selected_row(row, cx));
     }
 
     /// The structure view's data, when loaded.
@@ -980,6 +1128,7 @@ impl TableTab {
         match (detail, ddl) {
             (Ok(detail), Ok(ddl)) => {
                 self.structure = Some(StructureData { detail, ddl });
+                self.sync_info_grids(cx);
                 self.structure_error = None;
             }
             (Err(e), _) | (_, Err(e)) => {
@@ -1555,6 +1704,8 @@ impl TableTab {
                 line
             })
             .collect();
+        let theme = cx.theme().clone();
+        let index_mode = self.mode == TabMode::Index;
         let ddl = data
             .ddl
             .clone()
@@ -1562,9 +1713,9 @@ impl TableTab {
         let mut panel = v_flex()
             .id("structure-view")
             .test_support()
-            .gap_4()
-            .px_1()
-            .py_2()
+            .size_full()
+            .gap_3()
+            .p_3()
             .overflow_y_scroll();
         if let Some(error) = &self.structure_error {
             panel = panel.child(
@@ -1579,7 +1730,7 @@ impl TableTab {
             );
         }
         // Columns, with per-row Alter / Drop and an add form.
-        let mut col_section = div()
+        let mut col_section = v_flex()
             .id("structure-columns")
             .test_support()
             .aria_label(if columns.is_empty() {
@@ -1587,84 +1738,109 @@ impl TableTab {
             } else {
                 columns.join("\n")
             })
-            .px_3()
-            .py_2()
-            .child(div().text_sm().child("Columns"));
-        for (line, column) in columns.iter().zip(detail.columns.iter()) {
-            let name = column.name.clone();
-            if self.edit_column.as_deref() == Some(name.as_str()) {
-                let mut row = h_flex()
-                    .gap_2()
-                    .child(div().text_sm().child(format!("{name}:")));
-                if let Some(input) = self.structure_form("edit-col-type") {
-                    row = row.child(
-                        div()
-                            .flex_1()
-                            .child(Input::new(&input).id("structure-edit-col-type")),
-                    );
-                }
-                if let Some(input) = self.structure_form("edit-col-default") {
-                    row = row.child(
-                        div()
-                            .flex_1()
-                            .child(Input::new(&input).id("structure-edit-col-default")),
-                    );
-                }
-                if let Some(forms) = &self.structure_forms {
-                    let checked = forms.edit_col_nullable;
-                    row = row.child(
-                        Checkbox::new(SharedString::from("structure-edit-col-nullable"))
-                            .label("Nullable")
-                            .checked(checked)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if let Some(forms) = this.structure_forms.as_mut() {
-                                    forms.edit_col_nullable = !forms.edit_col_nullable;
-                                }
-                                cx.notify();
-                            })),
-                    );
-                }
-                row = row.child(
-                    Button::new("structure-save-col-edit")
-                        .label("Save")
+            .gap_1p5()
+            .p_3()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Columns"),
+            );
+        col_section = col_section.child(
+            div()
+                .h(px(240.))
+                .border_1()
+                .border_color(theme.border)
+                .child(
+                    DataTable::new(&self.col_grid)
+                        .with_size(px(22.))
+                        .bordered(false)
+                        .fixed_cols_border(false)
+                        .header_row_height(px(24.))
+                        .stripe(true),
+                ),
+        );
+        let picked_col = Self::info_selection(&self.col_grid, cx)
+            .and_then(|i| detail.columns.get(i))
+            .map(|c| c.name.clone());
+        let (alter_target, drop_target) = (picked_col.clone(), picked_col.clone());
+        col_section = col_section.child(
+            h_flex()
+                .gap_2()
+                .child(
+                    Button::new("structure-alter-col")
+                        .label("Alter")
                         .small()
-                        .on_click(cx.listener(|this, _, _, cx| this.save_structure_edit(cx))),
+                        .disabled(picked_col.is_none())
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            if let Some(name) = &alter_target {
+                                this.begin_structure_edit(name, window, cx);
+                            }
+                        })),
+                )
+                .child(
+                    Button::new("structure-drop-col")
+                        .label("Drop")
+                        .small()
+                        .disabled(picked_col.is_none())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(name) = &drop_target {
+                                this.drop_structure_column(name, cx);
+                            }
+                        })),
+                ),
+        );
+        if let Some(name) = self.edit_column.clone() {
+            let mut row = h_flex()
+                .gap_2()
+                .child(div().text_sm().child(format!("{name}:")));
+            if let Some(input) = self.structure_form("edit-col-type") {
+                row = row.child(
+                    div()
+                        .flex_1()
+                        .child(Input::new(&input).id("structure-edit-col-type")),
                 );
+            }
+            if let Some(input) = self.structure_form("edit-col-default") {
                 row = row.child(
-                    Button::new("structure-cancel-col-edit")
-                        .label("Cancel")
-                        .small()
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.edit_column = None;
+                    div()
+                        .flex_1()
+                        .child(Input::new(&input).id("structure-edit-col-default")),
+                );
+            }
+            if let Some(forms) = &self.structure_forms {
+                let checked = forms.edit_col_nullable;
+                row = row.child(
+                    Checkbox::new(SharedString::from("structure-edit-col-nullable"))
+                        .label("Nullable")
+                        .checked(checked)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(forms) = this.structure_forms.as_mut() {
+                                forms.edit_col_nullable = !forms.edit_col_nullable;
+                            }
                             cx.notify();
                         })),
                 );
-                col_section = col_section.child(row);
-            } else {
-                let drop_name = name.clone();
-                let alter_name = name.clone();
-                col_section = col_section.child(
-                    h_flex()
-                        .gap_2()
-                        .child(div().text_sm().child(line.clone()))
-                        .child(
-                            Button::new(SharedString::from(format!("structure-alter-col-{name}")))
-                                .label("Alter")
-                                .small()
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.begin_structure_edit(&alter_name, window, cx);
-                                })),
-                        )
-                        .child(
-                            Button::new(SharedString::from(format!("structure-drop-col-{name}")))
-                                .label("Drop")
-                                .small()
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.drop_structure_column(&drop_name, cx);
-                                })),
-                        ),
-                );
             }
+            row = row.child(
+                Button::new("structure-save-col-edit")
+                    .label("Save")
+                    .small()
+                    .on_click(cx.listener(|this, _, _, cx| this.save_structure_edit(cx))),
+            );
+            row = row.child(
+                Button::new("structure-cancel-col-edit")
+                    .label("Cancel")
+                    .small()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.edit_column = None;
+                        cx.notify();
+                    })),
+            );
+            col_section = col_section.child(row);
         }
         if let Some(forms) = &self.structure_forms {
             let add_col_name = forms.add_col_name.clone();
@@ -1710,9 +1886,11 @@ impl TableTab {
                     ),
             );
         }
-        panel = panel.child(col_section);
+        if !index_mode {
+            panel = panel.child(col_section);
+        }
         // Indexes, with per-row Drop and an add form.
-        let mut idx_section = div()
+        let mut idx_section = v_flex()
             .id("structure-indexes")
             .test_support()
             .aria_label(if indexes.is_empty() {
@@ -1720,25 +1898,47 @@ impl TableTab {
             } else {
                 indexes.join("\n")
             })
-            .px_3()
-            .py_2()
-            .child(div().text_sm().child("Indexes"));
-        for (line, index) in indexes.iter().zip(detail.indexes.iter()) {
-            let name = index.name.clone();
-            idx_section = idx_section.child(
-                h_flex()
-                    .gap_2()
-                    .child(div().text_sm().child(line.clone()))
-                    .child(
-                        Button::new(SharedString::from(format!("structure-drop-idx-{name}")))
-                            .label("Drop")
-                            .small()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.drop_structure_index(&name, cx);
-                            })),
-                    ),
+            .gap_1p5()
+            .p_3()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Indexes"),
             );
-        }
+        idx_section = idx_section.child(
+            div()
+                .h(px(280.))
+                .border_1()
+                .border_color(theme.border)
+                .child(
+                    DataTable::new(&self.idx_grid)
+                        .with_size(px(22.))
+                        .bordered(false)
+                        .fixed_cols_border(false)
+                        .header_row_height(px(24.))
+                        .stripe(true),
+                ),
+        );
+        let picked_idx = Self::info_selection(&self.idx_grid, cx)
+            .and_then(|i| detail.indexes.get(i))
+            .map(|ix| ix.name.clone());
+        idx_section = idx_section.child(
+            h_flex().gap_2().child(
+                Button::new("structure-drop-idx")
+                    .label("Drop")
+                    .small()
+                    .disabled(picked_idx.is_none())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(name) = &picked_idx {
+                            this.drop_structure_index(name, cx);
+                        }
+                    })),
+            ),
+        );
         if let Some(forms) = &self.structure_forms {
             let add_idx_name = forms.add_idx_name.clone();
             let add_idx_columns = forms.add_idx_columns.clone();
@@ -1777,9 +1977,11 @@ impl TableTab {
                     ),
             );
         }
-        panel = panel.child(idx_section);
+        if index_mode {
+            panel = panel.child(idx_section);
+        }
         // Foreign keys, with per-row Drop and an add form.
-        let mut fk_section = div()
+        let mut fk_section = v_flex()
             .id("structure-fks")
             .test_support()
             .aria_label(if fks.is_empty() {
@@ -1787,29 +1989,47 @@ impl TableTab {
             } else {
                 fks.join("\n")
             })
-            .px_3()
-            .py_2()
-            .child(div().text_sm().child("Foreign keys"));
-        for (i, (line, fk)) in fks.iter().zip(detail.foreign_keys.iter()).enumerate() {
-            let Some(name) = fk.name.clone() else {
-                continue;
-            };
-            let drop_id = format!("structure-drop-fk-{name}");
-            let _ = i;
-            fk_section = fk_section.child(
-                h_flex()
-                    .gap_2()
-                    .child(div().text_sm().child(line.clone()))
-                    .child(
-                        Button::new(SharedString::from(drop_id))
-                            .label("Drop")
-                            .small()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.drop_structure_fk(&name, cx);
-                            })),
-                    ),
+            .gap_1p5()
+            .p_3()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Foreign keys"),
             );
-        }
+        fk_section = fk_section.child(
+            div()
+                .h(px(150.))
+                .border_1()
+                .border_color(theme.border)
+                .child(
+                    DataTable::new(&self.fk_grid)
+                        .with_size(px(22.))
+                        .bordered(false)
+                        .fixed_cols_border(false)
+                        .header_row_height(px(24.))
+                        .stripe(true),
+                ),
+        );
+        let picked_fk = Self::info_selection(&self.fk_grid, cx)
+            .and_then(|i| detail.foreign_keys.get(i))
+            .and_then(|fk| fk.name.clone());
+        fk_section = fk_section.child(
+            h_flex().gap_2().child(
+                Button::new("structure-drop-fk")
+                    .label("Drop")
+                    .small()
+                    .disabled(picked_fk.is_none())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(name) = &picked_fk {
+                            this.drop_structure_fk(name, cx);
+                        }
+                    })),
+            ),
+        );
         if let Some(forms) = &self.structure_forms {
             let add_fk_name = forms.add_fk_name.clone();
             let add_fk_columns = forms.add_fk_columns.clone();
@@ -1859,9 +2079,11 @@ impl TableTab {
                         ),
                 );
         }
-        panel = panel.child(fk_section);
+        if !index_mode {
+            panel = panel.child(fk_section);
+        }
         // Table actions: rename and drop.
-        if let Some(forms) = &self.structure_forms {
+        if let (false, Some(forms)) = (index_mode, &self.structure_forms) {
             let rename_table_name = forms.rename_table_name.clone();
             panel =
                 panel.child(
@@ -1891,16 +2113,26 @@ impl TableTab {
                 );
         }
         // DDL text, as reported by the engine.
-        panel = panel.child(
-            div()
-                .id("structure-ddl")
-                .test_support()
-                .aria_label(ddl.clone())
-                .px_3()
-                .py_2()
-                .child(div().text_sm().child("DDL"))
-                .child(div().text_sm().child(ddl)),
-        );
+        if !index_mode {
+            panel = panel.child(
+                v_flex()
+                    .id("structure-ddl")
+                    .test_support()
+                    .aria_label(ddl.clone())
+                    .gap_1p5()
+                    .p_3()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("DDL"),
+                    )
+                    .child(div().text_sm().font_family("monospace").child(ddl)),
+            );
+        }
         // Form validation errors.
         if let Some(error) = &self.structure_form_error {
             panel = panel.child(
@@ -4091,9 +4323,12 @@ impl Render for TableTab {
                 ))
         });
 
+        let mode = self.mode;
         // A segment of the Data | Structure | Index switch.
-        let segment = |label: &'static str, active: bool| {
+        let segment = |id: &'static str, label: &'static str, active: bool| {
             div()
+                .id(id)
+                .test_support()
                 .px_2p5()
                 .h(px(20.))
                 .flex()
@@ -4157,14 +4392,14 @@ impl Render for TableTab {
                 cx.listener(|this, _: &CommitChanges, window, cx| this.request_commit(window, cx)),
             )
             .on_action(cx.listener(|this, _: &UndoEdit, _, cx| {
-                if this.mode == TabMode::Structure {
+                if this.mode != TabMode::Data {
                     this.undo_structure(cx);
                 } else {
                     this.undo_edit(cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &RedoEdit, _, cx| {
-                if this.mode == TabMode::Structure {
+                if this.mode != TabMode::Data {
                     this.redo_structure(cx);
                 } else {
                     this.redo_edit(cx);
@@ -4218,31 +4453,6 @@ impl Render for TableTab {
                 this.ensure_structure_forms(window, cx);
             }))
             .bg(theme.background)
-            .child(
-                h_flex()
-                    .gap_2()
-                    .px_3()
-                    .py_2()
-                    .child(
-                        Button::new("mode-data")
-                            .label("Data")
-                            .small()
-                            .when(self.mode == TabMode::Data, |b| b.primary())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.set_mode(TabMode::Data, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("mode-structure")
-                            .label("Structure")
-                            .small()
-                            .when(self.mode == TabMode::Structure, |b| b.primary())
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.set_mode(TabMode::Structure, cx);
-                                this.ensure_structure_forms(window, cx);
-                            })),
-                    ),
-            )
             .when_some(self.error.clone(), |d, e| {
                 d.child(
                     div()
@@ -4260,7 +4470,7 @@ impl Render for TableTab {
                 div()
                     .flex_1()
                     .min_h_0()
-                    .child(if self.mode == TabMode::Structure {
+                    .child(if self.mode != TabMode::Data {
                         self.structure_panel(cx)
                     } else {
                         DataTable::new(&self.table)
@@ -4308,18 +4518,45 @@ impl Render for TableTab {
                                     .items_center()
                                     .rounded_md()
                                     .bg(theme.secondary)
-                                    .child(segment("Data", true))
-                                    .child(segment("Structure", false))
+                                    .child(
+                                        segment("mode-data", "Data", mode == TabMode::Data)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.set_mode(TabMode::Data, cx);
+                                            })),
+                                    )
+                                    .child(
+                                        segment(
+                                            "mode-structure",
+                                            "Structure",
+                                            mode == TabMode::Structure,
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _, window, cx| {
+                                                this.set_mode(TabMode::Structure, cx);
+                                                this.ensure_structure_forms(window, cx);
+                                            }),
+                                        ),
+                                    )
                                     .child(div().w_px().h(px(12.)).bg(theme.border))
-                                    .child(segment("Index", false)),
+                                    .child(
+                                        segment("mode-index", "Index", mode == TabMode::Index)
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.set_mode(TabMode::Index, cx);
+                                                this.ensure_structure_forms(window, cx);
+                                            })),
+                                    ),
                             )
-                            .child(
-                                Button::new("add-row")
-                                    .icon(hugeicon(Hugeicon::Plus))
-                                    .label(if is_zh { "行" } else { "Row" })
-                                    .small()
-                                    .on_click(cx.listener(|this, _, _, cx| this.insert_row(cx))),
-                            ),
+                            .when(mode == TabMode::Data, |d| {
+                                d.child(
+                                    Button::new("add-row")
+                                        .icon(hugeicon(Hugeicon::Plus))
+                                        .label(if is_zh { "行" } else { "Row" })
+                                        .small()
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| this.insert_row(cx)),
+                                        ),
+                                )
+                            }),
                     )
                     .child(
                         div()
